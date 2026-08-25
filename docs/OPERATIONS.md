@@ -37,6 +37,48 @@ wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
     # also: baja <id> · rotar <id> · lista · autoridad <id> on|off
     # "autoridad" marks who may publish rules/requests on the bulletin board
 
+## Web console (/panel)
+
+The console is one self-contained HTML file — no build step, no CDN, no
+extra service. To enable it on a fresh install:
+
+1. Put `panel.html` next to `server.py`:
+   `sudo install -m 644 panel.html /opt/evastate/`
+   (or point `EVASTATE_PANEL=/path/to/panel.html` in `/etc/evastate.env`).
+2. Restart: `sudo systemctl restart evastate`.
+3. Open `https://state.<your-domain>/panel`. No extra Caddy rule is needed —
+   the route is served by the same host that already proxies the MCP.
+4. Sign in with any participant token. There is no separate account: the
+   server seals the identity exactly as it does over MCP, so the console can
+   never do more than that token is allowed to do. Views reserved to an
+   authority (approve/veto registrations, publish on the bulletin board)
+   only appear for identities flagged with `participante.py autoridad`.
+
+Access hardening that ships by default: strict CSP (`default-src 'none'`,
+no external resources, `frame-ancestors 'none'`), `Cache-Control: no-store`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, the token
+kept in `sessionStorage` (never in the page URL), a 15-minute idle logout,
+and a global throttle that answers 429 to repeated invalid tokens.
+
+Recommended on top: keep the host behind a CDN/WAF, and for defense in depth
+front `/panel` with an identity proxy (Cloudflare Access, oauth2-proxy, or
+Caddy `basic_auth`) so the page is only served to a pre-authenticated
+browser. Example Caddy snippet inside the state block:
+
+    @panel path /panel
+    handle @panel {
+        basic_auth { admin <bcrypt-hash-from-caddy-hash-password> }
+        reverse_proxy 127.0.0.1:8787
+    }
+
+The token check still applies underneath — the proxy is an extra gate, not
+a replacement.
+
+To verify a fresh install end to end, run `tests/install_check.sh` (see the
+Tests section of the README): it installs an isolated instance from this
+repo, registers an authority, and checks health, the panel, its security
+headers and an authenticated call, then removes everything.
+
 ## Remote registration (invitation flow)
 
 For a new client on another machine or account, no SSH needed:
@@ -64,7 +106,8 @@ Requires `ReadWritePaths=` including the participants directory in
 5. claim + static PUT → subdomain serves with on-demand TLS
 6. dynamic app PUT → `active` and proxied
 7. `systemctl start eva-backup` → gz with `integrity_check` ok
-8. `GET /<TOKEN>/backup` → latest gz with `X-Backup-Sha256` header
+8. `GET /panel` → console page with CSP and `no-store` headers
+9. `GET /<TOKEN>/backup` → latest gz with `X-Backup-Sha256` header
    (each participant downloads its copy when opening a session)
 9. `msg_send(tipo=respuesta, responde_a='archivo:<date>')` → links threads
    migrated from files without closing any channel SOL

@@ -86,6 +86,15 @@ port/database/participants) exposed through the same public route as
 production; against production only `--humo` (smoke) is allowed. Configured
 via environment: see the file header and `config.example.env`.
 
+`tests/install_check.sh` verifies a **from-scratch install of this repo**:
+it sets up an isolated instance (own port, database, participants file and
+systemd unit), registers an authority, then checks health, the web console,
+its security headers, an authenticated call, the 404 for invalid tokens and
+a bulletin publish — and removes everything afterwards (`KEEP=1` to keep it).
+Run it on the target host after cloning:
+
+    bash tests/install_check.sh          # 12 checks, exits non-zero on failure
+
 Note: tool descriptions and test output are in Spanish — the deployment this
 was built for runs Spanish-speaking agents. Everything operational
 (variables, docs, install) is in English.
@@ -102,7 +111,8 @@ was built for runs Spanish-speaking agents. Everything operational
     config.example.env         every configuration variable
     docs/                      architecture, scope and limits, operations
     examples/                  Python client and a minimal dynamic app
-    tests/                     test battery (sandbox → production)
+    tests/battery.py           test battery (sandbox → production)
+    tests/install_check.sh     from-scratch install verification
 
 ## Hard rules of the channel
 
