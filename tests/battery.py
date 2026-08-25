@@ -82,6 +82,15 @@ def puerta_A():
          lambda: assert_(all(k in call(T1, "state_overview") for k in
                 ("yo","mensajes_pendientes","decisiones_recientes","hechos",
                  "infraestructura","subdominios","apps")), "faltan secciones"))
+    caso("A", "GET /panel sirve la consola (login por token, same-origin)",
+         lambda: assert_("Panel de state" in http("GET", f"{BASE}/panel").read().decode("utf-8"),
+                         "el panel no responde o no es la página esperada"))
+    caso("A", "el panel llega con CSP estricta y sin caché",
+         lambda: (lambda h: (assert_("default-src 'none'" in h.get("Content-Security-Policy",""), "sin CSP estricta"),
+                             assert_("frame-ancestors 'none'" in h.get("Content-Security-Policy",""), "permite iframes"),
+                             assert_(h.get("Cache-Control") == "no-store", "el panel es cacheable"),
+                             assert_(h.get("X-Content-Type-Options") == "nosniff", "sin nosniff")))
+                 (http("GET", f"{BASE}/panel").headers))
     n_tools = int(os.environ.get("BAT_TOOLS", "37"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
@@ -124,6 +133,7 @@ def puerta_C():
     else:
         salto("C", "tokens sin texto plano", "sin BAT_SSH")
     caso("C", "alta remota: invitación de un solo uso + aprobación de la autoridad", _c_alta_remota)
+    caso("C", "los tokens inválidos repetidos acaban en 429 (freno a fuerza bruta)", _c_freno_auth)
 
 _ult_ref = {}
 def _msg_firmado():
@@ -145,6 +155,14 @@ def _c_sol_cerrar_ajeno():
     # que el involucrado SÍ puede (cierre limpio del caso).
     ok = call(T2, "sol_cerrar", {"ref": ref, "estado": "descartada"})
     assert "cerrad" in json.dumps(ok) or ok, f"el involucrado no pudo cerrar: {ok}"
+
+def _c_freno_auth():
+    vio = []
+    for i in range(45):
+        if status_de(lambda: rpc(f"token-invalido-{RUN}-{i}" + "x" * 30, "tools/list")) == 429:
+            vio.append(1); break
+    assert vio, "45 tokens inválidos seguidos no dispararon el freno"
+    assert call(T1, "whoami").get("id"), "el freno afectó a una identidad válida"
 
 def _c_sin_texto_plano():
     pf = os.environ.get("BAT_PARTICIPANTS_FILE", "/etc/evastate-test/participants.json")

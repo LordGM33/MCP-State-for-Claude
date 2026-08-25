@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>state · Console</title>
+<style>
+:root{--bg:#0f0f0f;--s1:#1a1a1a;--s2:#202020;--s3:#2a2a2a;--bd:#2e2e2e;--tx:#e6e6e6;
+--mut:#9a9a9a;--rojo:#d50c2d;--verde:#2f9e6e;--amar:#d9822b}
+*{box-sizing:border-box}html,body{height:100%}
+body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:var(--bg);color:var(--tx);font-size:14px}
+a{color:inherit}
+#login{max-width:430px;margin:12vh auto;background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:28px}
+#login h2{margin:0 0 4px;font-size:19px}#login .sub{font-size:13px;color:var(--mut);margin-bottom:14px}
+#err{color:var(--rojo);font-size:13px;min-height:18px;margin-top:8px}
+input,select,textarea{font:inherit;color:var(--tx);background:var(--s2);border:1px solid var(--bd);
+border-radius:6px;padding:8px 10px;width:100%}
+input:focus,select:focus,textarea:focus{outline:1px solid var(--rojo)}
+label{font-size:12px;color:var(--mut);display:block;margin:10px 0 3px}
+button{font:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--bd);background:var(--s3);color:var(--tx);padding:7px 14px}
+button.pri{background:var(--rojo);border-color:var(--rojo);color:#fff;font-weight:600}
+button.mini{font-size:12px;padding:4px 10px;margin:6px 6px 0 0}
+button.ok{border-color:var(--verde);color:var(--verde)}button.mal{border-color:var(--rojo);color:var(--rojo)}
+#app{display:none;height:100vh}
+#app.on{display:flex}
+aside{width:215px;min-width:215px;background:var(--s1);border-right:1px solid var(--bd);
+display:flex;flex-direction:column;overflow-y:auto}
+.logo{display:flex;align-items:center;gap:8px;padding:16px 16px 12px;font-weight:800;font-size:16px;letter-spacing:.4px}
+.logo b{color:var(--rojo)}
+.sec{font-size:11px;color:var(--mut);letter-spacing:.8px;padding:14px 16px 4px;text-transform:uppercase}
+.nav{display:flex;align-items:center;gap:9px;padding:8px 16px;cursor:pointer;font-size:13.5px;color:#cfcfcf;border-left:3px solid transparent}
+.nav:hover{background:var(--s2)}
+.nav.act{background:var(--s2);border-left-color:var(--rojo);color:#fff;border-radius:0 8px 8px 0}
+.nav .dot{width:7px;height:7px;border-radius:99px;background:var(--mut)}
+.nav.act .dot{background:var(--rojo)}
+#zona{flex:1;display:flex;flex-direction:column;min-width:0}
+header{display:flex;align-items:center;gap:14px;padding:10px 22px;border-bottom:1px solid var(--bd);background:var(--s1)}
+header .busca{flex:1;max-width:520px;position:relative}
+#quien{margin-left:auto;font-size:13px;color:var(--mut);white-space:nowrap}
+#quien b{color:#fff}
+main{flex:1;overflow-y:auto;padding:20px 24px}
+h1{font-size:22px;font-weight:650;margin:0 0 14px}
+h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-transform:uppercase;letter-spacing:.5px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.tile{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:14px;cursor:pointer}
+.tile:hover{border-color:var(--rojo)}
+.tile .n{font-size:26px;font-weight:700}.tile .l{font-size:12px;color:var(--mut)}
+.tile.alerta .n{color:var(--rojo)}
+.card{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.card h3{margin:0 0 3px;font-size:14px;font-weight:600}
+.card .meta{font-size:12px;color:var(--mut)}
+.card pre{white-space:pre-wrap;font-size:13px;margin:8px 0 0;font-family:inherit;color:#d6d6d6}
+.card.pend{border-left:3px solid var(--rojo)}
+.card.bien{border-left:3px solid var(--verde)}
+.badge{display:inline-block;font-size:11px;padding:1px 8px;border-radius:99px;background:var(--s3);color:var(--mut);margin-left:6px}
+.badge.rojo{background:#3a1218;color:#ff8a9a}
+.fila{display:flex;gap:10px;align-items:end;flex-wrap:wrap}.fila>div{flex:1;min-width:140px}
+.acti{display:flex;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--bd);font-size:13px}
+.acti .cuando{margin-left:auto;color:var(--mut);font-size:12px;white-space:nowrap}
+.pto{width:8px;height:8px;border-radius:99px;background:var(--verde);margin-top:5px;flex:none}
+.pto.r{background:var(--rojo)}
+.aviso-seg{font-size:12px;color:var(--mut);border:1px dashed var(--bd);border-radius:8px;padding:8px 10px;margin-top:14px}
+</style>
+</head>
+<body>
+<div id="login">
+  <div class="logo" style="padding:0 0 10px"><b>state</b>&nbsp;Console</div>
+  <h2>Panel de state</h2>
+  <div class="sub">Acceso por token de participante. El token se conserva solo en
+  esta pestaña (sessionStorage), nunca en la URL de la página, y la sesión se
+  cierra sola tras 15 minutos sin actividad.</div>
+  <label>Token</label><input id="tok" type="password" autocomplete="off" onkeydown="if(event.key==='Enter')entrar()">
+  <div id="err"></div>
+  <button class="pri" style="margin-top:12px;width:100%" onclick="entrar()">Entrar</button>
+  <div class="aviso-seg">Tras Cloudflare + TLS. El servidor no guarda tokens en
+  claro (solo SHA-256) y limita los intentos fallidos. Cierra sesión al terminar
+  en equipos compartidos.</div>
+</div>
+
+<div id="app">
+<aside>
+  <div class="logo"><b>state</b> Console</div>
+  <div class="sec">Panel</div>
+  <div class="nav" data-v="dashboard"><span class="dot"></span>Dashboard</div>
+  <div class="nav" data-v="buscar"><span class="dot"></span>Buscar</div>
+  <div class="sec">Canal</div>
+  <div class="nav" data-v="cartelera"><span class="dot"></span>Cartelera</div>
+  <div class="nav" data-v="bandeja"><span class="dot"></span>Bandeja</div>
+  <div class="nav" data-v="redactar"><span class="dot"></span>Redactar</div>
+  <div class="nav" data-v="solicitudes"><span class="dot"></span>Solicitudes</div>
+  <div class="nav" data-v="historial"><span class="dot"></span>Historial</div>
+  <div class="sec">Gobierno</div>
+  <div class="nav" data-v="altas"><span class="dot"></span>Altas</div>
+  <div class="nav" data-v="participantes"><span class="dot"></span>Participantes</div>
+  <div class="nav" data-v="registros"><span class="dot"></span>Hechos y decisiones</div>
+  <div class="sec">Infra</div>
+  <div class="nav" data-v="infra"><span class="dot"></span>Subdominios y apps</div>
+</aside>
+<div id="zona">
+<header>
+  <div class="busca"><input id="q" placeholder="Buscar en el canal…" onkeydown="if(event.key==='Enter'){ir('buscar');buscar()}"></div>
+  <span id="quien"></span>
+  <button class="mini" onclick="salir()">Salir</button>
+</header>
+<main id="vista"></main>
+</div>
+</div>
+
+<script>
+let TOK = sessionStorage.getItem("state_tok") || "";
+let YO = null, VACT = "dashboard";
+const $ = s => document.querySelector(s);
+const esc = t => String(t ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+let idleT;
+function vivo() { clearTimeout(idleT); idleT = setTimeout(() => salir("sesión cerrada por inactividad"), 15*60*1000); }
+["click","keydown","scroll"].forEach(e => addEventListener(e, vivo, {passive:true}));
+
+async function tool(nombre, args) {
+  const r = await fetch(`/${TOK}/mcp`, {method: "POST",
+    headers: {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+    body: JSON.stringify({jsonrpc:"2.0", id:1, method:"tools/call", params:{name:nombre, arguments:args||{}}})});
+  if (r.status === 404) throw new Error("token no válido");
+  if (r.status === 429) throw new Error("límite de tasa alcanzado: espera un minuto");
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.message || "error MCP");
+  const txt = (j.result.content || []).map(c => c.text || "").join("\n");
+  if (txt.trim().startsWith("ERROR")) throw new Error(txt.slice(0, 250));
+  try { return JSON.parse(txt); } catch { return txt; }
+}
+
+async function entrar() {
+  TOK = $("#tok").value.trim(); $("#err").textContent = "";
+  try {
+    YO = await tool("whoami");
+    sessionStorage.setItem("state_tok", TOK);
+    $("#login").style.display = "none"; $("#app").classList.add("on");
+    $("#quien").innerHTML = `<b>${esc(YO.id)}</b> · ${esc(YO.tipo)}${YO.autoridad ? ' · <span style="color:var(--rojo)">AUTORIDAD</span>' : ""}`;
+    document.querySelectorAll(".nav").forEach(n => n.onclick = () => ir(n.dataset.v));
+    vivo(); ir("dashboard");
+  } catch (e) { $("#err").textContent = e.message; }
+}
+function salir(msg) {
+  sessionStorage.removeItem("state_tok");
+  location.reload();
+}
+
+async function ir(v) {
+  VACT = v;
+  document.querySelectorAll(".nav").forEach(n => n.classList.toggle("act", n.dataset.v === v));
+  $("#vista").innerHTML = "<p style='color:var(--mut)'>cargando…</p>";
+  try { await VISTAS[v](); } catch (e) { $("#vista").innerHTML = `<p style="color:var(--rojo)">${esc(e.message)}</p>`; }
+}
+const card = (cls, tit, meta, cuerpo, extra) =>
+  `<div class="card ${cls}"><h3>${tit}</h3><div class="meta">${meta}</div>${cuerpo?`<pre>${cuerpo}</pre>`:""}${extra||""}</div>`;
+async function accion(t, args, vista) { try { await tool(t, args); ir(vista); } catch (e) { alert(e.message); } }
+
+const VISTAS = {
+async dashboard() {
+  const o = await tool("state_overview");
+  const hace = new Date(Date.now() - 7*864e5).toISOString().slice(0,10);
+  let act = []; try { act = await tool("msg_desde", {fecha_iso: hace}); } catch {}
+  if (!Array.isArray(act)) act = [];
+  const tiles = [
+    ["cartelera", o.cartelera_pendiente?.length || 0, "Cartelera pendiente", true],
+    ["bandeja", o.mensajes_pendientes?.length || 0, "Bandeja", true],
+    ["solicitudes", o.esperando_respuesta?.length || 0, "Esperando respuesta", true],
+    ["registros", o.decisiones_recientes?.length || 0, "Decisiones recientes", false],
+    ["registros", o.hechos?.length || 0, "Hechos canónicos", false],
+    ["infra", (o.subdominios?.length || 0), "Subdominios", false],
+    ["infra", (o.apps?.length || 0), "Apps", false]];
+  let h = `<h1>Dashboard</h1><div class="tiles">` + tiles.map(([v,n,l,a]) =>
+    `<div class="tile ${a && n ? "alerta" : ""}" onclick="ir('${v}')"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("") + "</div>";
+  h += "<h2 class='t'>Actividad · últimos 7 días</h2>";
+  h += act.slice().reverse().slice(0, 25).map(m =>
+    `<div class="acti"><span class="pto ${m.tipo === "alerta" ? "r" : ""}"></span>
+     <div><b>${esc(m.de)}</b> → ${esc(m.para)} · ${esc(m.asunto)}${m.ref ? `<span class="badge">${esc(m.ref)}</span>` : ""}
+     <span class="badge">${esc(m.tipo)}</span></div><span class="cuando">${esc((m._creado||"").slice(0,16).replace("T"," "))}</span></div>`).join("")
+     || "<p class='meta' style='color:var(--mut)'>sin actividad</p>";
+  $("#vista").innerHTML = h;
+},
+async buscar() {
+  $("#vista").innerHTML = `<h1>Buscar</h1><div id="b-out" style="margin-top:8px"><p style="color:var(--mut)">Escribe arriba y pulsa Enter.</p></div>`;
+  if ($("#q").value.trim()) buscar();
+},
+async cartelera() {
+  const items = await tool("cartelera", {incluir_cerrados: true});
+  let h = "<h1>Cartelera</h1>";
+  if (YO.autoridad) h += `<div class="card"><h3>Publicar</h3>
+    <div class="fila"><div style="max-width:160px"><label>Tipo</label><select id="c-tipo">
+    <option>regla</option><option>condicion</option><option>peticion</option><option>aviso</option></select></div>
+    <div style="flex:3"><label>Asunto</label><input id="c-asunto"></div></div>
+    <label>Cuerpo</label><textarea id="c-cuerpo" rows="3"></textarea>
+    <label>Formato de respuesta (solo peticiones)</label><input id="c-fmt">
+    <button class="pri mini" onclick="pubCartel()">Publicar</button></div>`;
+  h += items.map(c => {
+    const pend = String(c.mi_estado || "").startsWith("PENDIENTE");
+    let x = "";
+    if (pend && c.requiere === "confirmacion")
+      x += `<button class="mini ok" onclick="accion('cartel_confirmar',{ref:'${c.ref}'},'cartelera')">Confirmar integración</button>`;
+    if (pend && c.requiere === "respuesta")
+      x += `<button class="mini" onclick="prep('respuesta','${esc(c.de)}','${c.ref}')">Responder en privado</button>`;
+    if (YO.autoridad) {
+      x += `<button class="mini" onclick="verEstado('${c.ref}')">Matriz</button>`;
+      if (c.estado === "activo") x += `<button class="mini mal" onclick="accion('cartel_cerrar',{ref:'${c.ref}'},'cartelera')">Cerrar</button>`;
+    }
+    return card(pend ? "pend" : "bien",
+      `${esc(c.ref)} · ${esc(c.asunto)}<span class="badge">${esc(c.tipo)}</span><span class="badge">${esc(c.estado)}</span>`,
+      `de ${esc(c.de)} · requiere ${esc(c.requiere)} · mi estado: ${esc(c.mi_estado)}`, esc(c.cuerpo), x);
+  }).join("") || "<p style='color:var(--mut)'>vacía</p>";
+  $("#vista").innerHTML = h;
+},
+async bandeja() {
+  const msgs = await tool("msg_inbox", {incluir_atendidos: false});
+  $("#vista").innerHTML = "<h1>Bandeja</h1>" + (msgs.map(m => card("pend",
+    `${esc(m.asunto)}${m.ref ? `<span class="badge">${esc(m.ref)}</span>` : ""}<span class="badge">${esc(m.tipo)}</span>`,
+    `de ${esc(m.de)} para ${esc(m.para)} · ${esc(m._creado)}`, esc(m.cuerpo),
+    (m.tipo === "solicitud" && m.ref ? `<button class="mini" onclick="prep('respuesta','${esc(m.de)}','${m.ref}')">Responder</button>` :
+     `<button class="mini" onclick="prep('aviso','${esc(m.de)}','')">Responder</button>`) +
+    (m.para !== "todos" ? `<button class="mini ok" onclick="accion('msg_ack',{id:${m._id}},'bandeja')">Atendido</button>`
+                        : `<span class="badge">aviso a todos: no atender (D8)</span>`)).join("")
+    || "<p style='color:var(--mut)'>vacía</p>");
+},
+async redactar() {
+  const parts = await tool("participantes");
+  const ops = ['<option>todos</option>'].concat(parts.filter(p => p.activo && p.id !== YO.id).map(p => `<option>${esc(p.id)}</option>`)).join("");
+  $("#vista").innerHTML = `<h1>Redactar</h1><div class="card">
+    <div class="fila">
+    <div style="max-width:180px"><label>Para</label><select id="m-para">${ops}</select></div>
+    <div style="max-width:160px"><label>Tipo</label><select id="m-tipo">
+      <option>aviso</option><option>solicitud</option><option>respuesta</option><option>bitacora</option><option>alerta</option></select></div>
+    <div><label>Responde a (ref, si es respuesta)</label><input id="m-ra" placeholder="SOL-007 / CART-001 / archivo:…"></div></div>
+    <label>Asunto</label><input id="m-asunto">
+    <label>Cuerpo</label><textarea id="m-cuerpo" rows="5"></textarea>
+    <button class="pri mini" onclick="enviarMsg()">Enviar</button>
+    <span class="badge">la identidad la firma el servidor: ${esc(YO.id)}</span></div>`;
+  if (window._prep) { const [t,p,r] = window._prep; $("#m-tipo").value = t; $("#m-para").value = p; $("#m-ra").value = r; window._prep = null; }
+},
+async solicitudes() {
+  const o = await tool("state_overview");
+  let h = "<h1>Solicitudes</h1><h2 class='t'>Mías, esperando respuesta</h2>";
+  h += (o.esperando_respuesta || []).map(m => card("pend", `${esc(m.ref)} · ${esc(m.asunto)}`,
+    `para ${esc(m.para)} · desde ${esc(m._creado)}`, esc(m.cuerpo),
+    `<button class="mini mal" onclick="cerrarSol('${m.ref}')">Cerrar</button>`)).join("") || "<p style='color:var(--mut)'>ninguna</p>";
+  h += "<h2 class='t'>Dirigidas a mí (abiertas)</h2>";
+  const inbox = await tool("msg_inbox");
+  h += inbox.filter(m => m.tipo === "solicitud").map(m => card("pend",
+    `${esc(m.ref)} · ${esc(m.asunto)}`, `de ${esc(m.de)} · ${esc(m._creado)}`, esc(m.cuerpo),
+    `<button class="mini" onclick="prep('respuesta','${esc(m.de)}','${m.ref}')">Responder</button>`)).join("") || "<p style='color:var(--mut)'>ninguna</p>";
+  $("#vista").innerHTML = h;
+},
+async historial() {
+  const parts = await tool("participantes");
+  $("#vista").innerHTML = `<h1>Historial por par</h1><div class="fila" style="max-width:420px">
+    <div><label>Participante</label><select id="h-con">` +
+    parts.filter(p => p.id !== YO.id).map(p => `<option>${esc(p.id)}</option>`).join("") +
+    `</select></div><button class="mini pri" onclick="verHist()">Ver</button></div><div id="h-out" style="margin-top:12px"></div>`;
+},
+async altas() {
+  if (!YO.autoridad) { $("#vista").innerHTML = "<h1>Altas</h1><p style='color:var(--mut)'>Solo la autoridad gestiona altas.</p>"; return; }
+  const pend = await tool("altas_pendientes");
+  let h = `<h1>Altas</h1><div class="card"><h3>Invitar a un cliente nuevo</h3>
+    <div class="meta">Código de un solo uso, caduca en 7 días. Entrégalo por canal privado; el candidato propone su propio token en /registro.</div>
+    <label>Nota</label><input id="i-nota">
+    <button class="pri mini" onclick="invitar()">Emitir invitación</button><pre id="i-out"></pre></div>
+    <h2 class="t">Pendientes de aprobación</h2>`;
+  h += pend.map(p => card("pend", `${esc(p.id)}<span class="badge">${esc(p.tipo)}</span>`,
+    `${esc(p.nombre)} · máquina ${esc(p.maquina)} · solicitada ${esc(p.solicitada)} · invitó ${esc(p.emitida_por)}`, "",
+    `<button class="mini ok" onclick="accion('alta_aprobar',{id:'${p.id}'},'altas')">Aprobar</button>
+     <button class="mini mal" onclick="vetar('${p.id}')">Vetar</button>`)).join("") || "<p style='color:var(--mut)'>ninguna</p>";
+  $("#vista").innerHTML = h;
+},
+async participantes() {
+  const parts = await tool("participantes");
+  $("#vista").innerHTML = "<h1>Participantes</h1>" + parts.map(p =>
+    card(p.activo ? "bien" : "", `${esc(p.id)}<span class="badge">${esc(p.tipo)}</span>` +
+      (p.autoridad ? '<span class="badge rojo">autoridad</span>' : "") + (p.activo ? "" : '<span class="badge">baja</span>'),
+      `${esc(p.nombre)} · ${esc(p.maquina || "—")} · desde ${esc(p.desde)}${p.alta_via ? " · vía " + esc(p.alta_via) : ""}`)).join("");
+},
+async registros() {
+  const [hechos, dec] = await Promise.all([tool("fact_list"), tool("decision_list")]);
+  let h = "<h1>Hechos y decisiones</h1>";
+  if (YO.autoridad) h += `<div class="card"><h3>Nuevo hecho canónico</h3>
+    <div class="fila"><div><label>Clave</label><input id="f-clave"></div>
+    <div style="flex:2"><label>Valor</label><input id="f-valor"></div>
+    <div><label>Fuente</label><input id="f-fuente"></div></div>
+    <button class="pri mini" onclick="nuevoHecho()">Fijar hecho</button></div>`;
+  h += "<h2 class='t'>Hechos canónicos</h2>";
+  h += hechos.map(f => card("", esc(f.clave), `de ${esc(f.de)} · ${esc(f.fuente || "")}`, esc(f.valor))).join("");
+  h += "<h2 class='t'>Decisiones</h2>";
+  h += dec.map(d => card(d._estado === "superada" ? "" : "bien",
+    `${esc(d.titulo)}${d._estado ? `<span class="badge">${esc(d._estado)}</span>` : ""}`,
+    `de ${esc(d.de)} · ${esc(d._creado)} · #${d._id}`, esc(d.decision) + "\n\nMotivo: " + esc(d.motivo || ""))).join("");
+  $("#vista").innerHTML = h;
+},
+async infra() {
+  const [infra, subs, apps] = await Promise.all([tool("infra_list"), tool("subdomain_list"), tool("app_list")]);
+  let h = "<h1>Subdominios y apps</h1><h2 class='t'>Infraestructura</h2>";
+  h += infra.map(i => card("", `${esc(i.id)}<span class="badge">${esc(i.tipo)}</span>`, esc(i.dominios || ""), esc(i.descripcion))).join("");
+  h += "<h2 class='t'>Subdominios</h2>";
+  h += subs.map(s => card(s.estado === "ocupado" ? "bien" : "", `${esc(s.nombre)}<span class="badge">${esc(s.estado)}</span>`,
+    `dueño ${esc(s.dueno)} · ${esc(s.url || "")}`, esc(s.notas || ""))).join("");
+  h += "<h2 class='t'>Apps dinámicas</h2>";
+  h += apps.map(a => card("", `${esc(a.nombre)}<span class="badge">:${esc(a.puerto)}</span>`, `dueño ${esc(a.dueno)}`, "",
+    `<button class="mini" onclick="verLogs('${a.nombre}')">Logs</button>
+     <button class="mini ok" onclick="accion('app_start',{nombre:'${a.nombre}'},'infra')">Start</button>
+     <button class="mini" onclick="accion('app_restart',{nombre:'${a.nombre}'},'infra')">Restart</button>
+     <button class="mini mal" onclick="accion('app_stop',{nombre:'${a.nombre}'},'infra')">Stop</button>`)).join("")
+     || "<p style='color:var(--mut)'>ninguna</p>";
+  $("#vista").innerHTML = h;
+}};
+
+function prep(tipo, para, ref) { window._prep = [tipo, para, ref]; ir("redactar"); }
+async function enviarMsg() {
+  try {
+    const args = {para: $("#m-para").value, tipo: $("#m-tipo").value,
+                  asunto: $("#m-asunto").value, cuerpo: $("#m-cuerpo").value};
+    if ($("#m-ra").value.trim()) args.responde_a = $("#m-ra").value.trim();
+    const r = await tool("msg_send", args);
+    alert("Enviado" + (r.ref ? " · " + r.ref : "")); ir("dashboard");
+  } catch (e) { alert(e.message); }
+}
+async function cerrarSol(ref) {
+  const est = confirm("¿Cerrar como RESPONDIDA? (Cancelar = descartada)") ? "respondida" : "descartada";
+  accion("sol_cerrar", {ref, estado: est}, "solicitudes");
+}
+async function pubCartel() {
+  try {
+    await tool("cartel_publicar", {tipo: $("#c-tipo").value, asunto: $("#c-asunto").value,
+      cuerpo: $("#c-cuerpo").value, formato_respuesta: $("#c-fmt").value});
+    ir("cartelera");
+  } catch (e) { alert(e.message); }
+}
+async function invitar() {
+  try {
+    const r = await tool("alta_invitar", {nota: $("#i-nota").value});
+    $("#i-out").textContent = "CÓDIGO (se muestra una sola vez):\n" + r.codigo + "\n\n" + r.instrucciones;
+  } catch (e) { alert(e.message); }
+}
+function vetar(id) { const m = prompt("Motivo del veto (opcional):") || ""; accion("alta_rechazar", {id, motivo: m}, "altas"); }
+async function verEstado(ref) {
+  try {
+    const e = await tool("cartel_estado", {ref});
+    alert(`${ref}\nConfirmados: ${Object.keys(e.confirmados).join(", ") || "nadie"}\nPendientes: ${e.pendientes.join(", ") || "nadie"}`);
+  } catch (e) { alert(e.message); }
+}
+async function verHist() {
+  try {
+    const h = await tool("msg_historial", {con_quien: $("#h-con").value});
+    $("#h-out").innerHTML = h.mensajes.map(m => card(m.de === YO.id ? "" : "bien",
+      `${esc(m.asunto)}${m.ref ? `<span class="badge">${esc(m.ref)}</span>` : ""}<span class="badge">${esc(m.tipo)}</span>`,
+      `#${m._id} · ${esc(m.de)} → ${esc(m.para)} · ${esc(m._creado)} · ${esc(m.estado || "")}`, esc(m.cuerpo))).join("")
+      || "<p style='color:var(--mut)'>sin mensajes directos</p>";
+  } catch (e) { alert(e.message); }
+}
+async function buscar() {
+  const q = $("#q").value.trim(); if (!q) return;
+  try {
+    const res = await tool("search", {texto: q});
+    $("#b-out").innerHTML = (Array.isArray(res) ? res : []).map(r => card("",
+      `${esc(r.asunto || r.clave || r.titulo || r.nombre || r._id)}<span class="badge">${esc(r._kind || r.tipo || "")}</span>`,
+      `#${r._id || ""} · ${esc(r._creado || "")}`,
+      esc(r.cuerpo || r.valor || r.decision || ""))).join("") || "<p style='color:var(--mut)'>sin resultados</p>";
+  } catch (e) { $("#b-out").innerHTML = `<p style="color:var(--rojo)">${esc(e.message)}</p>`; }
+}
+async function verLogs(n) {
+  try { alert(await tool("app_logs", {nombre: n, lineas: 30})); } catch (e) { alert(e.message); }
+}
+if (TOK) { $("#tok").value = TOK; entrar(); }
+</script>
+</body>
+</html>

@@ -8,7 +8,7 @@ from collections import deque
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from starlette.routing import Route
 
 DB_PATH = os.environ.get("EVASTATE_DB", "/var/lib/evastate/state.db")
@@ -16,6 +16,7 @@ PARTICIPANTS_PATH = os.environ.get("EVASTATE_PARTICIPANTS", "/etc/evastate/parti
 DOMAIN = os.environ.get("EVASTATE_DOMAIN", "example.com")
 PUBLIC_HOST = os.environ.get("EVASTATE_PUBLIC_HOST", f"state.{DOMAIN}")
 SERVER_NAME = os.environ.get("EVASTATE_NAME", "estado-mcp")
+PANEL_PATH = os.environ.get("EVASTATE_PANEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html"))
 SITES_DIR = os.environ.get("EVASTATE_SITES", "/var/www/sites")
 APPS_DIR = os.environ.get("EVASTATE_APPS", "/srv/apps")
 CTL = "/usr/local/sbin/eva-app-ctl"
@@ -886,7 +887,22 @@ async def lifespan(app):
     async with mcp.session_manager.run():
         yield
 
-base = Starlette(routes=[Route("/health", health), Route("/tls-check", tls_check)],
+async def panel_get(_):
+    """Panel de administracion: pagina estatica same-origin; la identidad la pone
+    el token que el usuario introduce (no hay sesion en el servidor)."""
+    try:
+        return HTMLResponse(open(PANEL_PATH, encoding="utf-8").read(), headers={
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
+                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Cache-Control": "no-store"})
+    except Exception:
+        return PlainTextResponse("panel no instalado", status_code=404)
+
+base = Starlette(routes=[Route("/health", health), Route("/tls-check", tls_check),
+                         Route("/panel", panel_get)],
                  lifespan=lifespan)
 mcp_asgi = mcp.streamable_http_app(
     stateless_http=True,
@@ -910,6 +926,9 @@ async def app(scope, receive, send):
         from starlette.requests import Request
         resp = await registro_post(Request(scope, receive))
         return await resp(scope, receive, send)
+    if len(partes) >= 3 and _sha(partes[1]) not in TOKEN_INDEX and partes[2] in ("mcp", "backup", "deploy", "app"):
+        if not _rate_ok("__auth_fail__", 30):
+            return await JSONResponse({"error": "demasiados intentos"}, status_code=429)(scope, receive, send)
     if len(partes) >= 3 and _sha(partes[1]) in TOKEN_INDEX:
         pid = TOKEN_INDEX[_sha(partes[1])]
         if not _rate_ok(pid):

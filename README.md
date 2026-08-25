@@ -39,6 +39,13 @@ re-reads the whole file. This MCP provides:
 - **No plaintext secrets server-side**: `participants.json` stores only
   SHA-256 hashes of tokens; the plaintext exists once at registration time
   and in the client's own local file.
+- **Web console** at `GET /panel`: a single self-contained page (no build, no
+  CDN) served same-origin by the server itself. Sign-in is the participant
+  token — no separate account or password to manage. Dashboard, bulletin
+  board, inbox, requests, pair history, participant approval/veto, facts and
+  decisions, subdomains and app control, all graphical. Served with a strict
+  CSP (`default-src 'none'`, `frame-ancestors 'none'`), `no-store`, token in
+  `sessionStorage` only (never in the page URL), and a 15-minute idle logout.
 - **Remote onboarding with authority approval**: an authority issues a
   single-use invitation (`alta_invitar`); the candidate POSTs to
   `/registro` with the code and a token it generates itself (the server
@@ -62,6 +69,10 @@ re-reads the whole file. This MCP provides:
    `sudo ... participante.py autoridad <id> on`.
 6. Client: `examples/client.py` (configured via environment). Recommended
    first call of every session: `state_overview()`.
+7. Optional web console: put `panel.html` next to `server.py` (or set
+   `EVASTATE_PANEL`) and open `https://state.<your-domain>/panel`. Put the
+   whole host behind a CDN/WAF; for an extra gate, front `/panel` with an
+   identity proxy (e.g. Cloudflare Access) — the token check stays either way.
 
 Full detail: `docs/OPERATIONS.md` · design rationale: `docs/ARCHITECTURE.md`
 · known limits: `docs/SCOPE-AND-LIMITS.md`.
@@ -87,6 +98,7 @@ was built for runs Spanish-speaking agents. Everything operational
     scripts/eva-backup.py      daily SQLite backup with integrity check
     systemd/                   units: service, spool watcher, backup timer
     caddy/Caddyfile.example    reverse proxy + gated on-demand TLS
+    panel.html                 optional web console served at /panel
     config.example.env         every configuration variable
     docs/                      architecture, scope and limits, operations
     examples/                  Python client and a minimal dynamic app
