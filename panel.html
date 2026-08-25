@@ -262,10 +262,18 @@ async historial() {
 async altas() {
   if (!YO.autoridad) { $("#vista").innerHTML = "<h1>Altas</h1><p style='color:var(--mut)'>Solo la autoridad gestiona altas.</p>"; return; }
   const pend = await tool("altas_pendientes");
-  let h = `<h1>Altas</h1><div class="card"><h3>Invitar a un cliente nuevo</h3>
-    <div class="meta">Código de un solo uso, caduca en 7 días. Entrégalo por canal privado; el candidato propone su propio token en /registro.</div>
-    <label>Nota</label><input id="i-nota">
-    <button class="pri mini" onclick="invitar()">Emitir invitación</button><pre id="i-out"></pre></div>
+  let h = `<h1>Altas</h1><div class="card"><h3>Invitar a un cowork nuevo</h3>
+    <div class="meta">Genera el texto completo para entregarle: sirve tal cual, en cualquier
+    equipo y proyecto. El código es de un solo uso y caduca en 7 días.</div>
+    <div class="fila"><div><label>Id para el cowork nuevo (opcional)</label><input id="i-id" placeholder="editorial"></div>
+    <div style="flex:2"><label>Nota interna</label><input id="i-nota"></div></div>
+    <button class="pri mini" onclick="invitar()">Emitir invitación</button>
+    <div id="i-zona" style="display:none">
+      <label>Texto para entregar al cowork nuevo — cópialo entero</label>
+      <textarea id="i-txt" rows="14" readonly onclick="this.select()"></textarea>
+      <button class="mini ok" onclick="copiarInv()">Copiar al portapapeles</button>
+      <span id="i-copiado" class="badge"></span>
+    </div></div>
     <h2 class="t">Pendientes de aprobación</h2>`;
   h += pend.map(p => card("pend", `${esc(p.id)}<span class="badge">${esc(p.tipo)}</span>`,
     `${esc(p.nombre)} · máquina ${esc(p.maquina)} · solicitada ${esc(p.solicitada)} · invitó ${esc(p.emitida_por)}`, "",
@@ -368,9 +376,17 @@ async function pubCartel() {
 }
 async function invitar() {
   try {
-    const r = await tool("alta_invitar", {nota: $("#i-nota").value});
-    $("#i-out").textContent = "CÓDIGO (se muestra una sola vez):\n" + r.codigo + "\n\n" + r.instrucciones;
+    const r = await tool("alta_invitar", {nota: $("#i-nota").value, id_sugerido: $("#i-id").value.trim()});
+    $("#i-txt").value = r.texto_para_el_cowork;
+    $("#i-zona").style.display = "block";
+    $("#i-copiado").textContent = "";
   } catch (e) { alert(e.message); }
+}
+async function copiarInv() {
+  const t = $("#i-txt");
+  try { await navigator.clipboard.writeText(t.value); }
+  catch { t.select(); document.execCommand("copy"); }
+  $("#i-copiado").textContent = "copiado";
 }
 function vetar(id) { const m = prompt("Motivo del veto (opcional):") || ""; accion("alta_rechazar", {id, motivo: m}, "altas"); }
 async function verEstado(ref) {

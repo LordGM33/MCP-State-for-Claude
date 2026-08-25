@@ -163,6 +163,7 @@ def puerta_C():
     else:
         salto("C", "tokens sin texto plano", "sin BAT_SSH")
     caso("C", "alta remota: invitación de un solo uso + aprobación de la autoridad", _c_alta_remota)
+    caso("C", "la invitación trae un texto listo para pegar, con script válido", _c_texto_invitacion)
     caso("C", "subdominio de un no-autoridad queda PENDIENTE y no puede desplegar", _c_sub_pendiente)
     caso("C", "la autoridad aprueba/rechaza subdominios; tras aprobar sí despliega", _c_sub_aprobar)
 
@@ -256,6 +257,24 @@ def _c_sin_texto_plano():
     r = subprocess.run(SSH.split() + [f"sudo grep -cF {T1} {pf} || true"],
                        capture_output=True, text=True, timeout=30)
     assert r.stdout.strip() in ("0", ""), f"el token de T1 aparece en {pf}"
+
+def _c_texto_invitacion():
+    """El texto debe servir sin editar nada: con el codigo dentro, el host real
+    y un script que al menos sea Python valido (si no, el cowork se atasca)."""
+    import ast
+    inv = call(T1, "alta_invitar", {"nota": "bateria", "id_sugerido": "bat" + RUN[-5:]})
+    txt = inv.get("texto_para_el_cowork", "")
+    assert inv["codigo"] in txt, "el texto no incluye el codigo"
+    assert BASE.split("//")[1] in txt, "el texto no incluye el host real"
+    assert "state" in txt and "git" in txt, "no explica donde guardar la clave"
+    partes = txt.split("-" * 77)
+    assert len(partes) >= 3, "no se encuentra el script delimitado"
+    ast.parse(partes[1])
+    try:
+        call(T2, "alta_invitar", {})
+        assert False, "un no-autoridad emitió una invitación"
+    except Rechazo:
+        pass
 
 def _c_alta_remota():
     inv = call(T1, "alta_invitar", {"nota": "caso de bateria"})

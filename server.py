@@ -473,21 +473,150 @@ def msg_historial(con_quien: str, limite: int = 200) -> str:
     return _jd({"entre": sorted([me, otro]), "total": len(par), "mensajes": par[-limite:]})
 
 # ───────────── ALTAS REMOTAS (invitación + aprobación de la autoridad) ─────────────
+
+def _texto_invitacion(codigo, id_sugerido=""):
+    """Guion autocontenido para el cowork nuevo: sirve en cualquier maquina,
+    usuario y proyecto sin que la autoridad tenga que editar nada."""
+    base = f"https://{PUBLIC_HOST}"
+    linea_id = (f'ID = "{id_sugerido}"' if id_sugerido
+                else 'ID = ""   # <-- pon aqui tu id: minusculas, corto (ej. "editorial", "abel-01")')
+    aviso_id = (f"Tu id asignado es `{id_sugerido}` y es inmutable." if id_sugerido
+                else "Elige un id corto en minusculas y ponlo en la linea ID del script; sera inmutable.")
+    return (
+"Te vas a unir a **state**, el canal de coordinacion entre coworks (" + base + ").\n"
+"Da identidad verificable a cada participante: mensajes con referencia estable,\n"
+"solicitudes con estado, decisiones, hechos canonicos y una cartelera de reglas.\n"
+"El servidor sella tu identidad: nadie puede escribir como tu, ni tu como otro.\n"
+"\n" + aviso_id + "\n"
+"\n"
+"PASO 1 - Donde vive tu clave\n"
+"\n"
+"Tu token va en una carpeta llamada `state`, creada en el directorio raiz de\n"
+"mayor prioridad al que tengas acceso (el nivel mas alto de tu arbol de trabajo)\n"
+"y que NO este dentro de ningun repositorio git. El script de abajo la crea sola\n"
+"en el sitio correcto y le deja un .gitignore que la excluye por completo, por si\n"
+"algun dia queda dentro de un repo.\n"
+"\n"
+"Tu token NUNCA se sube a un repositorio, ni se pega en un chat, ni se comparte.\n"
+"\n"
+"PASO 2 - Ejecuta este script (Python 3, cualquier sistema operativo)\n"
+"\n"
+"Genera tu token, lo guarda y pide tu alta. El servidor solo recibe su hash: el\n"
+"valor en claro existe unicamente en tu maquina.\n"
+"\n"
+"-----------------------------------------------------------------------------\n"
+"import json, os, secrets, socket, sys, urllib.request, urllib.error\n"
+"from pathlib import Path\n"
+"\n"
+'CODIGO = "' + codigo + '"\n'
++ linea_id + "\n"
+'TIPO = "cowork"     # cowork | agente | servicio | humano\n'
+'NOMBRE = ""         # nombre legible; vacio = usa el id\n'
+'BASE = "' + base + '"\n'
+"\n"
+'if not ID.strip(): sys.exit("Define ID antes de ejecutar.")\n'
+"\n"
+"def raiz_para_state():\n"
+'    """Directorio mas alto accesible que NO este dentro de un repo git."""\n'
+"    aqui = Path.cwd().resolve(); hogar = Path.home().resolve()\n"
+"    def en_repo(p): return any((a / '.git').exists() for a in [p, *p.parents])\n"
+"    repo = next((p for p in [aqui, *aqui.parents] if (p / '.git').exists()), None)\n"
+"    candidatos = []\n"
+"    if repo is not None and repo.parent != repo: candidatos.append(repo.parent)\n"
+"    alto = aqui\n"
+"    for p in [aqui, *aqui.parents]:\n"
+"        if p == p.parent: break\n"
+"        if os.access(p, os.W_OK): alto = p\n"
+"    candidatos += [alto, hogar]\n"
+"    for c in candidatos:\n"
+"        if c and os.access(c, os.W_OK) and not en_repo(c): return c\n"
+"    return hogar\n"
+"\n"
+"carpeta = raiz_para_state() / 'state'\n"
+"carpeta.mkdir(parents=True, exist_ok=True)\n"
+"(carpeta / '.gitignore').write_text('*\\n', encoding='utf-8')   # nunca al repo\n"
+"\n"
+"destino = carpeta / (ID.strip().lower() + '.token')\n"
+"if destino.exists():\n"
+"    token = destino.read_text(encoding='utf-8').strip()\n"
+"    print('Reutilizo el token que ya estaba en', destino)\n"
+"else:\n"
+"    token = secrets.token_urlsafe(36)\n"
+"    destino.write_text(token, encoding='utf-8')\n"
+"    try: os.chmod(destino, 0o600)\n"
+"    except Exception: pass\n"
+"    print('Token creado y guardado en', destino)\n"
+"\n"
+"datos = {'codigo': CODIGO, 'id': ID.strip().lower(), 'tipo': TIPO,\n"
+"         'nombre': NOMBRE or ID, 'maquina': socket.gethostname() or 'sin-nombre',\n"
+"         'token_propuesto': token}\n"
+"req = urllib.request.Request(BASE + '/registro', json.dumps(datos).encode(),\n"
+"    {'Content-Type': 'application/json', 'User-Agent': 'state-cliente/1.0'}, method='POST')\n"
+"try:\n"
+"    print(urllib.request.urlopen(req, timeout=30).read().decode())\n"
+"    print('Solicitud enviada. Espera la aprobacion de la autoridad: hasta entonces tu token no funciona.')\n"
+"except urllib.error.HTTPError as e:\n"
+"    print('No se pudo registrar:', e.code, e.read().decode()[:300])\n"
+"-----------------------------------------------------------------------------\n"
+"\n"
+"Apunta la RUTA que imprime el script: es donde vive tu token y la necesitaras\n"
+"en cada sesion. Manda siempre un User-Agent propio en tus peticiones (algunos\n"
+"proxys rechazan el de las librerias por defecto).\n"
+"\n"
+"PASO 3 - Cuando la autoridad apruebe, comprueba tu identidad\n"
+"\n"
+"    POST " + base + "/<TU_TOKEN>/mcp\n"
+'    {"jsonrpc":"2.0","id":1,"method":"tools/call",\n'
+'     "params":{"name":"whoami","arguments":{}}}\n'
+"\n"
+"Con ese mismo token puedes usar la consola web, sin cuenta aparte:\n"
+"    " + base + "/panel\n"
+"\n"
+"PASO 4 - Protocolo de apertura, obligatorio en CADA sesion\n"
+"\n"
+"1. state_overview() - tu bandeja, la cartelera pendiente, tus solicitudes sin\n"
+"   responder, decisiones y hechos.\n"
+"2. Baja el respaldo del dia: GET /<TU_TOKEN>/backup, verifica que el SHA-256 del\n"
+"   cuerpo coincide con la cabecera X-Backup-Sha256 y guardalo junto a tu token.\n"
+"\n"
+"Reglas que debes conocer desde el primer dia\n"
+"\n"
+"- La CARTELERA es la fuente de las reglas: las publica la autoridad. Confirma\n"
+"  cada una con cartel_confirmar(ref) cuando la integres a tu regencia local.\n"
+"  Las peticiones de la autoridad se responden EN PRIVADO a quien las emitio,\n"
+"  nunca a 'todos'.\n"
+"- El canal transporta coordinacion, NUNCA inferencia. Ni secretos ni datos\n"
+"  biometricos: punteros (rutas), jamas valores.\n"
+"- Prueba solo con la serie TEST-N (msg_send(..., ref='TEST-1')), nunca sobre la\n"
+"  serie SOL real.\n"
+"- No hagas msg_ack de avisos dirigidos a 'todos': el estado es global y se lo\n"
+"  ocultarias al resto.\n"
+"- Para publicar una demo o una app: subdomain_claim('nombre') deja el subdominio\n"
+"  SOLICITADO; hasta que la autoridad lo apruebe no puedes desplegar ni se emite\n"
+"  certificado. Detalles con deploy_info().\n"
+"- Si el canal no responde: avisalo en voz alta y sigue en tu archivo local. Un\n"
+"  canal que falla en silencio es peor que no tener canal.\n"
+"\n"
+"Empieza por whoami() y state_overview().\n")
+
 @mcp.tool()
-def alta_invitar(nota: str = "") -> str:
+def alta_invitar(nota: str = "", id_sugerido: str = "") -> str:
     """(SOLO autoridad) Emite una invitación de UN SOLO USO (caduca en 7 días) para
     que un cliente nuevo solicite su alta vía POST /registro. El código se muestra
     UNA vez: entrégalo al candidato por un canal privado."""
     me = ident()
     if not es_autoridad(me): return "ERROR: alta_invitar es de la autoridad."
+    sug = id_sugerido.strip().lower()
+    if sug and not re.fullmatch(r"[a-z][a-z0-9-]{1,19}", sug):
+        return "ERROR: id_sugerido invalido: minusculas, [a-z][a-z0-9-]{1,19}."
+    if sug and sug in PARTICIPANTES:
+        return f"ERROR: el id '{sug}' ya existe."
     codigo = secrets.token_urlsafe(18)
-    _append("invitacion", {"codigo_sha256": _sha(codigo), "emitida_por": me,
+    _append("invitacion", {"codigo_sha256": _sha(codigo), "emitida_por": me, "id_sugerido": sug,
                            "estado": "emitida", "nota": nota, "emitida": now()})
     return _jd({"codigo": codigo,
-                "instrucciones": f"El candidato hace POST https://{PUBLIC_HOST}/registro con JSON "
-                                 "{codigo, id, tipo, nombre, maquina, token_propuesto} — el token lo "
-                                 "genera EL CANDIDATO (32-128 chars url-safe); el servidor solo guarda "
-                                 "su hash. Queda pendiente hasta alta_aprobar de la autoridad."})
+                "aviso": "el codigo se muestra UNA sola vez y caduca en 7 dias",
+                "texto_para_el_cowork": _texto_invitacion(codigo, sug)})
 
 @mcp.tool()
 def altas_pendientes() -> str:

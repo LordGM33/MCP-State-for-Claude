@@ -98,12 +98,15 @@ An authority's own `subdomain_claim` is approved on the spot.
 
 For a new client on another machine or account, no SSH needed:
 
-1. An authority runs `alta_invitar()` over MCP → single-use code (7-day
-   expiry). Hand it to the candidate through a private channel.
-2. The candidate generates its OWN token (32-128 url-safe chars) and calls
-   `POST https://state.<domain>/registro` with JSON
-   `{codigo, id, tipo, nombre, maquina, token_propuesto}`. The server
-   stores only the SHA-256 of both code and token.
+1. An authority runs `alta_invitar(nota, id_sugerido)` over MCP — or uses
+   the console's *Altas* view. It returns a single-use code (7-day expiry)
+   **and `texto_para_el_cowork`**: a complete briefing to hand over as-is,
+   with the code already embedded. Deliver it through a private channel.
+2. The newcomer runs the script inside that briefing. It picks the highest
+   writable directory that is not inside a git repository, creates `state/`
+   there with a `.gitignore`, generates its OWN token (the plaintext never
+   leaves that machine), and posts to `/registro`. The server stores only
+   the SHA-256 of both code and token.
 3. The authority reviews `altas_pendientes()` and calls `alta_aprobar(id)`
    (or `alta_rechazar`). On approval the identity is live immediately — the
    candidate's token works, and no plaintext ever touched the server disk.

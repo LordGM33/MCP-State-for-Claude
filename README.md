@@ -50,11 +50,14 @@ re-reads the whole file. This MCP provides:
   decisions, subdomains and app control, all graphical. Served with a strict
   CSP (`default-src 'none'`, `frame-ancestors 'none'`), `no-store`, token in
   `sessionStorage` only (never in the page URL), and a 15-minute idle logout.
-- **Remote onboarding with authority approval**: an authority issues a
-  single-use invitation (`alta_invitar`); the candidate POSTs to
-  `/registro` with the code and a token it generates itself (the server
-  only ever sees the hash); the authority reviews (`altas_pendientes`) and
-  approves (`alta_aprobar`) — no restart needed, no self-registration.
+- **Remote onboarding with authority approval**: `alta_invitar` returns a
+  single-use code *and a ready-to-paste briefing* for the newcomer — no
+  editing needed, valid on any machine, user or project. It carries a
+  self-contained Python script that creates a `state/` folder at the highest
+  writable directory outside any git repository (dropping a `.gitignore` in
+  it), generates the token there, and posts the registration. The server only
+  ever sees the hash. The authority then reviews (`altas_pendientes`) and
+  approves (`alta_aprobar`) — no restart, no self-registration.
 
 ## Installation (summary)
 
