@@ -108,7 +108,7 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
 
 <script>
 let TOK = sessionStorage.getItem("state_tok") || "";
-let YO = null, VACT = "dashboard";
+let YO = null, VACT = "dashboard", PREP = null;
 const $ = s => document.querySelector(s);
 const esc = t => String(t ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
@@ -212,14 +212,17 @@ async cartelera() {
 },
 async bandeja() {
   const msgs = await tool("msg_inbox", {incluir_atendidos: false});
-  $("#vista").innerHTML = "<h1>Bandeja</h1>" + (msgs.map(m => card("pend",
-    `${esc(m.asunto)}${m.ref ? `<span class="badge">${esc(m.ref)}</span>` : ""}<span class="badge">${esc(m.tipo)}</span>`,
-    `de ${esc(m.de)} para ${esc(m.para)} · ${esc(m._creado)}`, esc(m.cuerpo),
-    (m.tipo === "solicitud" && m.ref ? `<button class="mini" onclick="prep('respuesta','${esc(m.de)}','${m.ref}')">Responder</button>` :
-     `<button class="mini" onclick="prep('aviso','${esc(m.de)}','')">Responder</button>`) +
-    (m.para !== "todos" ? `<button class="mini ok" onclick="accion('msg_ack',{id:${m._id}},'bandeja')">Atendido</button>`
-                        : `<span class="badge">aviso a todos: no atender (D8)</span>`)).join("")
-    || "<p style='color:var(--mut)'>vacía</p>");
+  const filas = msgs.map(m => {
+    const tit = `${esc(m.asunto)}${m.ref ? `<span class="badge">${esc(m.ref)}</span>` : ""}<span class="badge">${esc(m.tipo)}</span>`;
+    const meta = `de ${esc(m.de)} para ${esc(m.para)} · ${esc(m._creado)}`;
+    const ref = m.tipo === "solicitud" && m.ref ? m.ref : "";
+    let bot = `<button class="mini" onclick="prep('${ref ? "respuesta" : "aviso"}','${esc(m.de)}','${ref}')">Responder</button>`;
+    bot += m.para !== "todos"
+      ? `<button class="mini ok" onclick="accion('msg_ack',{id:${m._id}},'bandeja')">Atendido</button>`
+      : `<span class="badge">aviso a todos: no atender (D8)</span>`;
+    return card("pend", tit, meta, esc(m.cuerpo), bot);
+  }).join("");
+  $("#vista").innerHTML = "<h1>Bandeja</h1>" + (filas || "<p style='color:var(--mut)'>vacía</p>");
 },
 async redactar() {
   const parts = await tool("participantes");
@@ -234,7 +237,7 @@ async redactar() {
     <label>Cuerpo</label><textarea id="m-cuerpo" rows="5"></textarea>
     <button class="pri mini" onclick="enviarMsg()">Enviar</button>
     <span class="badge">la identidad la firma el servidor: ${esc(YO.id)}</span></div>`;
-  if (window._prep) { const [t,p,r] = window._prep; $("#m-tipo").value = t; $("#m-para").value = p; $("#m-ra").value = r; window._prep = null; }
+  if (PREP) { const [t,p,r] = PREP; $("#m-tipo").value = t; $("#m-para").value = p; $("#m-ra").value = r; PREP = null; }
 },
 async solicitudes() {
   const o = await tool("state_overview");
@@ -310,7 +313,7 @@ async infra() {
   $("#vista").innerHTML = h;
 }};
 
-function prep(tipo, para, ref) { window._prep = [tipo, para, ref]; ir("redactar"); }
+function prep(tipo, para, ref) { PREP = [tipo, para, ref]; ir("redactar"); }
 async function enviarMsg() {
   try {
     const args = {para: $("#m-para").value, tipo: $("#m-tipo").value,

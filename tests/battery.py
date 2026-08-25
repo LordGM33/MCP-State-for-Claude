@@ -91,6 +91,7 @@ def puerta_A():
                              assert_(h.get("Cache-Control") == "no-store", "el panel es cacheable"),
                              assert_(h.get("X-Content-Type-Options") == "nosniff", "sin nosniff")))
                  (http("GET", f"{BASE}/panel").headers))
+    caso("A", "el JavaScript del panel es sintácticamente válido", _a_panel_js)
     n_tools = int(os.environ.get("BAT_TOOLS", "37"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
@@ -98,6 +99,26 @@ def puerta_A():
 
 def assert_(cond, msg=""):
     assert cond, msg
+
+def _a_panel_js():
+    """Un error de sintaxis deja el panel mudo: los botones no hacen NADA y la
+    página se ve perfecta. Se valida con node si existe; si no, con un balance
+    de llaves/paréntesis fuera de cadenas."""
+    import re, shutil, tempfile
+    html = http("GET", f"{BASE}/panel").read().decode("utf-8")
+    js = "\n".join(re.findall(r"<script>(.*?)</script>", html, re.S))
+    assert js.strip(), "el panel no trae script"
+    node = shutil.which("node")
+    if node:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as f:
+            f.write(js); ruta = f.name
+        r = subprocess.run([node, "--check", ruta], capture_output=True, text=True, timeout=30)
+        os.unlink(ruta)
+        assert r.returncode == 0, f"node --check: {(r.stderr or '')[:300]}"
+    else:
+        limpio = re.sub(r'`(?:[^`\\]|\\.)*`|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|//[^\n]*', "", js)
+        for a, c in (("{", "}"), ("(", ")"), ("[", "]")):
+            assert limpio.count(a) == limpio.count(c), f"desbalance de {a}{c}"
 
 # ---------- PUERTA B · PROTOCOLO ----------
 def puerta_B():
