@@ -188,6 +188,7 @@ def _c_alta_remota():
     assert ok.get("accion") == "aprobada", ok
     w = call(tok_nuevo, "whoami")
     assert w["id"] == pid and w.get("alta_via") == "registro", w
+    _ult_ref["tok_fresco"] = tok_nuevo
 
 # ---------- PUERTA D · FUNCIONAL ----------
 def puerta_D():
@@ -425,6 +426,28 @@ def _f_d2():
 def puerta_G():
     print("PUERTA G · carga ligera (20 escrituras concurrentes)")
     caso("G", "20 hilos escriben sin errores y todo queda en la base", _g_carga)
+    if _ult_ref.get("tok_fresco"):
+        caso("G", "límite de tasa: una identidad desbocada recibe 429 y no arrastra a las demás", _g_tasa)
+    else:
+        salto("G", "límite de tasa", "sin identidad fresca del caso de alta")
+
+def _g_tasa():
+    tokf = _ult_ref["tok_fresco"]
+    limite = int(os.environ.get("BAT_RATE_MAX", "240"))
+    vio_429 = []
+    def uno(_):
+        try:
+            rpc(tokf, "tools/list")
+        except urllib.error.HTTPError as e:
+            if e.code == 429: vio_429.append(1)
+    lotes = (limite + 40) // 12 + 1
+    for _ in range(lotes):
+        hs = [threading.Thread(target=uno, args=(i,)) for i in range(12)]
+        [h.start() for h in hs]; [h.join() for h in hs]
+        if vio_429: break
+    assert vio_429, f"nunca llego el 429 tras ~{limite+40} peticiones"
+    w = call(T1, "whoami")
+    assert w.get("id"), "el limite de una identidad afecto a otra"
 
 def _g_carga():
     errores = []

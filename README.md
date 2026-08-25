@@ -105,7 +105,7 @@ was built for runs Spanish-speaking agents. Everything operational
 The token travels in the URL (mitigate with TLS + rotation; if the risk
 grows, move to an `Authorization` header). Server-side only SHA-256 hashes
 are stored, but the client's local token file is plaintext — protect that
-machine. There is no rate limiting.
+machine. Rate limiting is per-identity and in-memory (light).
 Dynamic apps execute arbitrary code by design for authorized participants:
 the defense is the systemd sandbox and the fact that only the human admin
 creates participants. Details: `docs/SCOPE-AND-LIMITS.md`.

@@ -35,9 +35,11 @@ production.
    rotatable tokens (`participante.py rotar`), server-side storage of
    SHA-256 hashes only, and Caddy does not log state paths. If the risk
    grows: move to an `Authorization` header.
-2. **No rate limiting.** A compromised token can write without brakes.
-   Mitigated by Cloudflare in front and by rotation; pending if the channel
-   is opened to third parties.
+2. **Light rate limiting only.** Per-identity sliding window
+   (`EVASTATE_RATE_MAX` per `EVASTATE_RATE_WINDOW` seconds, default 240/60s;
+   `/registro` capped at 30/60s globally) answered with 429. In-memory, so
+   it resets on restart — it protects the channel from a runaway client,
+   it does not replace rotating a compromised token.
 3. **Dynamic apps have open network egress.** Needed so an app can call out;
    it also means a malicious app could send spam. Compensated: only
    participants registered by the admin can deploy, and each app runs as

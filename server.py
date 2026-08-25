@@ -2,6 +2,8 @@
 """Shared-state MCP server: identity-sealed messaging, facts, decisions,
 subdomain/app deployment. All config via EVASTATE_* env vars."""
 import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, subprocess, hashlib, secrets
+import time
+from collections import deque
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -22,6 +24,22 @@ NOMBRE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 RESERVADOS = {"www", "state", "mail", "smtp", "autodiscover", "_dmarc"}
 
 CURRENT = contextvars.ContextVar("participante", default=None)
+
+RATE_MAX = int(os.environ.get("EVASTATE_RATE_MAX", "240"))
+RATE_WINDOW = int(os.environ.get("EVASTATE_RATE_WINDOW", "60"))
+_RATE = {}
+
+def _rate_ok(clave, maximo=None):
+    """Ventana deslizante en memoria por identidad; el limite protege el canal,
+    no sustituye la rotacion de un token comprometido."""
+    ahora = time.monotonic()
+    q = _RATE.setdefault(clave, deque())
+    while q and ahora - q[0] > RATE_WINDOW:
+        q.popleft()
+    if len(q) >= (maximo or RATE_MAX):
+        return False
+    q.append(ahora)
+    return True
 
 def _sha(t):
     return hashlib.sha256(t.encode()).hexdigest()
@@ -887,11 +905,16 @@ async def app(scope, receive, send):
     partes = path.split("/")
     # /<token>/mcp | /<token>/deploy/<nombre> | /<token>/app/<nombre>
     if len(partes) >= 2 and partes[1] == "registro" and scope.get("method") == "POST":
+        if not _rate_ok("__registro__", 30):
+            return await JSONResponse({"error": "demasiadas solicitudes"}, status_code=429)(scope, receive, send)
         from starlette.requests import Request
         resp = await registro_post(Request(scope, receive))
         return await resp(scope, receive, send)
     if len(partes) >= 3 and _sha(partes[1]) in TOKEN_INDEX:
         pid = TOKEN_INDEX[_sha(partes[1])]
+        if not _rate_ok(pid):
+            return await JSONResponse({"error": f"limite de tasa: {RATE_MAX} peticiones por {RATE_WINDOW}s"},
+                                      status_code=429)(scope, receive, send)
         tokvar = CURRENT.set(pid)
         try:
             resto = "/" + "/".join(partes[2:])
