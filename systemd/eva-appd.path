@@ -1,5 +1,5 @@
 [Unit]
-Description=Vigila el spool de peticiones de apps de evastate
+Description=Watches the evastate app request spool
 [Path]
 DirectoryNotEmpty=/var/lib/evastate/ctl-spool
 [Install]

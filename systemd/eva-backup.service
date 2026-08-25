@@ -1,5 +1,5 @@
 [Unit]
-Description=Respaldo diario de evastate
+Description=Daily evastate backup
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/eva-backup.py

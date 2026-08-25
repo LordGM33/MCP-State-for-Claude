@@ -1,84 +1,94 @@
 # MCP-State-for-Claude
 
-Servidor **MCP remoto de estado compartido** para equipos de agentes (Claude
-u otros clientes MCP) que coordinan trabajo sobre un mismo proyecto desde
-máquinas distintas. Sustituye los archivos de intercambio en disco por un
-canal con identidad, referencias estables e historial — y añade despliegue de
-demos y apps a subdominios con TLS automático.
+A **remote MCP server for shared state** between teams of agents (Claude or
+any MCP client) coordinating work on the same project from different
+machines. It replaces on-disk exchange files with a channel that has
+identity, stable references and history — plus deployment of demos and apps
+to subdomains with automatic TLS.
 
-## Qué resuelve
+## What it solves
 
-Varios agentes y un humano coordinándose por archivos `.md` en un solo PC:
-funciona, pero no cruza máquinas y las solicitudes se pierden si nadie relee
-el archivo entero. Este MCP da:
+Several agents and a human coordinating through `.md` files on a single PC
+works, but it does not cross machines and requests get lost unless someone
+re-reads the whole file. This MCP provides:
 
-- **Identidad por participante**: cada agente tiene su token; el servidor
-  sella cada escritura con la identidad del token — nadie puede escribir como
-  otro (no existe ningún parámetro `de`).
-- **Mensajería con referencias**: solicitudes con ref estable (`SOL-001`,
-  normalizada: `SOL-1` ≡ `SOL-001`), estados abierta/respondida/descartada,
-  hilos, bandeja por identidad (sin los envíos propios) y una serie `TEST-N`
-  aparte para pruebas que no toca el contador real.
-- **Decisiones y hechos canónicos**: append-only con `supersede`; datos que
-  todos deben citar igual.
-- **Despliegue sin SSH**: sitios estáticos y apps dinámicas (sandbox systemd
-  con límites de memoria/CPU) a `<nombre>.<tu-dominio>` con certificado TLS
-  emitido on-demand.
-- **Respaldo verificable**: diario en el servidor y bajo demanda por
-  participante (`GET /<TOKEN>/backup`, con SHA256 en cabecera).
+- **Per-participant identity**: every agent has its own token; the server
+  seals each write with the token's identity — nobody can write as someone
+  else (there is no `from` parameter anywhere).
+- **Messaging with references**: requests get a stable ref (`SOL-001`,
+  normalized: `SOL-1` ≡ `SOL-001`), states open/answered/discarded, threads,
+  a per-identity inbox (which excludes your own messages) and a separate
+  `TEST-N` series for testing that never touches the real counter.
+- **Decisions and canonical facts**: append-only with `supersede`; data
+  everyone must quote the same way.
+- **Deployment without SSH**: static sites and dynamic apps (hardened
+  systemd sandbox with memory/CPU limits) served at `<name>.<your-domain>`
+  with on-demand TLS certificates.
+- **Verifiable backup**: daily on the server and on demand per participant
+  (`GET /<TOKEN>/backup`, SHA256 in a response header).
 
-## Instalación (resumen)
+## Installation (summary)
 
-1. VPS con Python 3.11+, Caddy y systemd. Crear usuario `evastate`.
-2. `server.py` a `/opt/evastate/`, scripts a `/usr/local/sbin/`, unidades de
-   `systemd/` a `/etc/systemd/system/`.
-3. Copiar `config.example.env` a `/etc/evastate.env` y definir **todas** las
-   variables (los defaults del código son neutros: sin configurar, el
-   servidor responde por `state.example.com`).
-4. Adaptar `caddy/Caddyfile.ejemplo` a tu dominio (apex + wildcard con TLS
-   on-demand aprobado por el endpoint `/tls-check` del servidor).
-5. Alta del primer participante:
-   `sudo /opt/evastate/venv/bin/python /opt/evastate/participante.py alta <id> <tipo> "<Nombre>" <maquina>`
-   (tipos: cowork|agente|servicio|humano; imprime el token UNA sola vez).
-6. Cliente: `ejemplos/cliente_python.py` (config por entorno). Primer
-   comando recomendado de cada sesión: `state_overview()`.
+1. A VPS with Python 3.12+, Caddy and systemd. Create the `evastate` user.
+2. `server.py` to `/opt/evastate/`, scripts to `/usr/local/sbin/`, units
+   from `systemd/` to `/etc/systemd/system/`.
+3. Copy `config.example.env` to `/etc/evastate.env` and set **all** the
+   variables (code defaults are neutral: unconfigured, the server answers
+   for `state.example.com`).
+4. Adapt `caddy/Caddyfile.example` to your domain (apex + wildcard with
+   on-demand TLS approved by the server's `/tls-check` endpoint).
+5. Register the first participant:
+   `sudo /opt/evastate/venv/bin/python /opt/evastate/participante.py alta <id> <type> "<Name>" <machine>`
+   (types: cowork|agente|servicio|humano; prints the token ONCE).
+6. Client: `examples/client.py` (configured via environment). Recommended
+   first call of every session: `state_overview()`.
 
-Detalle completo: `docs/OPERACION.md` · diseño y porqués: `docs/ARQUITECTURA.md`
-· límites conocidos: `docs/ALCANCES-Y-LIMITES.md`.
+Full detail: `docs/OPERATIONS.md` · design rationale: `docs/ARCHITECTURE.md`
+· known limits: `docs/SCOPE-AND-LIMITS.md`.
 
-## Pruebas
+## Tests
 
-`tests/bateria.py` (solo stdlib): 7 puertas — humo, protocolo/conformidad,
-identidad/seguridad, funcional, persistencia/respaldo, regresión y carga
-ligera. Pensada para correr contra una **instancia sandbox** (mismo servidor,
-puerto/base/participantes propios) desplegada por la misma ruta pública que
-producción; contra producción solo se permite `--humo`. Config por entorno:
-ver cabecera del archivo y `config.example.env`.
+`tests/battery.py` (stdlib only): 7 gates — smoke, protocol/conformance,
+identity/security, functional, persistence/backup, regression and light
+load. Meant to run against a **sandbox instance** (same server, own
+port/database/participants) exposed through the same public route as
+production; against production only `--humo` (smoke) is allowed. Configured
+via environment: see the file header and `config.example.env`.
 
-## Estructura
+Note: tool descriptions and test output are in Spanish — the deployment this
+was built for runs Spanish-speaking agents. Everything operational
+(variables, docs, install) is in English.
 
-    server.py                  el servidor MCP (Python, SDK MCP v2, Starlette)
-    scripts/eva-app-ctl        ayudante root: instala/gestiona apps dinámicas
-    scripts/participante.py    altas/bajas/rotación de tokens (solo admin)
-    scripts/eva-backup.py      respaldo diario del SQLite con verificación
-    systemd/                   unidades: servicio, vigilante de spool, timer
-    caddy/Caddyfile.ejemplo    reverse proxy + TLS on-demand con aprobación
-    config.example.env         todas las variables de configuración
-    docs/                      arquitectura, alcances y límites, operación
-    ejemplos/                  cliente Python y app dinámica mínima
-    tests/                     batería de pruebas (sandbox → producción)
+## Layout
 
-## Reglas duras del canal
+    server.py                  the MCP server (Python, MCP SDK v2, Starlette)
+    scripts/eva-app-ctl        root helper: installs/manages dynamic apps
+    scripts/participante.py    token add/remove/rotate (admin only)
+    scripts/eva-backup.py      daily SQLite backup with integrity check
+    systemd/                   units: service, spool watcher, backup timer
+    caddy/Caddyfile.example    reverse proxy + gated on-demand TLS
+    config.example.env         every configuration variable
+    docs/                      architecture, scope and limits, operations
+    examples/                  Python client and a minimal dynamic app
+    tests/                     test battery (sandbox → production)
 
-1. **Transporta coordinación, nunca inferencia.** El razonamiento de los
-   agentes vive en sus propias máquinas; el canal solo coordina.
-2. **Ni secretos ni datos biométricos.** Punteros a claves, nunca valores.
-3. **Nada se borra**: bajas y cierres son lógicos; el historial es el activo.
+## Hard rules of the channel
 
-## Límites conocidos (leer antes de exponerlo)
+1. **It transports coordination, never inference.** Agents' reasoning lives
+   on their own machines; the channel only coordinates.
+2. **No secrets, no biometric data.** Pointers to keys, never values.
+3. **Nothing is deleted**: removals and closures are logical; the history is
+   the asset.
 
-El token viaja en la URL (mitigar con TLS + rotación; si el riesgo crece,
-migrar a header `Authorization`). No hay límite de tasa. Las apps dinámicas
-ejecutan código arbitrario por diseño para participantes autorizados: la
-defensa es el sandbox systemd y que las altas las haga solo el administrador.
-Detalle: `docs/ALCANCES-Y-LIMITES.md`.
+## Known limits (read before exposing it)
+
+The token travels in the URL (mitigate with TLS + rotation; if the risk
+grows, move to an `Authorization` header). There is no rate limiting.
+Dynamic apps execute arbitrary code by design for authorized participants:
+the defense is the systemd sandbox and the fact that only the human admin
+creates participants. Details: `docs/SCOPE-AND-LIMITS.md`.
+
+## License
+
+MIT — free use, modification and redistribution, as long as the copyright
+notice (credit) is preserved. See `LICENSE`.

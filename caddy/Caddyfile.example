@@ -1,0 +1,81 @@
+# Example Caddyfile — shared-state MCP server
+#  1) example.com + www  -> main site (regular certificate)
+#  2) *.example.com      -> everything else, with on-demand TLS:
+#       state.example.com  -> the MCP server (127.0.0.1:8787)
+#       <name>.example.com -> /var/www/sites/<name>/
+# NOTE: do NOT give `state` its own block: a name covered by a present
+# wildcard is left unmanaged by Caddy (no cert, no logs). Keep the apex
+# alone and everything non-apex inside the single on-demand block.
+
+{
+	email admin@example.com
+
+	# Caddy only requests certificates for hosts the state server approves.
+	on_demand_tls {
+		ask http://127.0.0.1:8787/tls-check
+	}
+}
+
+# --- 1. Main site ----------------------------------------------------------
+example.com {
+	root * /var/www/principal
+	file_server
+	encode gzip zstd
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+# --- 2. Everything else under the domain -----------------------------------
+*.example.com {
+	tls {
+		on_demand
+	}
+
+	# 2-pre. www -> apex. Served through on-demand TLS like any subdomain
+	# (explicitly allowed by /tls-check). Do NOT move it into the apex block.
+	@www host www.example.com
+	handle @www {
+		redir https://example.com{uri} permanent
+	}
+
+	# 2a-pre. Dynamic apps (reverse proxy), one snippet per app.
+	import /etc/caddy/apps.d/*.caddy
+
+	# 2a. Shared state (MCP). No valid token in the path -> 404.
+	@state host state.example.com
+	handle @state {
+		encode gzip
+		reverse_proxy 127.0.0.1:8787 {
+			# The MCP may stream (SSE): do not buffer or time out.
+			flush_interval -1
+			transport http {
+				read_timeout 1h
+				write_timeout 1h
+			}
+		}
+	}
+
+	# 2b. Demo subdomains: served straight from /var/www/sites/<name>/
+	@desplegado file {
+		root /var/www/sites/{labels.2}
+		try_files index.html
+	}
+	handle @desplegado {
+		root * /var/www/sites/{labels.2}
+		file_server
+		encode gzip
+	}
+
+	# 2c. Reserved but empty, or nonexistent.
+	handle {
+		respond "Subdomain not deployed yet. Reserve it with subdomain_claim() and upload files to /var/www/sites/<name>/" 404
+	}
+
+	header -Server
+}

@@ -1,5 +1,5 @@
 [Unit]
-Description=Respaldo diario de evastate (03:17 UTC)
+Description=Daily evastate backup (03:17 UTC)
 [Timer]
 OnCalendar=*-*-* 03:17:00 UTC
 Persistent=true

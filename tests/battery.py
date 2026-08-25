@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
-"""Batería de pruebas del MCP de estado compartido (v3).
-
-Corre contra el SANDBOX por defecto (state-test). Solo stdlib.
-Uso:
-    python3 bateria.py                  # puertas A-D + F (sin restart ni carga)
-    python3 bateria.py --todo           # incluye E (respaldo+restart, requiere SSH) y G (carga)
-Variables de entorno:
-    BAT_URL_BASE   URL base de la instancia BAJO PRUEBA (obligatoria)
-    BAT_TOKEN_1    ruta al token del participante 1 (prueba)
-    BAT_TOKEN_2    ruta al token del participante 2 (prueba2)
-    BAT_TOKEN_AJENO ruta a un token válido de OTRA instancia (opcional)
-    BAT_SSH        comando ssh para la puerta E (opcional); BAT_SERVICIO nombre de la unidad; BAT_PROD=1 marca produccion
-REGLA: esta batería NUNCA se apunta a producción salvo la puerta A (humo)
-tras una promoción. Las escrituras son solo-sandbox.
-"""
+"""Test battery (7 gates), stdlib only. Configure via env: BAT_URL_BASE,
+BAT_TOKEN_1/2, optional BAT_TOKEN_AJENO/BAT_SSH/BAT_SERVICIO/BAT_PROD.
+Against production only --humo (smoke) is allowed."""
 import json, os, sys, time, gzip, hashlib, io, subprocess, threading, urllib.request, urllib.error
 RUN = str(int(time.time()))
 

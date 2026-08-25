@@ -1,5 +1,5 @@
 [Unit]
-Description=Estado compartido entre agentes (MCP) v2
+Description=Shared-state MCP server
 After=network-online.target
 Wants=network-online.target
 

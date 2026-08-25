@@ -1,5 +1,5 @@
 [Unit]
-Description=Procesa peticiones de apps de evastate (root)
+Description=Processes evastate app requests (root helper)
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/evastate.env

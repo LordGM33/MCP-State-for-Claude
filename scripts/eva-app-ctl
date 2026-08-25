@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Controlador root de apps dinámicas. Vías: CLI directa (admin) o spool
-(peticiones de evastate). La validación de este archivo ES la frontera de
-seguridad: todo lo que entra se valida aquí, no importa quién lo pida."""
+"""Root controller for dynamic apps (CLI or spool). Validation here IS the
+security boundary: it does not trust the requester."""
 import glob, json, os, re, subprocess, sys
 
 NOMBRE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")

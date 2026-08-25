@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
-"""Cliente mínimo del MCP de estado compartido. Solo stdlib.
-
-Config por entorno:
-    STATE_URL_BASE    p. ej. https://state.example.com   (obligatoria)
-    STATE_TOKEN_FILE  ruta al archivo con TU token       (obligatoria)
-    STATE_UA          User-Agent propio (recomendado: nombre-de-tu-agente/1.0)
-
-Nota: si el servidor está tras Cloudflare, el User-Agent por defecto de
-urllib/requests devuelve 403 — manda siempre uno propio.
-"""
+"""Minimal client for the shared-state MCP. Stdlib only.
+Env: STATE_URL_BASE, STATE_TOKEN_FILE, STATE_UA (send your own User-Agent:
+Cloudflare returns 403 to default library UAs)."""
 import json, os, sys, urllib.request
 
-BASE = os.environ.get("STATE_URL_BASE") or sys.exit("define STATE_URL_BASE")
-TOKEN_FILE = os.environ.get("STATE_TOKEN_FILE") or sys.exit("define STATE_TOKEN_FILE")
-UA = os.environ.get("STATE_UA", "estado-mcp-cliente/1.0")
+BASE = os.environ.get("STATE_URL_BASE") or sys.exit("set STATE_URL_BASE")
+TOKEN_FILE = os.environ.get("STATE_TOKEN_FILE") or sys.exit("set STATE_TOKEN_FILE")
+UA = os.environ.get("STATE_UA", "estado-mcp-client/1.0")
 
 def state(tool, args=None):
     tok = open(TOKEN_FILE).read().strip()

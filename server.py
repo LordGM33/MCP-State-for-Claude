@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
-"""
-Estado compartido entre agentes (MCP remoto) — coordinación multiagente con identidad por token.
-
-Autenticación POR PARTICIPANTE: cada uno tiene su token y su URL:
-    https://<HOST_PUBLICO>/<TOKEN>/mcp          (MCP)
-    PUT https://<HOST_PUBLICO>/<TOKEN>/deploy/<nombre>   (sitio estático, tar.gz)
-    PUT https://<HOST_PUBLICO>/<TOKEN>/app/<nombre>      (app dinámica, tar.gz)
-
-La identidad la sella el SERVIDOR según el token: nadie escribe como otro.
-Altas/bajas de participantes: /opt/evastate/participante.py (solo admin en el VPS).
-
-REGLAS DURAS (acordadas en el puente, 23-ago):
-  - Aquí no se guardan secretos ni datos personales/biométricos. Solo punteros.
-  - state transporta COORDINACIÓN (encargos, resultados, avisos), nunca
-    inferencia: el cerebro es 100% local (R-007, condición de financiamiento).
-"""
+"""Shared-state MCP server: identity-sealed messaging, facts, decisions,
+subdomain/app deployment. All config via EVASTATE_* env vars."""
 import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, subprocess
 
 from mcp.server import MCPServer

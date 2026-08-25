@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Respaldo diario de state: copia consistente del SQLite (API backup), más
-participants.json y Caddyfile. Conserva 14 días. Verifica integridad."""
+"""Daily SQLite backup with integrity check, 14-day retention."""
 import datetime, glob, gzip, os, shutil, sqlite3, subprocess, sys
 
 DB = "/var/lib/evastate/state.db"; DEST = "/var/backups/evastate"
