@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Participant add/remove/rotate (admin only). Prints the token ONCE."""
+"""Altas y bajas de participantes de state. SOLO admin (decisión de Ricardo,
+23-ago-2026: las altas de agentes pasan por él). Imprime el token UNA vez."""
 import json, os, secrets, subprocess, sys, datetime
 
 P = os.environ.get("EVASTATE_PARTICIPANTS", "/etc/evastate/participants.json")
@@ -18,7 +19,7 @@ def guardar(d):
 
 def main():
     if os.geteuid() != 0: sys.exit("correr con sudo")
-    if len(sys.argv) < 2: sys.exit("uso: participante.py alta <id> <tipo> [nombre] [maquina] | baja <id> | lista | rotar <id>")
+    if len(sys.argv) < 2: sys.exit("uso: participante.py alta <id> <tipo> [nombre] [maquina] | baja <id> | lista | rotar <id> | autoridad <id> on|off")
     op = sys.argv[1]; d = cargar()
     if op == "lista":
         for k, v in d.items():
@@ -42,6 +43,13 @@ def main():
         tok = secrets.token_urlsafe(36)
         d[pid]["token"] = tok; guardar(d)
         print(f"token nuevo de '{pid}':\n{tok}")
+    elif op == "autoridad":
+        pid = sys.argv[2].strip().lower()
+        modo = (sys.argv[3] if len(sys.argv) > 3 else "on").lower()
+        if pid not in d: sys.exit(f"'{pid}' no existe")
+        if modo not in ("on", "off"): sys.exit("modo: on|off")
+        d[pid]["autoridad"] = (modo == "on"); guardar(d)
+        print(f"autoridad de '{pid}': {modo}")
     elif op == "baja":
         pid = sys.argv[2].strip().lower()
         if pid not in d: sys.exit(f"'{pid}' no existe")

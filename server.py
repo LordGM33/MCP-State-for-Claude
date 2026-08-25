@@ -113,13 +113,16 @@ def _next_ref(prefijo="SOL"):
     _put("seq", prefijo, {"n": n})
     return f"{prefijo}-{n:03d}"
 
-_REF_RE = re.compile(r"(?i)^(SOL|TEST)-(\d+)$")
+_REF_RE = re.compile(r"(?i)^(SOL|TEST|CART)-(\d+)$")
 def _norm_ref(s):
     """Forma canonica de una ref del canal (SOL-007 == SOL-7). None si no es ref."""
     m = _REF_RE.match((s or "").strip())
     return f"{m.group(1).upper()}-{int(m.group(2)):03d}" if m else None
 
 def _jd(x): return json.dumps(x, ensure_ascii=False, indent=2)
+
+def es_autoridad(pid):
+    return bool(PARTICIPANTES.get(pid, {}).get("autoridad"))
 
 init_db()
 
@@ -146,8 +149,19 @@ def state_overview() -> str:
     pend = [m for m in _rows("msg", 500)
             if m.get("para") in (me, "todos") and m.get("de") != me
             and m.get("estado") not in ("atendido", "respondida", "descartada")]
+    mias = [m for m in _rows("msg", 500) if m.get("de") == me
+            and m.get("tipo") == "solicitud" and m.get("estado") == "abierta"]
+    cart_pend = []
+    for c in _rows("cartel", 300, order="DESC"):
+        if c.get("estado") != "activo": continue
+        if me in c.get("dirigido_a", []) and me not in c.get("confirmaciones", {}) \
+                and c.get("requiere") in ("confirmacion", "respuesta"):
+            cart_pend.append({"ref": c["ref"], "tipo": c["tipo"], "de": c["de"],
+                              "asunto": c["asunto"], "requiere": c["requiere"]})
     return _jd({
         "yo": me,
+        "cartelera_pendiente": cart_pend,
+        "esperando_respuesta": mias,
         "mensajes_pendientes": pend,
         "decisiones_recientes": _rows("decision", 8, order="DESC"),
         "hechos": _rows("fact", 100),
@@ -198,10 +212,24 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
         ra = responde_a.strip()
         # solo se normaliza a mayusculas si es una ref del canal; el texto libre se respeta
         d["responde_a"] = _norm_ref(ra) or ra
+        if str(d["responde_a"]).startswith("CART-"):
+            cart = next((c for c in _rows("cartel", 300) if _norm_ref(c.get("ref")) == d["responde_a"]), None)
+            if not cart: return f"ERROR: no existe el cartel {d['responde_a']}."
+            if para != cart.get("de"):
+                return (f"ERROR: las respuestas a la cartelera van EN PRIVADO a la autoridad emisora "
+                        f"(para='{cart.get('de')}'), nunca a 'todos' ni a terceros.")
         d["estado"] = "pendiente"
     else:
         d["estado"] = "pendiente"
     res = _append("msg", d)
+    if tipo == "respuesta" and str(d.get("responde_a", "")).startswith("CART-"):
+        with db() as con:
+            for r in con.execute("SELECT id,data FROM items WHERE kind='cartel'").fetchall():
+                dc = json.loads(r["data"])
+                if _norm_ref(dc.get("ref")) == d["responde_a"]:
+                    dc.setdefault("confirmaciones", {})[me] = {"tipo": "respuesta", "msg_id": res["id"], "fecha": now()}
+                    con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                                (json.dumps(dc, ensure_ascii=False), now(), r["id"]))
     if tipo == "respuesta" and _REF_RE.match(d["responde_a"]):
         # la solicitud del canal pasa a respondida (el hilo conserva todo);
         # las refs externas (archivo:...) no cierran nada: son enlace, no estado
@@ -280,6 +308,117 @@ def sol_cerrar(ref: str, estado: str = "respondida", nota: str = "") -> str:
                         atendidas += 1
                 return _jd({"accion": estado, "ref": ref, "respuestas_atendidas": atendidas})
     return f"ERROR: no existe la solicitud {ref}."
+
+# ───────────── CARTELERA (divulgación de la autoridad) e HISTORIAL ─────────────
+@mcp.tool()
+def cartel_publicar(tipo: str, asunto: str, cuerpo: str, requiere: str = "", formato_respuesta: str = "") -> str:
+    """Publica en la cartelera (SOLO autoridad). tipo: regla|condicion|peticion|aviso.
+    `requiere` (default por tipo): confirmacion — cada participante confirma que la
+    integró a su regencia local; respuesta — respuesta PRIVADA a la autoridad en
+    `formato_respuesta`; nada. Recibe ref estable CART-N."""
+    me = ident()
+    if not es_autoridad(me):
+        return "ERROR: solo la autoridad publica en la cartelera; lo tuyo va por msg_send."
+    tipo = tipo.strip().lower()
+    if tipo not in ("regla", "condicion", "peticion", "aviso"):
+        return "ERROR: tipo debe ser regla|condicion|peticion|aviso"
+    req = (requiere or {"regla": "confirmacion", "condicion": "confirmacion",
+                        "peticion": "respuesta", "aviso": "nada"}[tipo]).strip().lower()
+    if req not in ("confirmacion", "respuesta", "nada"):
+        return "ERROR: requiere debe ser confirmacion|respuesta|nada"
+    if tipo == "peticion" and req == "respuesta" and not formato_respuesta:
+        return "ERROR: una peticion de informacion declara `formato_respuesta` (el formato acordado)."
+    ref = _next_ref("CART")
+    dirigidos = [p for p, v in PARTICIPANTES.items() if v.get("activo", True) and p != me]
+    d = {"de": me, "tipo": tipo, "asunto": asunto, "cuerpo": cuerpo, "ref": ref,
+         "requiere": req, "formato_respuesta": formato_respuesta,
+         "dirigido_a": dirigidos, "confirmaciones": {}, "estado": "activo"}
+    res = _append("cartel", d)
+    return _jd({**res, "ref": ref, "dirigido_a": dirigidos})
+
+@mcp.tool()
+def cartelera(incluir_cerrados: bool = False) -> str:
+    """La cartelera de la autoridad vista por MI identidad: cada item trae mi_estado
+    (confirmar, responder en privado, o al día). Prioridad máxima del canal."""
+    me = ident()
+    out = []
+    for c in _rows("cartel", 300, order="DESC"):
+        if c.get("estado") != "activo" and not incluir_cerrados: continue
+        conf = c.get("confirmaciones", {})
+        if me == c.get("de"): mi = "emisor"
+        elif me not in c.get("dirigido_a", []): mi = "no dirigido"
+        elif me in conf: mi = "al dia"
+        elif c.get("requiere") == "confirmacion":
+            mi = "PENDIENTE: confirmar integracion con cartel_confirmar"
+        elif c.get("requiere") == "respuesta":
+            mi = f"PENDIENTE: responder EN PRIVADO a {c.get('de')} (msg_send responde_a={c.get('ref')})"
+        else: mi = "al dia"
+        c.pop("confirmaciones", None)
+        c["mi_estado"] = mi
+        out.append(c)
+    return _jd(out)
+
+@mcp.tool()
+def cartel_confirmar(ref: str, nota: str = "integrada en la regencia local") -> str:
+    """Confirma que integraste a tu regencia local la regla/condición del cartel."""
+    me = ident()
+    ref = _norm_ref(ref) or ref.strip().upper()
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='cartel'").fetchall():
+            d = json.loads(r["data"])
+            if _norm_ref(d.get("ref")) == ref:
+                if me not in d.get("dirigido_a", []):
+                    return f"ERROR: {ref} no esta dirigido a {me}."
+                if d.get("requiere") == "respuesta":
+                    return f"ERROR: {ref} pide respuesta privada a {d.get('de')} (msg_send responde_a={ref}), no confirmacion."
+                d.setdefault("confirmaciones", {})[me] = {"tipo": "integrada", "fecha": now(), "nota": nota}
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                return _jd({"accion": "confirmado", "ref": ref, "por": me})
+    return f"ERROR: no existe el cartel {ref}."
+
+@mcp.tool()
+def cartel_estado(ref: str) -> str:
+    """(SOLO autoridad) Matriz de un cartel: quién confirmó/respondió y quién falta."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: cartel_estado es de la autoridad."
+    ref = _norm_ref(ref) or ref.strip().upper()
+    for c in _rows("cartel", 300):
+        if _norm_ref(c.get("ref")) == ref:
+            conf = c.get("confirmaciones", {})
+            pend = [p for p in c.get("dirigido_a", []) if p not in conf]
+            return _jd({"ref": ref, "tipo": c.get("tipo"), "requiere": c.get("requiere"),
+                        "estado": c.get("estado"), "confirmados": conf, "pendientes": pend})
+    return f"ERROR: no existe el cartel {ref}."
+
+@mcp.tool()
+def cartel_cerrar(ref: str, nota: str = "") -> str:
+    """(SOLO autoridad) Cierra un cartel: deja de exigir acción; queda en historial."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: cartel_cerrar es de la autoridad."
+    ref = _norm_ref(ref) or ref.strip().upper()
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='cartel'").fetchall():
+            d = json.loads(r["data"])
+            if _norm_ref(d.get("ref")) == ref:
+                d["estado"] = "cerrado"; d["cerrado_por"] = me
+                if nota: d["nota_cierre"] = nota
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                return _jd({"accion": "cerrado", "ref": ref})
+    return f"ERROR: no existe el cartel {ref}."
+
+@mcp.tool()
+def msg_historial(con_quien: str, limite: int = 200) -> str:
+    """Historial completo de mensajes directos entre MI identidad y otro participante,
+    cronológico. La MISMA vista para ambas partes: transparente y referenciable
+    por _id y fecha, aunque pertenezcan a personas o cuentas distintas."""
+    me = ident(); otro = con_quien.strip().lower()
+    if otro not in PARTICIPANTES: return f"ERROR: '{otro}' no existe. Ver participantes()."
+    rows = _rows("msg", 2000, order="ASC")
+    par = [m for m in rows if {m.get("de"), m.get("para")} == {me, otro}
+           or (me == otro and m.get("de") == me and m.get("para") == me)]
+    return _jd({"entre": sorted([me, otro]), "total": len(par), "mensajes": par[-limite:]})
 
 # ───────────── DECISIONES / HECHOS / INFRA (sellados con identidad) ─────────────
 @mcp.tool()

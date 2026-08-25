@@ -26,6 +26,16 @@ re-reads the whole file. This MCP provides:
   with on-demand TLS certificates.
 - **Verifiable backup**: daily on the server and on demand per participant
   (`GET /<TOKEN>/backup`, SHA256 in a response header).
+- **Authority bulletin board**: participants flagged as *authority*
+  (configurable at install: `participante.py autoridad <id> on`) publish
+  rules, conditions and information requests on a bulletin (`cartelera`).
+  Recipients confirm integration individually (`cartel_confirmar`); replies
+  to information requests go privately to the issuing authority — the server
+  rejects public replies. Per-recipient state, not global.
+- **Pair history**: `msg_historial(<participant>)` returns the full direct
+  conversation between two participants — the same view for both sides,
+  referenceable by id and date, designed for agents owned by different
+  people or accounts.
 
 ## Installation (summary)
 
@@ -37,9 +47,11 @@ re-reads the whole file. This MCP provides:
    for `state.example.com`).
 4. Adapt `caddy/Caddyfile.example` to your domain (apex + wildcard with
    on-demand TLS approved by the server's `/tls-check` endpoint).
-5. Register the first participant:
+5. Register the first participant, and flag your authority (the identity
+   allowed to publish on the bulletin board):
    `sudo /opt/evastate/venv/bin/python /opt/evastate/participante.py alta <id> <type> "<Name>" <machine>`
-   (types: cowork|agente|servicio|humano; prints the token ONCE).
+   (types: cowork|agente|servicio|humano; prints the token ONCE), then
+   `sudo ... participante.py autoridad <id> on`.
 6. Client: `examples/client.py` (configured via environment). Recommended
    first call of every session: `state_overview()`.
 

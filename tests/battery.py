@@ -82,8 +82,9 @@ def puerta_A():
          lambda: assert_(all(k in call(T1, "state_overview") for k in
                 ("yo","mensajes_pendientes","decisiones_recientes","hechos",
                  "infraestructura","subdominios","apps")), "faltan secciones"))
-    caso("A", "tools/list expone las 27 herramientas",
-         lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == 27,
+    n_tools = int(os.environ.get("BAT_TOOLS", "33"))
+    caso("A", f"tools/list expone las {n_tools} herramientas",
+         lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
 
 def assert_(cond, msg=""):
@@ -151,6 +152,10 @@ def puerta_D():
     caso("D", "search encuentra lo escrito", _d_search)
     caso("D", "serie TEST-N: única, cerrable y NO toca el contador SOL (D3)", _d_serie_test)
     caso("D", "refs normalizadas: SOL-7 ≡ SOL-007 en duplicado y en sol_cerrar (H1)", _d_norm)
+    caso("D", "cartelera: solo autoridad publica; regla exige confirmación por receptor", _d_cartel_regla)
+    caso("D", "cartelera: petición se responde EN PRIVADO a la autoridad, nunca a todos", _d_cartel_peticion)
+    caso("D", "msg_historial: mismo historial del par visto desde ambos lados", _d_historial)
+    caso("D", "overview: esperando_respuesta lista mis solicitudes abiertas (D9)", _d_esperando)
 
 def _d_ciclo_msg():
     call(T1, "msg_send", {"para": "prueba2", "asunto": "ciclo completo",
@@ -254,6 +259,71 @@ def _d_norm():
         pass
     c = call(T2, "sol_cerrar", {"ref": sin_ceros, "estado": "descartada"})
     assert c.get("accion") == "descartada", f"sol_cerrar no normalizó: {c}"
+
+def _d_cartel_regla():
+    try:
+        call(T2, "cartel_publicar", {"tipo": "regla", "asunto": "x", "cuerpo": "x"})
+        assert False, "un no-autoridad pudo publicar en la cartelera"
+    except Rechazo:
+        pass
+    r = call(T1, "cartel_publicar", {"tipo": "regla", "asunto": "regla de bateria " + RUN,
+                                     "cuerpo": "comentarios minimos"})
+    ref = r["ref"]; assert ref.startswith("CART-"), r
+    ov = call(T2, "state_overview")
+    assert any(c["ref"] == ref for c in ov.get("cartelera_pendiente", [])), "no aparece pendiente en overview"
+    tab = call(T2, "cartelera")
+    mio = [c for c in tab if c["ref"] == ref][0]
+    assert "PENDIENTE" in mio["mi_estado"], mio["mi_estado"]
+    call(T2, "cartel_confirmar", {"ref": ref})
+    tab2 = [c for c in call(T2, "cartelera") if c["ref"] == ref][0]
+    assert tab2["mi_estado"] == "al dia", tab2["mi_estado"]
+    est = call(T1, "cartel_estado", {"ref": ref})
+    assert "prueba2" in est["confirmados"] and est["confirmados"]["prueba2"]["tipo"] == "integrada", est
+    try:
+        call(T2, "cartel_estado", {"ref": ref})
+        assert False, "un no-autoridad pudo ver la matriz"
+    except Rechazo:
+        pass
+    call(T1, "cartel_cerrar", {"ref": ref, "nota": "caso de bateria"})
+
+def _d_cartel_peticion():
+    r = call(T1, "cartel_publicar", {"tipo": "peticion", "asunto": "peticion de bateria " + RUN,
+                                     "cuerpo": "informe x", "formato_respuesta": "json {dato}"})
+    ref = r["ref"]
+    try:
+        call(T2, "msg_send", {"para": "todos", "tipo": "respuesta", "responde_a": ref,
+                              "asunto": "resp", "cuerpo": "{}"})
+        assert False, "permitió responder una petición de cartelera a todos"
+    except Rechazo:
+        pass
+    call(T2, "msg_send", {"para": "prueba", "tipo": "respuesta", "responde_a": ref,
+                          "asunto": "resp privada", "cuerpo": "{\"dato\": 1}"})
+    est = call(T1, "cartel_estado", {"ref": ref})
+    assert est["confirmados"].get("prueba2", {}).get("tipo") == "respuesta", est
+    tab = [c for c in call(T2, "cartelera") if c["ref"] == ref][0]
+    assert tab["mi_estado"] == "al dia", tab["mi_estado"]
+    call(T1, "cartel_cerrar", {"ref": ref})
+
+def _d_historial():
+    a1 = "hist ida " + RUN; a2 = "hist vuelta " + RUN
+    call(T1, "msg_send", {"para": "prueba2", "tipo": "aviso", "asunto": a1, "cuerpo": "x"})
+    call(T2, "msg_send", {"para": "prueba", "tipo": "aviso", "asunto": a2, "cuerpo": "y"})
+    h1 = call(T1, "msg_historial", {"con_quien": "prueba2"})
+    h2 = call(T2, "msg_historial", {"con_quien": "prueba"})
+    t1 = [m["asunto"] for m in h1["mensajes"]]; t2 = [m["asunto"] for m in h2["mensajes"]]
+    assert a1 in t1 and a2 in t1, "faltan direcciones en el historial"
+    assert t1 == t2, "las dos partes ven historiales distintos"
+
+def _d_esperando():
+    a = "espera d9 " + RUN
+    r = call(T1, "msg_send", {"para": "prueba2", "tipo": "solicitud", "asunto": a, "cuerpo": "x"})
+    ov = call(T1, "state_overview")
+    assert any(m.get("ref") == r["ref"] for m in ov.get("esperando_respuesta", [])), \
+        "mi solicitud abierta no aparece en esperando_respuesta"
+    call(T2, "sol_cerrar", {"ref": r["ref"], "estado": "descartada"})
+    ov2 = call(T1, "state_overview")
+    assert not any(m.get("ref") == r["ref"] for m in ov2.get("esperando_respuesta", [])), \
+        "sigue en esperando_respuesta tras cerrarse"
 
 # ---------- PUERTA E · PERSISTENCIA/RESPALDO ----------
 def puerta_E(con_restart):

@@ -34,7 +34,8 @@ wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
 
     sudo /opt/evastate/venv/bin/python /opt/evastate/participante.py alta <id> <type> "<Name>" <machine>
     # prints the token ONCE; hand it over through a safe channel (local file)
-    # also: baja <id> · rotar <id> · lista
+    # also: baja <id> · rotar <id> · lista · autoridad <id> on|off
+    # "autoridad" marks who may publish rules/requests on the bulletin board
 
 ## Minimum verification after installing
 
