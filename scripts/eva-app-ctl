@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Controlador root de apps dinámicas. Vías: CLI directa (admin) o spool
+(peticiones de evastate). La validación de este archivo ES la frontera de
+seguridad: todo lo que entra se valida aquí, no importa quién lo pida."""
+import glob, json, os, re, subprocess, sys
+
+NOMBRE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+import os as _os
+DOMAIN = _os.environ.get("EVASTATE_DOMAIN", "example.com")
+APPS = "/srv/apps"; UNITDIR = "/etc/systemd/system"; CADDYD = "/etc/caddy/apps.d"
+SPOOL = "/var/lib/evastate/ctl-spool"; OUTD = "/var/lib/evastate/ctl-out"
+
+UNIT = """[Unit]
+Description=Eva app dinamica: {n}
+After=network.target
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory={apps}/{n}
+Environment=PORT={p}
+ExecStart=/bin/sh -lc '{cmd}'
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={apps}/{n}
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=512M
+CPUQuota=80%
+TasksMax=64
+[Install]
+WantedBy=multi-user.target
+"""
+
+SNIPPET = """@app_{n} host {n}.{dom}
+handle @app_{n} {{
+\treverse_proxy 127.0.0.1:{p}
+}}
+"""
+
+def sh(*a):
+    r = subprocess.run(a, capture_output=True, text=True, timeout=90)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+def val_nombre(n):
+    if not NOMBRE.match(n or ""): raise ValueError(f"nombre invalido: {n!r}")
+    return n
+
+def leer_cmd(n):
+    p = os.path.join(APPS, n, "eva-app.toml")
+    cmd = ""
+    try:
+        import tomllib
+        cmd = tomllib.load(open(p, "rb")).get("cmd", "")
+    except Exception:
+        m = re.search(r'^\s*cmd\s*=\s*"(.*)"\s*$', open(p).read(), re.M)
+        cmd = m.group(1) if m else ""
+    cmd = (cmd or "").strip()
+    if not cmd or len(cmd) > 300 or "'" in cmd or any(ord(c) < 32 for c in cmd):
+        raise ValueError("cmd invalido: 1 linea, <=300 chars, sin comillas simples")
+    return cmd
+
+def unidad(n): return f"eva-app-{n}.service"
+
+def install(n, puerto):
+    val_nombre(n); puerto = int(puerto)
+    if not (9100 <= puerto <= 9899): raise ValueError("puerto fuera de rango")
+    cmd = leer_cmd(n)
+    sh("chmod", "-R", "a+rX", os.path.join(APPS, n))
+    open(os.path.join(UNITDIR, unidad(n)), "w").write(UNIT.format(n=n, p=puerto, cmd=cmd, apps=APPS))
+    os.makedirs(CADDYD, exist_ok=True)
+    open(os.path.join(CADDYD, f"{n}.caddy"), "w").write(SNIPPET.format(n=n, p=puerto, dom=DOMAIN))
+    sh("systemctl", "daemon-reload")
+    rc, out = sh("systemctl", "enable", "--now", unidad(n))
+    if rc != 0: return rc, f"systemd: {out}"
+    rc2, out2 = sh("systemctl", "reload", "caddy")
+    if rc2 != 0: return rc2, f"caddy: {out2}"
+    rc3, estado = sh("systemctl", "is-active", unidad(n))
+    return 0, f"instalada; estado={estado}; puerto={puerto}; cmd={cmd}"
+
+def remove(n):
+    val_nombre(n)
+    sh("systemctl", "disable", "--now", unidad(n))
+    for p in (os.path.join(UNITDIR, unidad(n)), os.path.join(CADDYD, f"{n}.caddy")):
+        if os.path.exists(p): os.remove(p)
+    sh("systemctl", "daemon-reload"); sh("systemctl", "reload", "caddy")
+    return 0, "eliminada"
+
+def simple(accion, n):
+    val_nombre(n)
+    rc, out = sh("systemctl", accion, unidad(n))
+    return rc, out or accion
+
+def status(n):
+    val_nombre(n)
+    rc, out = sh("systemctl", "show", unidad(n),
+                 "-p", "ActiveState,SubState,ExecMainStatus,MemoryCurrent,NRestarts")
+    return 0, out
+
+def logs(n, lineas=40):
+    val_nombre(n)
+    rc, out = sh("journalctl", "-u", unidad(n), "-n", str(min(int(lineas), 200)), "--no-pager", "-o", "cat")
+    return 0, out or "(sin lineas)"
+
+def dispatch(req):
+    a = req.get("accion")
+    n = req.get("nombre", "")
+    if a == "install": return install(n, req.get("puerto"))
+    if a == "remove":  return remove(n)
+    if a in ("start", "stop", "restart"): return simple(a, n)
+    if a == "status":  return status(n)
+    if a == "logs":    return logs(n, req.get("lineas", 40))
+    return 1, f"accion desconocida: {a}"
+
+def spool():
+    os.makedirs(OUTD, exist_ok=True)
+    for f in sorted(glob.glob(os.path.join(SPOOL, "*.json"))):
+        try:
+            req = json.load(open(f))
+        except Exception:
+            os.remove(f); continue
+        try:
+            rc, out = dispatch(req)
+        except Exception as e:
+            rc, out = 1, f"ERROR: {e}"
+        rid = req.get("id") or os.path.basename(f)[:-5]
+        tmp = os.path.join(OUTD, f".{rid}.tmp")
+        json.dump({"rc": rc, "out": out}, open(tmp, "w"))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(OUTD, f"{rid}.json"))
+        os.remove(f)
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "spool":
+        spool(); sys.exit(0)
+    if len(sys.argv) < 3:
+        print("uso: eva-app-ctl <install|remove|start|stop|restart|status|logs> <nombre> [args]"); sys.exit(2)
+    a, n = sys.argv[1], sys.argv[2]
+    extra = {}
+    if a == "install": extra["puerto"] = sys.argv[3]
+    if a == "logs" and len(sys.argv) > 3: extra["lineas"] = sys.argv[3]
+    rc, out = dispatch({"accion": a, "nombre": n, **extra})
+    print(out); sys.exit(rc)

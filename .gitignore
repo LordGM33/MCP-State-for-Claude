@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+participants.json
+*.token
+*.db
+config.env
+*.env
+!config.example.env

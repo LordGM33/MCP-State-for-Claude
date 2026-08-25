@@ -1,0 +1,6 @@
+[Unit]
+Description=Vigila el spool de peticiones de apps de evastate
+[Path]
+DirectoryNotEmpty=/var/lib/evastate/ctl-spool
+[Install]
+WantedBy=multi-user.target

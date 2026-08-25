@@ -1,0 +1,6 @@
+[Unit]
+Description=Procesa peticiones de apps de evastate (root)
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/evastate.env
+ExecStart=/usr/local/sbin/eva-app-ctl spool

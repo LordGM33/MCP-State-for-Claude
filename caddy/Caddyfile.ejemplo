@@ -1,0 +1,88 @@
+# ===========================================================================
+# Caddyfile de ejemplo — MCP de estado compartido
+#
+#  1) example.com + www  -> sitio principal (certificado normal, ya emitido)
+#  2) *.example.com      -> TODO lo demás, con TLS bajo demanda:
+#       · state.example.com -> MCP de estado compartido (127.0.0.1:8787)
+#       · <nombre>.example.com -> /var/www/sites/<nombre>/
+#
+# NOTA (23-ago): antes `state` tenía su propio bloque. Al coexistir con el
+# wildcard, Caddy lo daba por cubierto por éste (que es on-demand) y nunca pedía
+# su certificado, mientras el wildcard tampoco podía emitirse sin DNS-01.
+# Se resuelve metiendo todo lo no-apex en un único bloque on-demand.
+# ===========================================================================
+
+{
+	email admin@example.com
+
+	# Caddy solo pide certificado para hosts que el servidor de estado autorice.
+	on_demand_tls {
+		ask http://127.0.0.1:8787/tls-check
+	}
+}
+
+# --- 1. Sitio principal ----------------------------------------------------
+example.com {
+	root * /var/www/principal
+	file_server
+	encode gzip zstd
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}
+
+# --- 2. Todo lo demás bajo el dominio --------------------------------------
+*.example.com {
+	tls {
+		on_demand
+	}
+
+	# 2-pre. www -> apex. Se sirve por on-demand TLS como cualquier subdominio
+	# (listado explícito en /tls-check). NO volver a ponerlo en el bloque del
+	# apex: Caddy deja sin gestionar un nombre individual cubierto por un
+	# wildcard presente, y el handshake muere sin log (visto 23-ago).
+	@www host www.example.com
+	handle @www {
+		redir https://example.com{uri} permanent
+	}
+
+	# 2a-pre. Apps dinamicas (reverse proxy), un snippet por app.
+	import /etc/caddy/apps.d/*.caddy
+
+	# 2a. Estado compartido (MCP). Sin token válido en la ruta -> 404.
+	@state host state.example.com
+	handle @state {
+		encode gzip
+		reverse_proxy 127.0.0.1:8787 {
+			# El MCP usa streaming (SSE): no bufferizar ni cortar por tiempo.
+			flush_interval -1
+			transport http {
+				read_timeout 1h
+				write_timeout 1h
+			}
+		}
+	}
+
+	# 2b. Subdominios de demos: se publican solos desde /var/www/sites/<nombre>/
+	@desplegado file {
+		root /var/www/sites/{labels.2}
+		try_files index.html
+	}
+	handle @desplegado {
+		root * /var/www/sites/{labels.2}
+		file_server
+		encode gzip
+	}
+
+	# 2c. Reservado pero aún sin archivos, o inexistente.
+	handle {
+		respond "Subdominio no desplegado todavia. Reserva con subdomain_claim() y sube los archivos a /var/www/sites/<nombre>/" 404
+	}
+
+	header -Server
+}
