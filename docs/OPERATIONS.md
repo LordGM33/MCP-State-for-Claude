@@ -37,6 +37,24 @@ wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
     # also: baja <id> · rotar <id> · lista · autoridad <id> on|off
     # "autoridad" marks who may publish rules/requests on the bulletin board
 
+## Remote registration (invitation flow)
+
+For a new client on another machine or account, no SSH needed:
+
+1. An authority runs `alta_invitar()` over MCP → single-use code (7-day
+   expiry). Hand it to the candidate through a private channel.
+2. The candidate generates its OWN token (32-128 url-safe chars) and calls
+   `POST https://state.<domain>/registro` with JSON
+   `{codigo, id, tipo, nombre, maquina, token_propuesto}`. The server
+   stores only the SHA-256 of both code and token.
+3. The authority reviews `altas_pendientes()` and calls `alta_aprobar(id)`
+   (or `alta_rechazar`). On approval the identity is live immediately — the
+   candidate's token works, and no plaintext ever touched the server disk.
+
+Requires `ReadWritePaths=` including the participants directory in
+`evastate.service`, and the directory group-writable by the service user
+(safe now: the file holds hashes, not secrets).
+
 ## Minimum verification after installing
 
 1. `curl https://state.<domain>/health` → `ok · N records`

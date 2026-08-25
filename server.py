@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared-state MCP server: identity-sealed messaging, facts, decisions,
 subdomain/app deployment. All config via EVASTATE_* env vars."""
-import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, subprocess
+import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, subprocess, hashlib, secrets
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -23,16 +23,34 @@ RESERVADOS = {"www", "state", "mail", "smtp", "autodiscover", "_dmarc"}
 
 CURRENT = contextvars.ContextVar("participante", default=None)
 
+def _sha(t):
+    return hashlib.sha256(t.encode()).hexdigest()
+
 def cargar_participantes():
     with open(PARTICIPANTS_PATH) as f:
         data = json.load(f)
     idx = {}
     for pid, p in data.items():
-        if p.get("activo", True) and p.get("token") and len(p["token"]) >= 24:
-            idx[p["token"]] = pid
+        if not p.get("activo", True): continue
+        h = p.get("token_sha256")
+        if not h and p.get("token") and len(p["token"]) >= 24:
+            h = _sha(p["token"])
+        if h: idx[h] = pid
     return data, idx
 
 PARTICIPANTES, TOKEN_INDEX = cargar_participantes()
+
+def _recargar_participantes():
+    global PARTICIPANTES, TOKEN_INDEX
+    PARTICIPANTES, TOKEN_INDEX = cargar_participantes()
+    sembrar_participantes()
+
+def _guardar_participantes():
+    tmp = PARTICIPANTS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(PARTICIPANTES, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, PARTICIPANTS_PATH)
 
 def ident():
     v = CURRENT.get()
@@ -60,7 +78,7 @@ def init_db():
 def sembrar_participantes():
     """Espeja participants.json (SIN tokens) en la base, para consultas."""
     for pid, p in PARTICIPANTES.items():
-        pub = {k: v for k, v in p.items() if k != "token"}
+        pub = {k: v for k, v in p.items() if k not in ("token", "token_sha256")}
         pub["id"] = pid
         _put("participant", pid, pub)
 
@@ -133,7 +151,7 @@ mcp = MCPServer(SERVER_NAME)
 def whoami() -> str:
     """Devuelve la identidad con la que este cliente escribe (la sella el servidor)."""
     pid = ident()
-    p = {k: v for k, v in PARTICIPANTES[pid].items() if k != "token"}
+    p = {k: v for k, v in PARTICIPANTES[pid].items() if k not in ("token", "token_sha256")}
     return _jd({"id": pid, **p})
 
 @mcp.tool()
@@ -419,6 +437,123 @@ def msg_historial(con_quien: str, limite: int = 200) -> str:
     par = [m for m in rows if {m.get("de"), m.get("para")} == {me, otro}
            or (me == otro and m.get("de") == me and m.get("para") == me)]
     return _jd({"entre": sorted([me, otro]), "total": len(par), "mensajes": par[-limite:]})
+
+# ───────────── ALTAS REMOTAS (invitación + aprobación de la autoridad) ─────────────
+@mcp.tool()
+def alta_invitar(nota: str = "") -> str:
+    """(SOLO autoridad) Emite una invitación de UN SOLO USO (caduca en 7 días) para
+    que un cliente nuevo solicite su alta vía POST /registro. El código se muestra
+    UNA vez: entrégalo al candidato por un canal privado."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: alta_invitar es de la autoridad."
+    codigo = secrets.token_urlsafe(18)
+    _append("invitacion", {"codigo_sha256": _sha(codigo), "emitida_por": me,
+                           "estado": "emitida", "nota": nota, "emitida": now()})
+    return _jd({"codigo": codigo,
+                "instrucciones": f"El candidato hace POST https://{PUBLIC_HOST}/registro con JSON "
+                                 "{codigo, id, tipo, nombre, maquina, token_propuesto} — el token lo "
+                                 "genera EL CANDIDATO (32-128 chars url-safe); el servidor solo guarda "
+                                 "su hash. Queda pendiente hasta alta_aprobar de la autoridad."})
+
+@mcp.tool()
+def altas_pendientes() -> str:
+    """(SOLO autoridad) Solicitudes de alta esperando aprobación."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: altas_pendientes es de la autoridad."
+    out = []
+    for i in _rows("invitacion", 200):
+        if i.get("estado") == "solicitada":
+            out.append({k: v for k, v in i.items() if k not in ("codigo_sha256", "token_sha256")})
+    return _jd(out)
+
+@mcp.tool()
+def alta_aprobar(id: str, nota: str = "") -> str:
+    """(SOLO autoridad) Aprueba una solicitud de alta: activa la identidad con el
+    token que el candidato propuso (aquí solo vive su hash)."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: alta_aprobar es de la autoridad."
+    pid = id.strip().lower()
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("estado") == "solicitada" and d.get("id") == pid:
+                if pid in PARTICIPANTES and PARTICIPANTES[pid].get("activo", True):
+                    return f"ERROR: '{pid}' ya existe y esta activo."
+                PARTICIPANTES[pid] = {"token_sha256": d["token_sha256"], "tipo": d.get("tipo", "cowork"),
+                                      "nombre": d.get("nombre", pid), "maquina": d.get("maquina", ""),
+                                      "desde": datetime.date.today().isoformat(), "activo": True,
+                                      "alta_via": "registro", "aprobada_por": me}
+                _guardar_participantes()
+                _recargar_participantes()
+                d["estado"] = "aprobada"; d["aprobada_por"] = me; d["aprobada_fecha"] = now()
+                if nota: d["nota_aprobacion"] = nota
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                return _jd({"accion": "aprobada", "id": pid,
+                            "aviso": "el candidato ya puede usar el token que propuso"})
+    return f"ERROR: no hay solicitud pendiente para '{pid}'."
+
+@mcp.tool()
+def alta_rechazar(id: str, motivo: str = "") -> str:
+    """(SOLO autoridad) Rechaza una solicitud de alta pendiente."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: alta_rechazar es de la autoridad."
+    pid = id.strip().lower()
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("estado") == "solicitada" and d.get("id") == pid:
+                d["estado"] = "rechazada"; d["rechazada_por"] = me
+                if motivo: d["motivo_rechazo"] = motivo
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                return _jd({"accion": "rechazada", "id": pid})
+    return f"ERROR: no hay solicitud pendiente para '{pid}'."
+
+async def registro_post(request):
+    """Alta remota sin token: requiere codigo de invitacion vigente de la autoridad."""
+    try:
+        body = json.loads(await request.body())
+    except Exception:
+        return JSONResponse({"error": "JSON invalido"}, status_code=400)
+    codigo = str(body.get("codigo", "")); pid = str(body.get("id", "")).strip().lower()
+    tok = str(body.get("token_propuesto", "")); tipo = str(body.get("tipo", "cowork")).strip().lower()
+    if tipo not in ("cowork", "agente", "servicio", "humano"):
+        return JSONResponse({"error": "tipo: cowork|agente|servicio|humano"}, status_code=400)
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,19}", pid):
+        return JSONResponse({"error": "id invalido: minusculas, [a-z][a-z0-9-]{1,19}"}, status_code=400)
+    if pid in PARTICIPANTES:
+        return JSONResponse({"error": "id no disponible"}, status_code=409)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", tok):
+        return JSONResponse({"error": "token_propuesto: 32-128 caracteres url-safe, generado por ti"}, status_code=400)
+    h = _sha(codigo)
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("estado") == "solicitada" and d.get("id") == pid:
+                return JSONResponse({"error": "id no disponible"}, status_code=409)
+        for r in con.execute("SELECT id,data FROM items WHERE kind='invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("codigo_sha256") == h and d.get("estado") == "emitida":
+                try:
+                    ed = datetime.datetime.fromisoformat(d.get("emitida"))
+                    caducada = (datetime.datetime.now(datetime.timezone.utc) - ed).days >= 7
+                except Exception:
+                    caducada = False
+                if caducada:
+                    d["estado"] = "caducada"
+                    con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                                (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                    return JSONResponse({"error": "invitacion caducada"}, status_code=410)
+                d.update({"estado": "solicitada", "id": pid, "tipo": tipo,
+                          "nombre": str(body.get("nombre", pid))[:80],
+                          "maquina": str(body.get("maquina", ""))[:40],
+                          "token_sha256": _sha(tok), "solicitada": now()})
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                return JSONResponse({"ok": True, "id": pid,
+                                     "estado": "pendiente de aprobacion por la autoridad"})
+    return JSONResponse({"error": "invitacion no valida"}, status_code=404)
 
 # ───────────── DECISIONES / HECHOS / INFRA (sellados con identidad) ─────────────
 @mcp.tool()
@@ -751,8 +886,12 @@ async def app(scope, receive, send):
     path = scope.get("path", "")
     partes = path.split("/")
     # /<token>/mcp | /<token>/deploy/<nombre> | /<token>/app/<nombre>
-    if len(partes) >= 3 and partes[1] in TOKEN_INDEX:
-        pid = TOKEN_INDEX[partes[1]]
+    if len(partes) >= 2 and partes[1] == "registro" and scope.get("method") == "POST":
+        from starlette.requests import Request
+        resp = await registro_post(Request(scope, receive))
+        return await resp(scope, receive, send)
+    if len(partes) >= 3 and _sha(partes[1]) in TOKEN_INDEX:
+        pid = TOKEN_INDEX[_sha(partes[1])]
         tokvar = CURRENT.set(pid)
         try:
             resto = "/" + "/".join(partes[2:])

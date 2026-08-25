@@ -32,8 +32,9 @@ production.
 
 1. **The token travels in the URL.** Convenient for simple clients, but URLs
    can end up in proxy logs and histories. Mitigated: end-to-end TLS,
-   rotatable 48-char tokens (`participante.py rotar`), and Caddy does not
-   log state paths. If the risk grows: move to an `Authorization` header.
+   rotatable tokens (`participante.py rotar`), server-side storage of
+   SHA-256 hashes only, and Caddy does not log state paths. If the risk
+   grows: move to an `Authorization` header.
 2. **No rate limiting.** A compromised token can write without brakes.
    Mitigated by Cloudflare in front and by rotation; pending if the channel
    is opened to third parties.
@@ -55,8 +56,10 @@ production.
 
 ## Governance defaults
 
-- Participant registration (teams AND ephemeral agents): **human admin
-  only**. A new participant requests its id BEFORE using the channel.
+- Participant registration (teams AND ephemeral agents): **authority
+  only** — either directly (`participante.py alta`) or via the invitation
+  flow (`alta_invitar` → `/registro` → `alta_aprobar`). No self-service
+  registration exists.
 - When migrating from exchange files: dual-write phase first; the files
   remain authoritative until channel and files show a full week without
   discrepancies.

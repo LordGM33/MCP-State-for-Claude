@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Altas y bajas de participantes de state. SOLO admin (decisión de Ricardo,
 23-ago-2026: las altas de agentes pasan por él). Imprime el token UNA vez."""
-import json, os, secrets, subprocess, sys, datetime
+import hashlib, json, os, secrets, subprocess, sys, datetime
 
 P = os.environ.get("EVASTATE_PARTICIPANTS", "/etc/evastate/participants.json")
 SERVICIO = os.environ.get("EVASTATE_SERVICE", "evastate")
@@ -31,7 +31,7 @@ def main():
         if tipo not in ("cowork", "agente", "servicio", "humano"): sys.exit("tipo: cowork|agente|servicio|humano")
         if pid in d and d[pid].get("activo"): sys.exit(f"'{pid}' ya existe y está activo (usa rotar)")
         tok = secrets.token_urlsafe(36)
-        d[pid] = {"token": tok, "tipo": tipo,
+        d[pid] = {"token_sha256": hashlib.sha256(tok.encode()).hexdigest(), "tipo": tipo,
                   "nombre": sys.argv[4] if len(sys.argv) > 4 else pid,
                   "maquina": sys.argv[5] if len(sys.argv) > 5 else "",
                   "desde": datetime.date.today().isoformat(), "activo": True}
@@ -41,7 +41,8 @@ def main():
         pid = sys.argv[2].strip().lower()
         if pid not in d: sys.exit(f"'{pid}' no existe")
         tok = secrets.token_urlsafe(36)
-        d[pid]["token"] = tok; guardar(d)
+        d[pid].pop("token", None)
+        d[pid]["token_sha256"] = hashlib.sha256(tok.encode()).hexdigest(); guardar(d)
         print(f"token nuevo de '{pid}':\n{tok}")
     elif op == "autoridad":
         pid = sys.argv[2].strip().lower()

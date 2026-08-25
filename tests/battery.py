@@ -82,7 +82,7 @@ def puerta_A():
          lambda: assert_(all(k in call(T1, "state_overview") for k in
                 ("yo","mensajes_pendientes","decisiones_recientes","hechos",
                  "infraestructura","subdominios","apps")), "faltan secciones"))
-    n_tools = int(os.environ.get("BAT_TOOLS", "33"))
+    n_tools = int(os.environ.get("BAT_TOOLS", "37"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
@@ -119,6 +119,11 @@ def puerta_C():
          lambda: assert_(_msg_firmado() == "prueba", f"firmado {_msg_firmado()}"))
     caso("C", "sol_cerrar por un NO involucrado → rechazo",
          lambda: _c_sol_cerrar_ajeno())
+    if SSH:
+        caso("C", "el servidor NO guarda tokens en texto plano (solo hashes)", _c_sin_texto_plano)
+    else:
+        salto("C", "tokens sin texto plano", "sin BAT_SSH")
+    caso("C", "alta remota: invitación de un solo uso + aprobación de la autoridad", _c_alta_remota)
 
 _ult_ref = {}
 def _msg_firmado():
@@ -140,6 +145,49 @@ def _c_sol_cerrar_ajeno():
     # que el involucrado SÍ puede (cierre limpio del caso).
     ok = call(T2, "sol_cerrar", {"ref": ref, "estado": "descartada"})
     assert "cerrad" in json.dumps(ok) or ok, f"el involucrado no pudo cerrar: {ok}"
+
+def _c_sin_texto_plano():
+    pf = os.environ.get("BAT_PARTICIPANTS_FILE", "/etc/evastate-test/participants.json")
+    r = subprocess.run(SSH.split() + [f"sudo grep -cF {T1} {pf} || true"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.stdout.strip() in ("0", ""), f"el token de T1 aparece en {pf}"
+
+def _c_alta_remota():
+    inv = call(T1, "alta_invitar", {"nota": "caso de bateria"})
+    codigo = inv["codigo"]
+    try:
+        call(T2, "alta_invitar", {})
+        assert False, "un no-autoridad pudo emitir invitaciones"
+    except Rechazo:
+        pass
+    pid = "pr" + RUN[-6:]
+    tok_nuevo = "bat" + hashlib.sha256((RUN + "x").encode()).hexdigest()[:40]
+    def registro(cod, i, t):
+        req = urllib.request.Request(f"{BASE}/registro",
+            json.dumps({"codigo": cod, "id": i, "tipo": "cowork", "nombre": "Alta de bateria",
+                        "maquina": "bateria", "token_propuesto": t}).encode(),
+            {"Content-Type": "application/json", "User-Agent": UA}, method="POST")
+        return json.load(urllib.request.urlopen(req, timeout=30))
+    assert status_de(lambda: registro("codigo-falso", pid, tok_nuevo)) == 404, "acepto un codigo falso"
+    r = registro(codigo, pid, tok_nuevo)
+    assert r.get("ok") and "pendiente" in r.get("estado", ""), r
+    assert status_de(lambda: registro(codigo, pid + "b", tok_nuevo)) in (404, 409), "el codigo sirvio dos veces"
+    try:
+        call(tok_nuevo, "whoami")
+        assert False, "el token propuesto funciono ANTES de aprobarse"
+    except Exception:
+        pass
+    try:
+        call(T2, "alta_aprobar", {"id": pid})
+        assert False, "un no-autoridad pudo aprobar altas"
+    except Rechazo:
+        pass
+    pend = call(T1, "altas_pendientes")
+    assert any(i.get("id") == pid for i in pend), f"{pid} no esta en pendientes"
+    ok = call(T1, "alta_aprobar", {"id": pid})
+    assert ok.get("accion") == "aprobada", ok
+    w = call(tok_nuevo, "whoami")
+    assert w["id"] == pid and w.get("alta_via") == "registro", w
 
 # ---------- PUERTA D · FUNCIONAL ----------
 def puerta_D():

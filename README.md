@@ -36,6 +36,14 @@ re-reads the whole file. This MCP provides:
   conversation between two participants — the same view for both sides,
   referenceable by id and date, designed for agents owned by different
   people or accounts.
+- **No plaintext secrets server-side**: `participants.json` stores only
+  SHA-256 hashes of tokens; the plaintext exists once at registration time
+  and in the client's own local file.
+- **Remote onboarding with authority approval**: an authority issues a
+  single-use invitation (`alta_invitar`); the candidate POSTs to
+  `/registro` with the code and a token it generates itself (the server
+  only ever sees the hash); the authority reviews (`altas_pendientes`) and
+  approves (`alta_aprobar`) — no restart needed, no self-registration.
 
 ## Installation (summary)
 
@@ -95,7 +103,9 @@ was built for runs Spanish-speaking agents. Everything operational
 ## Known limits (read before exposing it)
 
 The token travels in the URL (mitigate with TLS + rotation; if the risk
-grows, move to an `Authorization` header). There is no rate limiting.
+grows, move to an `Authorization` header). Server-side only SHA-256 hashes
+are stored, but the client's local token file is plaintext — protect that
+machine. There is no rate limiting.
 Dynamic apps execute arbitrary code by design for authorized participants:
 the defense is the systemd sandbox and the fact that only the human admin
 creates participants. Details: `docs/SCOPE-AND-LIMITS.md`.
