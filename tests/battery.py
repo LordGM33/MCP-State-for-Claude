@@ -66,6 +66,15 @@ def status_de(fn):
     except urllib.error.HTTPError as e:
         return e.code
 
+def espera_404(fn, intentos=3):
+    """Un 429 aqui es el freno global anti fuerza bruta (compartido entre casos),
+    no la respuesta que se prueba: espera a que la ventana se libere y reintenta."""
+    for i in range(intentos):
+        c = status_de(fn)
+        if c != 429: return c
+        time.sleep(22)
+    return 429
+
 # ---------- PUERTA A · HUMO ----------
 def a_health():
     b = http("GET", f"{BASE}/health").read().decode() if False else None
@@ -92,7 +101,7 @@ def puerta_A():
                              assert_(h.get("X-Content-Type-Options") == "nosniff", "sin nosniff")))
                  (http("GET", f"{BASE}/panel").headers))
     caso("A", "el JavaScript del panel es sintácticamente válido", _a_panel_js)
-    n_tools = int(os.environ.get("BAT_TOOLS", "37"))
+    n_tools = int(os.environ.get("BAT_TOOLS", "41"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
@@ -124,8 +133,8 @@ def _a_panel_js():
 def puerta_B():
     print("PUERTA B · protocolo/conformidad")
     caso("B", "token inválido → 404 (no 401/500: no filtra que existe el MCP)",
-         lambda: assert_(status_de(lambda: rpc("token-falso-123", "tools/list")) == 404,
-                         f"código {status_de(lambda: rpc('token-falso-123','tools/list'))}"))
+         lambda: (lambda c: assert_(c == 404, f"código {c}"))
+                 (espera_404(lambda: rpc("token-falso-123", "tools/list"))))
     caso("B", "método JSON-RPC inexistente → error controlado, no 500",
          lambda: assert_("error" in rpc(T1, "metodo/inexistente"), "no devolvió error JSON-RPC"))
     caso("B", "cuerpo no-JSON → rechazo controlado",
@@ -141,8 +150,8 @@ def puerta_C():
     print("PUERTA C · identidad y seguridad")
     if TA:
         caso("C", "token válido de OTRA instancia → 404 aquí (aislamiento entre instancias)",
-             lambda: assert_(status_de(lambda: rpc(TA, "tools/list")) == 404,
-                             "un token de otra instancia funciona aquí"))
+             lambda: (lambda c: assert_(c == 404, f"código {c} (200 = fuga de aislamiento)"))
+                     (espera_404(lambda: rpc(TA, "tools/list"))))
     else:
         salto("C", "aislamiento entre instancias", "sin BAT_TOKEN_AJENO")
     caso("C", "el emisor lo sella el servidor: msg de T1 llega firmado 'prueba'",
@@ -154,7 +163,8 @@ def puerta_C():
     else:
         salto("C", "tokens sin texto plano", "sin BAT_SSH")
     caso("C", "alta remota: invitación de un solo uso + aprobación de la autoridad", _c_alta_remota)
-    caso("C", "los tokens inválidos repetidos acaban en 429 (freno a fuerza bruta)", _c_freno_auth)
+    caso("C", "subdominio de un no-autoridad queda PENDIENTE y no puede desplegar", _c_sub_pendiente)
+    caso("C", "la autoridad aprueba/rechaza subdominios; tras aprobar sí despliega", _c_sub_aprobar)
 
 _ult_ref = {}
 def _msg_firmado():
@@ -176,6 +186,62 @@ def _c_sol_cerrar_ajeno():
     # que el involucrado SÍ puede (cierre limpio del caso).
     ok = call(T2, "sol_cerrar", {"ref": ref, "estado": "descartada"})
     assert "cerrad" in json.dumps(ok) or ok, f"el involucrado no pudo cerrar: {ok}"
+
+def _tar_demo(texto):
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        dato = texto.encode()
+        info = tarfile.TarInfo("index.html"); info.size = len(dato)
+        tf.addfile(info, io.BytesIO(dato))
+    return buf.getvalue()
+
+def _put_deploy(tok, nombre, blob):
+    try:
+        http("PUT", f"{BASE}/{tok}/deploy/{nombre}", blob)
+        return 200
+    except urllib.error.HTTPError as e:
+        return e.code
+
+def _c_sub_pendiente():
+    sub = "bat" + RUN[-6:]
+    _ult_ref["sub"] = sub
+    r = call(T2, "subdomain_claim", {"nombre": sub, "notas": "caso de bateria"})
+    assert r.get("estado") == "solicitado", f"un no-autoridad reservó directo: {r}"
+    lst = call(T2, "subdomain_list")
+    mio = [s for s in lst if s["nombre"] == sub][0]
+    assert mio["estado"] == "solicitado", mio
+    cod = _put_deploy(T2, sub, _tar_demo("no deberia publicarse"))
+    assert cod == 403, f"desplegó sin aprobación (HTTP {cod})"
+    try:
+        call(T2, "subdomain_pendientes")
+        assert False, "un no-autoridad vio las solicitudes pendientes"
+    except Rechazo:
+        pass
+    try:
+        call(T2, "subdomain_aprobar", {"nombre": sub})
+        assert False, "un no-autoridad aprobó su propio subdominio"
+    except Rechazo:
+        pass
+
+def _c_sub_aprobar():
+    sub = _ult_ref["sub"]
+    pend = call(T1, "subdomain_pendientes")
+    assert any(s["nombre"] == sub for s in pend), f"{sub} no aparece como pendiente"
+    ov = call(T1, "state_overview")
+    assert sub in (ov.get("por_aprobar", {}).get("subdominios") or []), "no aparece en por_aprobar del overview"
+    ok = call(T1, "subdomain_aprobar", {"nombre": sub, "nota": "bateria"})
+    assert ok.get("accion") == "aprobado", ok
+    cod = _put_deploy(T2, sub, _tar_demo("aprobado por la autoridad"))
+    assert cod == 200, f"tras aprobar, el dueño no pudo desplegar (HTTP {cod})"
+    otro = "bat" + RUN[-6:] + "b"
+    call(T2, "subdomain_claim", {"nombre": otro, "notas": "para rechazar"})
+    r = call(T1, "subdomain_rechazar", {"nombre": otro, "motivo": "caso de bateria"})
+    assert r.get("accion") == "rechazado", r
+    cod = _put_deploy(T2, otro, _tar_demo("rechazado"))
+    assert cod == 403, f"desplegó un subdominio rechazado (HTTP {cod})"
+    lib = call(T1, "subdomain_release", {"nombre": sub})
+    assert lib.get("accion"), f"la autoridad no pudo liberar un subdominio ajeno: {lib}"
 
 def _c_freno_auth():
     vio = []
@@ -469,6 +535,23 @@ def puerta_G():
         caso("G", "límite de tasa: una identidad desbocada recibe 429 y no arrastra a las demás", _g_tasa)
     else:
         salto("G", "límite de tasa", "sin identidad fresca del caso de alta")
+    if SSH:
+        caso("G", "sin fuga de descriptores: la carga no deja conexiones abiertas", _g_fds)
+    else:
+        salto("G", "fuga de descriptores", "sin BAT_SSH")
+    # el ULTIMO de todos: agota a proposito el freno global de intentos invalidos,
+    # asi no contamina los casos que esperan un 404
+    caso("G", "los tokens inválidos repetidos acaban en 429 (freno a fuerza bruta)", _c_freno_auth)
+
+def _g_fds():
+    """Tras cientos de llamadas, los descriptores hacia la base deben seguir
+    siendo pocos: `with sqlite3.connect()` no cierra, hay que cerrar a mano."""
+    svc = os.environ.get("BAT_SERVICIO", "evastate-test")
+    r = subprocess.run(SSH.split() + [
+        f"PID=$(systemctl show {svc} -p MainPID --value); sudo ls -l /proc/$PID/fd | grep -c state.db || true"],
+        capture_output=True, text=True, timeout=60)
+    n = int((r.stdout.strip() or "0").splitlines()[-1])
+    assert n <= 8, f"{n} descriptores abiertos hacia la base (fuga de conexiones)"
 
 def _g_tasa():
     tokf = _ult_ref["tok_fresco"]

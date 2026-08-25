@@ -41,9 +41,9 @@ production.
    it resets on restart — it protects the channel from a runaway client,
    it does not replace rotating a compromised token.
 3. **Dynamic apps have open network egress.** Needed so an app can call out;
-   it also means a malicious app could send spam. Compensated: only
-   participants registered by the admin can deploy, and each app runs as
-   DynamicUser, unprivileged, 512M / 80% CPU.
+   it also means a malicious app could send spam. Compensated: subdomains
+   need authority approval before anything can be deployed to them, and each
+   app runs as DynamicUser, unprivileged, 512M / 80% CPU.
 4. **Add/rotate restarts the service** (~2 s). With stateless clients no
    state is lost; only an in-flight request can fail. Accepted for
    simplicity; if it hurts, move to SIGHUP reload.

@@ -77,12 +77,20 @@ def ident():
         raise RuntimeError("sin identidad: la peticion no vino por una URL con token")
     return v
 
+@contextlib.contextmanager
 def db():
+    """Conexion por operacion. El close() es obligatorio: `with sqlite3.connect()`
+    solo hace commit/rollback y deja el descriptor abierto (fuga observada en
+    produccion: 25 descriptores acumulados; con carga sostenida agota el limite)."""
     con = sqlite3.connect(DB_PATH, timeout=15)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=8000")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=8000")
+        yield con
+        con.commit()
+    finally:
+        con.close()
 
 def init_db():
     with db() as con:
@@ -195,8 +203,15 @@ def state_overview() -> str:
                 and c.get("requiere") in ("confirmacion", "respuesta"):
             cart_pend.append({"ref": c["ref"], "tipo": c["tipo"], "de": c["de"],
                               "asunto": c["asunto"], "requiere": c["requiere"]})
+    por_aprobar = {}
+    if es_autoridad(me):
+        subs = [r["nombre"] for r in _rows("subdomain", 300) if r.get("estado") == "solicitado"]
+        altas = [i.get("id") for i in _rows("invitacion", 200) if i.get("estado") == "solicitada"]
+        if subs: por_aprobar["subdominios"] = subs
+        if altas: por_aprobar["altas"] = altas
     return _jd({
         "yo": me,
+        **({"por_aprobar": por_aprobar} if por_aprobar else {}),
         "cartelera_pendiente": cart_pend,
         "esperando_respuesta": mias,
         "mensajes_pendientes": pend,
@@ -647,12 +662,19 @@ def subdomain_claim(nombre: str, notas: str = "") -> str:
     if not NOMBRE_RE.match(nombre): return "ERROR: solo minúsculas, números y guiones (max 31)."
     if nombre in RESERVADOS: return f"ERROR: '{nombre}' está reservado."
     _, d = _get("subdomain", nombre)
-    if d and d.get("estado") == "ocupado" and d.get("dueno") != me:
-        return f"ERROR: '{nombre}' ya es de '{d.get('dueno')}'."
-    res = _put("subdomain", nombre, {"nombre": nombre, "dueno": me, "estado": "ocupado",
-                                     "url": f"https://{nombre}.{DOMAIN}", "notas": notas})
-    return _jd({**res, "url": f"https://{nombre}.{DOMAIN}",
-                "siguiente_paso": "PUT del tar.gz a /<TU_TOKEN>/deploy/" + nombre + " (estático) o /<TU_TOKEN>/app/" + nombre + " (dinámico)"})
+    if d and d.get("estado") in ("ocupado", "solicitado") and d.get("dueno") != me:
+        return f"ERROR: '{nombre}' ya es de '{d.get('dueno')}' (estado {d.get('estado')})."
+    if es_autoridad(me):
+        res = _put("subdomain", nombre, {"nombre": nombre, "dueno": me, "estado": "ocupado",
+                                         "url": f"https://{nombre}.{DOMAIN}", "notas": notas,
+                                         "aprobado_por": me, "aprobado": now()})
+        return _jd({**res, "estado": "ocupado", "url": f"https://{nombre}.{DOMAIN}",
+                    "siguiente_paso": "PUT del tar.gz a /<TU_TOKEN>/deploy/" + nombre + " (estatico) o /<TU_TOKEN>/app/" + nombre + " (dinamico)"})
+    res = _put("subdomain", nombre, {"nombre": nombre, "dueno": me, "estado": "solicitado",
+                                     "url": f"https://{nombre}.{DOMAIN}", "notas": notas,
+                                     "solicitado": now()})
+    return _jd({**res, "estado": "solicitado",
+                "siguiente_paso": "pendiente de aprobacion de la autoridad; hasta entonces no se puede desplegar ni se emite certificado TLS"})
 
 @mcp.tool()
 def subdomain_list(solo_ocupados: bool = False) -> str:
@@ -668,9 +690,61 @@ def subdomain_release(nombre: str) -> str:
     nombre = nombre.strip().lower()
     _, d = _get("subdomain", nombre)
     if not d: return f"ERROR: '{nombre}' no está registrado."
-    if d.get("dueno") != me: return f"ERROR: '{nombre}' es de '{d.get('dueno')}'."
-    d["estado"] = "libre"
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{nombre}' es de '{d.get('dueno')}'; solo su dueno o la autoridad puede liberarlo."
+    d["estado"] = "libre"; d["liberado_por"] = me; d["liberado"] = now()
     return _jd(_put("subdomain", nombre, d))
+
+@mcp.tool()
+def subdomain_pendientes() -> str:
+    """(SOLO autoridad) Subdominios solicitados esperando aprobación."""
+    if not es_autoridad(ident()): return "ERROR: subdomain_pendientes es de la autoridad."
+    return _jd([r for r in _rows("subdomain", 300) if r.get("estado") == "solicitado"])
+
+@mcp.tool()
+def subdomain_aprobar(nombre: str, nota: str = "") -> str:
+    """(SOLO autoridad) Aprueba un subdominio solicitado: habilita despliegue y TLS."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: subdomain_aprobar es de la autoridad."
+    nombre = nombre.strip().lower()
+    _, d = _get("subdomain", nombre)
+    if not d: return f"ERROR: '{nombre}' no está registrado."
+    if d.get("estado") != "solicitado": return f"ERROR: '{nombre}' está en estado {d.get('estado')}, no solicitado."
+    d["estado"] = "ocupado"; d["aprobado_por"] = me; d["aprobado"] = now()
+    if nota: d["nota_aprobacion"] = nota
+    _put("subdomain", nombre, d)
+    return _jd({"accion": "aprobado", "nombre": nombre, "dueno": d.get("dueno"),
+                "url": f"https://{nombre}.{DOMAIN}"})
+
+@mcp.tool()
+def subdomain_rechazar(nombre: str, motivo: str = "") -> str:
+    """(SOLO autoridad) Rechaza un subdominio solicitado."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: subdomain_rechazar es de la autoridad."
+    nombre = nombre.strip().lower()
+    _, d = _get("subdomain", nombre)
+    if not d: return f"ERROR: '{nombre}' no está registrado."
+    if d.get("estado") != "solicitado": return f"ERROR: '{nombre}' está en estado {d.get('estado')}, no solicitado."
+    d["estado"] = "rechazado"; d["rechazado_por"] = me; d["rechazado"] = now()
+    if motivo: d["motivo_rechazo"] = motivo
+    _put("subdomain", nombre, d)
+    return _jd({"accion": "rechazado", "nombre": nombre})
+
+@mcp.tool()
+def app_eliminar(nombre: str) -> str:
+    """Elimina una app dinámica: para el servicio, borra su unidad y su snippet de
+    Caddy. Solo el dueño o la autoridad. Los archivos desplegados se conservan."""
+    me = ident()
+    nombre = nombre.strip().lower()
+    _, d = _get("app", nombre)
+    if not d: return f"ERROR: no existe la app '{nombre}'."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{nombre}' es de '{d.get('dueno')}'; solo su dueno o la autoridad puede eliminarla."
+    rc, out = _sudo_ctl("remove", nombre)
+    if rc != 0: return f"ERROR al eliminar: {out[:300]}"
+    d["estado"] = "eliminada"; d["eliminada_por"] = me; d["eliminada"] = now()
+    _put("app", nombre, d)
+    return _jd({"accion": "eliminada", "nombre": nombre, "detalle": out[:200]})
 
 @mcp.tool()
 def deploy_info() -> str:
@@ -822,7 +896,10 @@ async def deploy_static(request, pid):
         return JSONResponse({"error": "nombre inválido"}, status_code=400)
     _, d = _get("subdomain", nombre)
     if not d or d.get("dueno") != pid or d.get("estado") != "ocupado":
-        return JSONResponse({"error": f"'{nombre}' no está reservado por '{pid}' (subdomain_claim primero)"}, status_code=403)
+        est = (d or {}).get("estado")
+        if d and d.get("dueno") == pid and est == "solicitado":
+            return JSONResponse({"error": f"'{nombre}' espera aprobacion de la autoridad (subdomain_aprobar)"}, status_code=403)
+        return JSONResponse({"error": f"'{nombre}' no esta aprobado para '{pid}' (subdomain_claim y aprobacion de la autoridad)"}, status_code=403)
     body = await _leer_cuerpo(request)
     if body is None: return JSONResponse({"error": "más de 50 MB"}, status_code=413)
     try:
@@ -839,7 +916,10 @@ async def deploy_app(request, pid):
         return JSONResponse({"error": "nombre inválido"}, status_code=400)
     _, d = _get("subdomain", nombre)
     if not d or d.get("dueno") != pid or d.get("estado") != "ocupado":
-        return JSONResponse({"error": f"'{nombre}' no está reservado por '{pid}' (subdomain_claim primero)"}, status_code=403)
+        est = (d or {}).get("estado")
+        if d and d.get("dueno") == pid and est == "solicitado":
+            return JSONResponse({"error": f"'{nombre}' espera aprobacion de la autoridad (subdomain_aprobar)"}, status_code=403)
+        return JSONResponse({"error": f"'{nombre}' no esta aprobado para '{pid}' (subdomain_claim y aprobacion de la autoridad)"}, status_code=403)
     body = await _leer_cuerpo(request)
     if body is None: return JSONResponse({"error": "más de 50 MB"}, status_code=413)
     destino = os.path.join(APPS_DIR, nombre)
@@ -864,7 +944,7 @@ async def deploy_app(request, pid):
     return JSONResponse({"ok": True, "url": f"https://{nombre}.{DOMAIN}",
                          "puerto_interno": puerto, "detalle": out})
 
-BACKUP_DIR = "/var/backups/evastate"
+BACKUP_DIR = os.environ.get("EVASTATE_BACKUP_DIR", "/var/backups/evastate")
 
 async def backup_get(request, pid):
     """Devuelve el respaldo mas reciente (gz). Cada cowork baja su copia al

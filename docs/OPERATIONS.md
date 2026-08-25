@@ -79,6 +79,21 @@ Tests section of the README): it installs an isolated instance from this
 repo, registers an authority, and checks health, the panel, its security
 headers and an authenticated call, then removes everything.
 
+## Subdomains and deployments (authority-gated)
+
+1. A participant calls `subdomain_claim("name")` → state `solicitado`.
+   Uploads to it return 403 and `/tls-check` refuses the certificate.
+2. An authority reviews `subdomain_pendientes()` (also surfaced in
+   `state_overview` under `por_aprobar`) and calls `subdomain_aprobar(name)`
+   or `subdomain_rechazar(name, motivo)`.
+3. Once approved, the owner uploads a tar.gz to `/<TOKEN>/deploy/<name>`
+   (static) or `/<TOKEN>/app/<name>` (dynamic app) — see `deploy_info()`.
+4. Teardown: `subdomain_release(name)` (owner or authority) and
+   `app_eliminar(name)`, which stops the service and removes its unit and
+   Caddy snippet. Deployed files are left on disk for the admin to remove.
+
+An authority's own `subdomain_claim` is approved on the spot.
+
 ## Remote registration (invitation flow)
 
 For a new client on another machine or account, no SSH needed:

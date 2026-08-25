@@ -21,9 +21,13 @@ re-reads the whole file. This MCP provides:
   `TEST-N` series for testing that never touches the real counter.
 - **Decisions and canonical facts**: append-only with `supersede`; data
   everyone must quote the same way.
-- **Deployment without SSH**: static sites and dynamic apps (hardened
-  systemd sandbox with memory/CPU limits) served at `<name>.<your-domain>`
-  with on-demand TLS certificates.
+- **Deployment without SSH, gated by the authority**: any participant can
+  request a subdomain (`subdomain_claim`), but it stays `solicitado` until an
+  authority approves it (`subdomain_aprobar` / `subdomain_rechazar`) — until
+  then uploads are refused with 403 and no TLS certificate is issued. Once
+  approved, static sites and dynamic apps (hardened systemd sandbox with
+  memory/CPU limits) are served at `<name>.<your-domain>` over HTTPS.
+  `app_eliminar` tears an app down (owner or authority).
 - **Verifiable backup**: daily on the server and on demand per participant
   (`GET /<TOKEN>/backup`, SHA256 in a response header).
 - **Authority bulletin board**: participants flagged as *authority*

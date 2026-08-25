@@ -298,20 +298,52 @@ async registros() {
 },
 async infra() {
   const [infra, subs, apps] = await Promise.all([tool("infra_list"), tool("subdomain_list"), tool("app_list")]);
-  let h = "<h1>Subdominios y apps</h1><h2 class='t'>Infraestructura</h2>";
-  h += infra.map(i => card("", `${esc(i.id)}<span class="badge">${esc(i.tipo)}</span>`, esc(i.dominios || ""), esc(i.descripcion))).join("");
+  let h = "<h1>Subdominios y apps</h1>";
+  h += `<div class="card"><h3>Solicitar un subdominio</h3>
+    <div class="meta">${YO.autoridad ? "Como autoridad queda aprobado al instante."
+      : "Queda pendiente de aprobación de la autoridad: hasta entonces no se puede desplegar ni se emite certificado."}</div>
+    <div class="fila"><div><label>Nombre</label><input id="s-nom" placeholder="mi-demo"></div>
+    <div style="flex:2"><label>Para qué</label><input id="s-notas"></div></div>
+    <button class="pri mini" onclick="pedirSub()">Solicitar</button></div>`;
+  const pend = subs.filter(x => x.estado === "solicitado");
+  if (pend.length) {
+    h += "<h2 class='t'>Solicitudes pendientes</h2>";
+    h += pend.map(x => card("pend", `${esc(x.nombre)}<span class="badge">solicitado</span>`,
+      `pide ${esc(x.dueno)} · ${esc(x.solicitado || "")}`, esc(x.notas || ""),
+      YO.autoridad
+        ? `<button class="mini ok" onclick="accion('subdomain_aprobar',{nombre:'${x.nombre}'},'infra')">Aprobar</button>
+           <button class="mini mal" onclick="rechazarSub('${x.nombre}')">Rechazar</button>`
+        : `<span class="badge">esperando a la autoridad</span>`)).join("");
+  }
   h += "<h2 class='t'>Subdominios</h2>";
-  h += subs.map(s => card(s.estado === "ocupado" ? "bien" : "", `${esc(s.nombre)}<span class="badge">${esc(s.estado)}</span>`,
-    `dueño ${esc(s.dueno)} · ${esc(s.url || "")}`, esc(s.notas || ""))).join("");
+  h += subs.filter(x => x.estado !== "solicitado").map(x => card(x.estado === "ocupado" ? "bien" : "",
+    `${esc(x.nombre)}<span class="badge">${esc(x.estado)}</span>`,
+    `dueño ${esc(x.dueno)} · ${esc(x.url || "")}`, esc(x.notas || ""),
+    (x.estado === "ocupado" && (x.dueno === YO.id || YO.autoridad))
+      ? `<button class="mini mal" onclick="accion('subdomain_release',{nombre:'${x.nombre}'},'infra')">Liberar</button>` : "")).join("");
   h += "<h2 class='t'>Apps dinámicas</h2>";
-  h += apps.map(a => card("", `${esc(a.nombre)}<span class="badge">:${esc(a.puerto)}</span>`, `dueño ${esc(a.dueno)}`, "",
+  h += apps.filter(a => a.estado !== "eliminada").map(a => card("",
+    `${esc(a.nombre)}<span class="badge">:${esc(a.puerto)}</span>`, `dueño ${esc(a.dueno)}`, "",
     `<button class="mini" onclick="verLogs('${a.nombre}')">Logs</button>
      <button class="mini ok" onclick="accion('app_start',{nombre:'${a.nombre}'},'infra')">Start</button>
      <button class="mini" onclick="accion('app_restart',{nombre:'${a.nombre}'},'infra')">Restart</button>
-     <button class="mini mal" onclick="accion('app_stop',{nombre:'${a.nombre}'},'infra')">Stop</button>`)).join("")
-     || "<p style='color:var(--mut)'>ninguna</p>";
+     <button class="mini mal" onclick="accion('app_stop',{nombre:'${a.nombre}'},'infra')">Stop</button>` +
+    ((a.dueno === YO.id || YO.autoridad) ? `<button class="mini mal" onclick="borrarApp('${a.nombre}')">Eliminar</button>` : ""))).join("")
+    || "<p style='color:var(--mut)'>ninguna activa</p>";
+  h += "<h2 class='t'>Infraestructura</h2>";
+  h += infra.map(i => card("", `${esc(i.id)}<span class="badge">${esc(i.tipo)}</span>`, esc(i.dominios || ""), esc(i.descripcion))).join("");
   $("#vista").innerHTML = h;
 }};
+
+async function pedirSub() {
+  try { await tool("subdomain_claim", {nombre: $("#s-nom").value.trim(), notas: $("#s-notas").value}); ir("infra"); }
+  catch (e) { alert(e.message); }
+}
+function rechazarSub(n) { const m = prompt("Motivo (opcional):") || ""; accion("subdomain_rechazar", {nombre: n, motivo: m}, "infra"); }
+function borrarApp(n) {
+  if (confirm(`¿Eliminar la app ${n}? Se para el servicio y se borran su unidad y su ruta pública.`))
+    accion("app_eliminar", {nombre: n}, "infra");
+}
 
 function prep(tipo, para, ref) { PREP = [tipo, para, ref]; ir("redactar"); }
 async function enviarMsg() {
