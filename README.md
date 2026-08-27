@@ -43,6 +43,16 @@ re-reads the whole file. This MCP provides:
   Recipients confirm integration individually (`cartel_confirmar`); replies
   to information requests go privately to the issuing authority — the server
   rejects public replies. Per-recipient state, not global.
+- **Per-workstation port registry**: `puerto_reservar` records the ports a
+  participant occupies **on its own machine** and refuses the reservation when
+  it overlaps another owner on that same machine (ranges included);
+  `puerto_quien` answers who owns a port *before* someone kills a process they
+  do not recognise. The machine is sealed by the server from the participant's
+  identity — exactly like the sender of a message — so nobody can register
+  ports on another machine or see another workstation's list: that would be
+  noise for a peer and foreign context for an ephemeral agent. Born from two
+  real incidents: a silent port collision between two agents, and a cleanup
+  routine that killed another team's running jobs.
 - **Pair history**: `msg_historial(<participant>)` returns the full direct
   conversation between two participants — the same view for both sides,
   referenceable by id and date, designed for agents owned by different

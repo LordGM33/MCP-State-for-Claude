@@ -95,6 +95,7 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
   <div class="nav" data-v="registros"><span class="dot"></span>Hechos y decisiones</div>
   <div class="sec">Infra</div>
   <div class="nav" data-v="infra"><span class="dot"></span>Subdominios y apps</div>
+  <div class="nav" data-v="puertos"><span class="dot"></span>Puertos de mi estación</div>
 </aside>
 <div id="zona">
 <header>
@@ -304,6 +305,30 @@ async registros() {
     `de ${esc(d.de)} · ${esc(d._creado)} · #${d._id}`, esc(d.decision) + "\n\nMotivo: " + esc(d.motivo || ""))).join("");
   $("#vista").innerHTML = h;
 },
+async puertos() {
+  const d = await tool("puerto_list");
+  let h = `<h1>Puertos de mi estación</h1>
+    <div class="card"><h3>${esc(d.estacion)}</h3>
+    <div class="meta">Solo se ven los de tu estación: lo de otra máquina sería ruido.
+    Registra lo que ocupes para que nadie lo pise ni mate tu proceso creyéndolo huérfano.</div>
+    <div class="fila">
+      <div style="max-width:120px"><label>Puerto</label><input id="p-num" inputmode="numeric"></div>
+      <div style="max-width:120px"><label>Hasta (rango)</label><input id="p-hasta" inputmode="numeric"></div>
+      <div style="flex:2"><label>Servicio</label><input id="p-serv" placeholder="llama-server (cerebro)"></div>
+      <div style="flex:2"><label>Notas</label><input id="p-notas"></div></div>
+    <button class="pri mini" onclick="pedirPuerto()">Registrar</button></div>
+    <div class="card"><h3>¿De quién es este puerto?</h3>
+    <div class="meta">Pregúntalo antes de matar un proceso que no reconozcas.</div>
+    <div class="fila"><div style="max-width:140px"><label>Puerto</label><input id="p-quien" inputmode="numeric"></div>
+    <button class="mini" onclick="quienPuerto()">Consultar</button></div></div>`;
+  h += d.puertos.map(p => card("bien",
+    `${esc(p.puerto)}${p.hasta && p.hasta !== p.puerto ? "–" + esc(p.hasta) : ""}<span class="badge">${esc(p.servicio)}</span>`,
+    `de ${esc(p.dueno)}${p.notas ? " · " + esc(p.notas) : ""}`, "",
+    (p.dueno === YO.id || YO.autoridad)
+      ? `<button class="mini mal" onclick="accion('puerto_liberar',{puerto:${p.puerto}},'puertos')">Liberar</button>` : "")).join("")
+    || "<p style='color:var(--mut)'>ningún puerto registrado todavía</p>";
+  $("#vista").innerHTML = h;
+},
 async infra() {
   const [infra, subs, apps] = await Promise.all([tool("infra_list"), tool("subdomain_list"), tool("app_list")]);
   let h = "<h1>Subdominios y apps</h1>";
@@ -342,6 +367,28 @@ async infra() {
   h += infra.map(i => card("", `${esc(i.id)}<span class="badge">${esc(i.tipo)}</span>`, esc(i.dominios || ""), esc(i.descripcion))).join("");
   $("#vista").innerHTML = h;
 }};
+
+async function verPuertos() { ir("puertos"); }
+
+async function pedirPuerto() {
+  try {
+    const args = {puerto: parseInt($("#p-num").value, 10),
+                  servicio: $("#p-serv").value, notas: $("#p-notas").value};
+    const h = parseInt($("#p-hasta").value, 10);
+    if (h) args.hasta = h;
+    await tool("puerto_reservar", args); ir("puertos");
+  } catch (e) { alert(e.message); }
+}
+async function quienPuerto() {
+  const n = parseInt($("#p-quien").value, 10);
+  if (!n) return;
+  try {
+    const q = await tool("puerto_quien", {puerto: n});
+    alert(q.encontrado
+      ? `Puerto ${n} en ${q.estacion}\n\nDueño: ${q.dueno}\nServicio: ${q.servicio}\nRango: ${q.rango}\n${q.notas || ""}`
+      : `Puerto ${n} sin registrar en ${q.estacion}.\n\n${q.aviso}`);
+  } catch (e) { alert(e.message); }
+}
 
 async function pedirSub() {
   try { await tool("subdomain_claim", {nombre: $("#s-nom").value.trim(), notas: $("#s-notas").value}); ir("infra"); }

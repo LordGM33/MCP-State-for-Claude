@@ -66,6 +66,16 @@ becomes the sender → ref `SOL-NNN` from a persisted sequence → state
 with `sol_cerrar` also marks its answers as handled. `msg_desde(date)`
 returns the delta since a date.
 
+## Workstation-scoped records
+
+Most records are global to the channel, but ports are not: a port number only
+means something on one machine. The `puerto` kind is keyed `<machine>:<port>`
+and every read and write is filtered by the caller's own machine, taken from
+`participants.json` — never from a parameter. The same number can therefore be
+in use on two workstations at once without conflict, and an agent running on a
+client's box cannot enumerate anyone else's. Scope by identity, not by
+convention: the server enforces it the same way it seals a message's sender.
+
 ## Participants
 
 `/etc/evastate/participants.json` (root:evastate 640) is the source of truth

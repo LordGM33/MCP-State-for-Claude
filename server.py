@@ -166,6 +166,13 @@ def _norm_ref(s):
 
 def _jd(x): return json.dumps(x, ensure_ascii=False, indent=2)
 
+def estacion(pid=None):
+    """Maquina del participante, sellada por el servidor (no es un parametro)."""
+    return (PARTICIPANTES.get(pid or ident(), {}).get("maquina") or "").strip()
+
+def _solapa(a1, a2, b1, b2):
+    return a1 <= b2 and b1 <= a2
+
 def es_autoridad(pid):
     return bool(PARTICIPANTES.get(pid, {}).get("autoridad"))
 
@@ -209,8 +216,15 @@ def state_overview() -> str:
         altas = [i.get("id") for i in _rows("invitacion", 200) if i.get("estado") == "solicitada"]
         if subs: por_aprobar["subdominios"] = subs
         if altas: por_aprobar["altas"] = altas
+    maq = estacion(me)
+    puertos = [{k: v for k, v in r.items() if k in ("puerto", "hasta", "servicio", "dueno", "notas")}
+               for r in _rows("puerto", 500, order="DESC")
+               if r.get("maquina") == maq and r.get("estado") == "ocupado"] if maq else []
+    puertos.sort(key=lambda r: int(r["puerto"]))
     return _jd({
         "yo": me,
+        "mi_estacion": maq or "(sin asignar)",
+        "puertos_de_mi_estacion": puertos,
         **({"por_aprobar": por_aprobar} if por_aprobar else {}),
         "cartelera_pendiente": cart_pend,
         "esperando_respuesta": mias,
@@ -717,6 +731,85 @@ async def registro_post(request):
                 return JSONResponse({"ok": True, "id": pid,
                                      "estado": "pendiente de aprobacion por la autoridad"})
     return JSONResponse({"error": "invitacion no valida"}, status_code=404)
+
+# ───────────── PUERTOS LOCALES (por estacion de trabajo) ─────────────
+@mcp.tool()
+def puerto_reservar(puerto: int, servicio: str, notas: str = "", hasta: int = 0) -> str:
+    """Registra un puerto (o rango puerto..hasta) que ocupas EN TU ESTACION, para
+    que nadie lo pise ni mate tu proceso creyendo que es huerfano. La estacion la
+    pone el servidor: no puedes registrar puertos de otra maquina."""
+    me = ident(); maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada; pidele a la autoridad que la registre."
+    try:
+        p1 = int(puerto); p2 = int(hasta) if hasta else p1
+    except (TypeError, ValueError):
+        return "ERROR: puerto y hasta deben ser numeros."
+    if not (1 <= p1 <= 65535 and p1 <= p2 <= 65535):
+        return "ERROR: rango invalido (1-65535, y hasta >= puerto)."
+    if not servicio.strip():
+        return "ERROR: di que servicio ocupa el puerto (es el dato que evita que alguien lo mate)."
+    for r in _rows("puerto", 500, order="DESC"):
+        if r.get("maquina") != maq or r.get("estado") != "ocupado": continue
+        if _solapa(p1, p2, int(r["puerto"]), int(r.get("hasta") or r["puerto"])):
+            if r.get("dueno") != me:
+                return (f"ERROR: en {maq} el puerto {r['puerto']}"
+                        + (f"-{r['hasta']}" if r.get("hasta") and r["hasta"] != r["puerto"] else "")
+                        + f" ya es de '{r.get('dueno')}' ({r.get('servicio')}). Elige otro o hablalo con quien lo tiene.")
+    d = {"maquina": maq, "puerto": p1, "hasta": p2, "servicio": servicio.strip(),
+         "dueno": me, "notas": notas, "estado": "ocupado"}
+    res = _put("puerto", f"{maq}:{p1}", d)
+    return _jd({**res, "maquina": maq, "puerto": p1,
+                **({"hasta": p2} if p2 != p1 else {})})
+
+@mcp.tool()
+def puerto_list(maquina: str = "", incluir_libres: bool = False) -> str:
+    """Puertos registrados EN TU ESTACION. Otra maquina solo se consulta pidiendola
+    explicitamente, y los agentes nunca ven mas que la suya: lo de otra estacion es
+    ruido para ti y contexto ajeno para ellos."""
+    me = ident(); mia = estacion()
+    pedida = (maquina or "").strip() or mia
+    if pedida != mia:
+        tipo = PARTICIPANTES.get(me, {}).get("tipo")
+        if tipo == "agente" and not es_autoridad(me):
+            return "ERROR: un agente solo consulta los puertos de su propia estacion."
+    out = [r for r in _rows("puerto", 500, order="DESC")
+           if r.get("maquina") == pedida and (incluir_libres or r.get("estado") == "ocupado")]
+    out.sort(key=lambda r: int(r["puerto"]))
+    return _jd({"estacion": pedida, "total": len(out), "puertos": out})
+
+@mcp.tool()
+def puerto_quien(puerto: int) -> str:
+    """De quien es un puerto EN TU ESTACION. Pregúntalo ANTES de matar un proceso
+    que no reconozcas: puede ser el cerebro o una corrida de otro cowork."""
+    maq = estacion()
+    if not maq: return "ERROR: tu identidad no tiene estacion asignada."
+    try: p = int(puerto)
+    except (TypeError, ValueError): return "ERROR: puerto debe ser un numero."
+    for r in _rows("puerto", 500, order="DESC"):
+        if r.get("maquina") == maq and r.get("estado") == "ocupado" \
+                and _solapa(p, p, int(r["puerto"]), int(r.get("hasta") or r["puerto"])):
+            return _jd({"encontrado": True, "estacion": maq, "puerto": p,
+                        "dueno": r.get("dueno"), "servicio": r.get("servicio"),
+                        "rango": f"{r['puerto']}-{r['hasta']}" if r.get("hasta") and r["hasta"] != r["puerto"] else str(r["puerto"]),
+                        "notas": r.get("notas", ""), "desde": r.get("_creado")})
+    return _jd({"encontrado": False, "estacion": maq, "puerto": p,
+                "aviso": "sin registrar: si hay algo escuchando ahi, pregunta en el canal antes de matarlo"})
+
+@mcp.tool()
+def puerto_liberar(puerto: int) -> str:
+    """Libera un puerto tuyo (o cualquiera de tu estacion, si eres autoridad)."""
+    me = ident(); maq = estacion()
+    if not maq: return "ERROR: tu identidad no tiene estacion asignada."
+    try: p = int(puerto)
+    except (TypeError, ValueError): return "ERROR: puerto debe ser un numero."
+    _, d = _get("puerto", f"{maq}:{p}")
+    if not d or d.get("estado") != "ocupado":
+        return f"ERROR: {p} no esta registrado como ocupado en {maq}."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: {p} en {maq} es de '{d.get('dueno')}'."
+    d["estado"] = "libre"; d["liberado_por"] = me; d["liberado"] = now()
+    return _jd({**_put("puerto", f"{maq}:{p}", d), "accion": "liberado", "puerto": p})
 
 # ───────────── DECISIONES / HECHOS / INFRA (sellados con identidad) ─────────────
 @mcp.tool()

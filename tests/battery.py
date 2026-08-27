@@ -13,6 +13,8 @@ BASE = _req("BAT_URL_BASE").rstrip("/")
 ES_PROD = os.environ.get("BAT_PROD") == "1"   # marcar explicitamente cuando el objetivo es produccion
 T1 = open(_req("BAT_TOKEN_1")).read().strip()
 T2 = open(_req("BAT_TOKEN_2")).read().strip()
+_t3 = os.environ.get("BAT_TOKEN_OTRA_ESTACION")   # participante en OTRA maquina
+T3 = open(_t3).read().strip() if _t3 else None
 _ta = os.environ.get("BAT_TOKEN_AJENO")
 TA = open(_ta).read().strip() if _ta else None
 SSH = os.environ.get("BAT_SSH", "")           # vacio = se salta el caso de restart
@@ -102,7 +104,7 @@ def puerta_A():
                  (http("GET", f"{BASE}/panel").headers))
     caso("A", "el JavaScript del panel es sintácticamente válido", _a_panel_js)
     caso("A", "/wake responde la página de despertar sin exponer nada", _a_wake)
-    n_tools = int(os.environ.get("BAT_TOOLS", "42"))
+    n_tools = int(os.environ.get("BAT_TOOLS", "46"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
@@ -347,6 +349,11 @@ def puerta_D():
     caso("D", "search encuentra lo escrito", _d_search)
     caso("D", "serie TEST-N: única, cerrable y NO toca el contador SOL (D3)", _d_serie_test)
     caso("D", "refs normalizadas: SOL-7 ≡ SOL-007 en duplicado y en sol_cerrar (H1)", _d_norm)
+    caso("D", "puertos: colisión detectada en la misma estación, rangos incluidos", _d_puertos)
+    if T3:
+        caso("D", "puertos: cada estación solo ve la suya y el mismo número convive", _d_puertos_aislados)
+    else:
+        salto("D", "aislamiento entre estaciones", "sin BAT_TOKEN_OTRA_ESTACION")
     caso("D", "cartelera: solo autoridad publica; regla exige confirmación por receptor", _d_cartel_regla)
     caso("D", "cartelera: petición se responde EN PRIVADO a la autoridad, nunca a todos", _d_cartel_peticion)
     caso("D", "msg_historial: mismo historial del par visto desde ambos lados", _d_historial)
@@ -417,6 +424,49 @@ def _d_search():
     parametro = list(esquema["inputSchema"]["properties"].keys())[0]
     s = call(T1, "search", {parametro: "ñandú"})
     assert "ñandú" in json.dumps(s, ensure_ascii=False), "search no encuentra el hecho"
+
+def _puerto_libre(base):
+    return base + (int(RUN[-3:]) % 900)
+
+def _d_puertos():
+    p = _puerto_libre(21000)
+    r = call(T1, "puerto_reservar", {"puerto": p, "servicio": "bateria " + RUN})
+    assert r.get("puerto") == p, r
+    try:
+        call(T2, "puerto_reservar", {"puerto": p, "servicio": "otro"})
+        assert False, "otro participante de la misma estación pudo tomar el puerto"
+    except Rechazo as e:
+        assert "ya es de" in str(e), str(e)
+    q = call(T2, "puerto_quien", {"puerto": p})
+    assert q.get("encontrado") and q.get("dueno"), q
+    # rango: reservar y comprobar que un punto interior tambien colisiona
+    b = _puerto_libre(22000)
+    call(T1, "puerto_reservar", {"puerto": b, "hasta": b + 10, "servicio": "rango " + RUN})
+    try:
+        call(T2, "puerto_reservar", {"puerto": b + 5, "servicio": "dentro del rango"})
+        assert False, "un puerto dentro de un rango ajeno se dejó reservar"
+    except Rechazo:
+        pass
+    assert call(T2, "puerto_quien", {"puerto": b + 5}).get("encontrado"), "el rango no responde a puerto_quien"
+    libre = call(T1, "puerto_liberar", {"puerto": p})
+    assert libre.get("accion") == "liberado", libre
+    assert not call(T1, "puerto_quien", {"puerto": p}).get("encontrado"), "sigue ocupado tras liberar"
+    call(T1, "puerto_liberar", {"puerto": b})
+
+def _d_puertos_aislados():
+    """Lo de otra estación es ruido: no debe aparecer, y el mismo número tiene
+    que poder usarse en dos máquinas a la vez sin estorbarse."""
+    p = _puerto_libre(23000)
+    call(T1, "puerto_reservar", {"puerto": p, "servicio": "en mi estacion " + RUN})
+    r3 = call(T3, "puerto_reservar", {"puerto": p, "servicio": "en la otra estacion " + RUN})
+    assert r3.get("puerto") == p, f"la otra estación no pudo usar el mismo número: {r3}"
+    mia = call(T1, "puerto_list"); otra = call(T3, "puerto_list")
+    assert mia["estacion"] != otra["estacion"], "ambas identidades declaran la misma estación"
+    assert all(x["dueno"] != r3.get("dueno") or x["servicio"] != r3.get("servicio")
+               for x in mia["puertos"]), "veo puertos de otra estación en mi listado"
+    q = call(T3, "puerto_quien", {"puerto": p})
+    assert q["estacion"] == otra["estacion"], "puerto_quien mira la estación equivocada"
+    call(T1, "puerto_liberar", {"puerto": p}); call(T3, "puerto_liberar", {"puerto": p})
 
 def _d_serie_test():
     a = call(T1, "msg_send", {"para": "prueba2", "asunto": "ancla pre-test",
