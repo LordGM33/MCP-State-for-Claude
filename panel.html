@@ -59,6 +59,7 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
 .acti .cuando{margin-left:auto;color:var(--mut);font-size:12px;white-space:nowrap}
 .pto{width:8px;height:8px;border-radius:99px;background:var(--verde);margin-top:5px;flex:none}
 .pto.r{background:var(--rojo)}
+.oculto{display:none}
 .aviso-seg{font-size:12px;color:var(--mut);border:1px dashed var(--bd);border-radius:8px;padding:8px 10px;margin-top:14px}
 </style>
 </head>
@@ -69,12 +70,31 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
   <div class="sub">Acceso por token de participante. El token se conserva solo en
   esta pestaña (sessionStorage), nunca en la URL de la página, y la sesión se
   cierra sola tras 15 minutos sin actividad.</div>
-  <label>Token</label><input id="tok" type="password" autocomplete="off" onkeydown="if(event.key==='Enter')entrar()">
-  <div id="err"></div>
-  <button class="pri" style="margin-top:12px;width:100%" onclick="entrar()">Entrar</button>
+  <div id="modo-pin" class="oculto">
+    <label>PIN de este dispositivo</label>
+    <input id="pin" type="password" inputmode="text" autocomplete="off"
+           onkeydown="if(event.key==='Enter')abrirConPin()">
+    <div id="err"></div>
+    <button class="pri" style="margin-top:12px;width:100%" onclick="abrirConPin()">Desbloquear</button>
+    <button class="mini" style="margin-top:8px;width:100%" onclick="olvidar()">Usar otro token / olvidar este dispositivo</button>
+  </div>
+  <div id="modo-token">
+    <label>Token</label><input id="tok" type="password" autocomplete="off" onkeydown="if(event.key==='Enter')entrar()">
+    <label style="margin-top:10px">
+      <input type="checkbox" id="recordar" style="width:auto;margin-right:6px">
+      Recordarlo en este dispositivo, protegido con un PIN
+    </label>
+    <div id="zona-pin" class="oculto">
+      <label>PIN nuevo (mínimo 6; mejor una frase corta que un número)</label>
+      <input id="pin-nuevo" type="password" autocomplete="off">
+    </div>
+    <div id="err2"></div>
+    <button class="pri" style="margin-top:12px;width:100%" onclick="entrar()">Entrar</button>
+  </div>
   <div class="aviso-seg">Tras Cloudflare + TLS. El servidor no guarda tokens en
-  claro (solo SHA-256) y limita los intentos fallidos. Cierra sesión al terminar
-  en equipos compartidos.</div>
+  claro (solo SHA-256) y limita los intentos fallidos. Si guardas el token en
+  este dispositivo queda cifrado y solo lo abre tu PIN; tras 5 intentos fallidos
+  se borra. No lo guardes en equipos compartidos.</div>
 </div>
 
 <div id="app">
@@ -130,8 +150,55 @@ async function tool(nombre, args) {
   try { return JSON.parse(txt); } catch { return txt; }
 }
 
-async function entrar() {
-  TOK = $("#tok").value.trim(); $("#err").textContent = "";
+const CAJA = "state_caja";          // token cifrado en este dispositivo
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+const deb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+async function claveDePin(pin, salt) {
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin),
+    "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    {name: "PBKDF2", salt, iterations: 600000, hash: "SHA-256"},
+    base, {name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
+}
+
+async function guardarToken(token, pin) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const k = await claveDePin(pin, salt);
+  const ct = await crypto.subtle.encrypt({name: "AES-GCM", iv}, k, new TextEncoder().encode(token));
+  localStorage.setItem(CAJA, JSON.stringify({s: b64(salt), i: b64(iv), c: b64(ct), f: 0}));
+}
+
+async function abrirConPin() {
+  const caja = JSON.parse(localStorage.getItem(CAJA) || "null");
+  if (!caja) return olvidar();
+  const pin = $("#pin").value;
+  $("#err").textContent = "Desbloqueando…";
+  try {
+    const k = await claveDePin(pin, deb64(caja.s));
+    const claro = await crypto.subtle.decrypt({name: "AES-GCM", iv: deb64(caja.i)}, k, deb64(caja.c));
+    caja.f = 0; localStorage.setItem(CAJA, JSON.stringify(caja));
+    TOK = new TextDecoder().decode(claro);
+    await entrarConToken();
+  } catch {
+    caja.f = (caja.f || 0) + 1;
+    if (caja.f >= 5) {
+      localStorage.removeItem(CAJA);
+      $("#err").textContent = "PIN incorrecto 5 veces: el token guardado se ha borrado.";
+      setTimeout(() => location.reload(), 2500);
+    } else {
+      localStorage.setItem(CAJA, JSON.stringify(caja));
+      $("#err").textContent = `PIN incorrecto (${5 - caja.f} intentos antes de borrarlo).`;
+    }
+  }
+}
+
+function olvidar() {
+  localStorage.removeItem(CAJA); sessionStorage.removeItem("state_tok"); location.reload();
+}
+
+async function entrarConToken() {
   try {
     YO = await tool("whoami");
     sessionStorage.setItem("state_tok", TOK);
@@ -139,8 +206,24 @@ async function entrar() {
     $("#quien").innerHTML = `<b>${esc(YO.id)}</b> · ${esc(YO.tipo)}${YO.autoridad ? ' · <span style="color:var(--rojo)">AUTORIDAD</span>' : ""}`;
     document.querySelectorAll(".nav").forEach(n => n.onclick = () => ir(n.dataset.v));
     vivo(); ir("dashboard");
-  } catch (e) { $("#err").textContent = e.message; }
+    return true;
+  } catch (e) {
+    ($("#modo-pin").classList.contains("oculto") ? $("#err2") : $("#err")).textContent = e.message;
+    return false;
+  }
 }
+
+async function entrar() {
+  TOK = $("#tok").value.trim(); $("#err2").textContent = "";
+  const rec = $("#recordar") && $("#recordar").checked;
+  const pin = $("#pin-nuevo") ? $("#pin-nuevo").value : "";
+  if (rec && pin.length < 6) { $("#err2").textContent = "El PIN necesita al menos 6 caracteres."; return; }
+  if (await entrarConToken() && rec) {
+    await guardarToken(TOK, pin);
+  }
+  return;
+}
+
 function salir(msg) {
   sessionStorage.removeItem("state_tok");
   location.reload();
@@ -266,7 +349,7 @@ async altas() {
   let h = `<h1>Altas</h1><div class="card"><h3>Invitar a un cowork nuevo</h3>
     <div class="meta">Genera el texto completo para entregarle: sirve tal cual, en cualquier
     equipo y proyecto. El código es de un solo uso y caduca en 7 días.</div>
-    <div class="fila"><div><label>Id para el cowork nuevo (opcional)</label><input id="i-id" placeholder="editorial"></div>
+    <div class="fila"><div><label>Id para el cowork nuevo (opcional)</label><input id="i-id" placeholder="equipo-nuevo"></div>
     <div style="flex:2"><label>Nota interna</label><input id="i-nota"></div></div>
     <button class="pri mini" onclick="invitar()">Emitir invitación</button>
     <div id="i-zona" style="display:none">
@@ -314,7 +397,7 @@ async puertos() {
     <div class="fila">
       <div style="max-width:120px"><label>Puerto</label><input id="p-num" inputmode="numeric"></div>
       <div style="max-width:120px"><label>Hasta (rango)</label><input id="p-hasta" inputmode="numeric"></div>
-      <div style="flex:2"><label>Servicio</label><input id="p-serv" placeholder="llama-server (cerebro)"></div>
+      <div style="flex:2"><label>Servicio</label><input id="p-serv" placeholder="api-local (para que sirve)"></div>
       <div style="flex:2"><label>Notas</label><input id="p-notas"></div></div>
     <button class="pri mini" onclick="pedirPuerto()">Registrar</button></div>
     <div class="card"><h3>¿De quién es este puerto?</h3>
@@ -464,7 +547,15 @@ async function buscar() {
 async function verLogs(n) {
   try { alert(await tool("app_logs", {nombre: n, lineas: 30})); } catch (e) { alert(e.message); }
 }
-if (TOK) { $("#tok").value = TOK; entrar(); }
+(function inicio() {
+  $("#recordar") && $("#recordar").addEventListener("change", e =>
+    $("#zona-pin").classList.toggle("oculto", !e.target.checked));
+  if (sessionStorage.getItem("state_tok")) { TOK = sessionStorage.getItem("state_tok"); entrarConToken(); return; }
+  if (localStorage.getItem(CAJA)) {
+    $("#modo-token").classList.add("oculto"); $("#modo-pin").classList.remove("oculto");
+    setTimeout(() => $("#pin").focus(), 100);
+  }
+})();
 </script>
 </body>
 </html>

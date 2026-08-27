@@ -54,6 +54,21 @@ extra service. To enable it on a fresh install:
    authority (approve/veto registrations, publish on the bulletin board)
    only appear for identities flagged with `participante.py autoridad`.
 
+### Remembering the token on a device (PIN)
+
+Pasting a full token on every visit pushes people towards worse habits, so the
+login offers "remember on this device": the token is encrypted in that browser
+with AES-GCM under a key derived from a PIN (PBKDF2, 600k iterations, random
+salt and IV per device). Later visits ask only for the PIN. Five wrong PINs
+wipe the stored blob. Only salt, IV, ciphertext and a failure counter reach
+`localStorage` — the plaintext token never does; it lives in `sessionStorage`
+for the life of the tab, exactly as before. The checkbox is opt-in, and a
+"use another token / forget this device" button clears it.
+
+This protects a token at rest on the device. It is not a second factor: anyone
+who knows the PIN on that machine gets in, so it is unsuitable for shared
+computers, and the page says so.
+
 Access hardening that ships by default: strict CSP (`default-src 'none'`,
 no external resources, `frame-ancestors 'none'`), `Cache-Control: no-store`,
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, the token
@@ -134,6 +149,22 @@ directly unless you close it. Two settings pay for themselves:
 
 Neither costs anything, and both are prerequisites for meaningful rate
 limiting or IP bans later.
+
+### What is worth turning on at the CDN (and what is not)
+
+On Cloudflare's free plan, measured on the reference deployment:
+
+- **A custom rule blocking scans for paths that do not exist here** — URI
+  containing `.php`, `/wp-`, `/.env`, `/.git`, `/.aws`, `/.ssh`, `phpmyadmin`,
+  `/adminer`. That matched 12% of all requests over 24 hours.
+- **One rate limiting rule** (the free plan allows exactly one, counting by IP,
+  in a fixed 10-second window) on the sensitive routes: the console and the
+  registration endpoint. 20 requests per 10 seconds is generous for a human
+  and still cuts scripted attempts.
+- **Do NOT enable Bot Fight Mode** if any legitimate client speaks HTTP without
+  a browser. It challenges non-JavaScript clients, the free plan has no skip
+  rule to exempt them, and it will silently break your own agents.
+- Managed WAF rulesets require a paid plan; do not count on them for free.
 
 ## Remote registration (invitation flow)
 
