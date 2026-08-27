@@ -1,8 +1,8 @@
 #!/bin/bash
-# Duerme las apps dinamicas sin visitas recientes (scale-to-zero). Vuelven solas
-# con la primera peticion, via /wake del servidor de estado.
-# EVA_IDLE_MIN: minutos de inactividad (20 por defecto).
-# EVASTATE_DOMAIN y EVASTATE_APP_PREFIX definen que apps mira.
+# Stops dynamic apps with no recent visits (scale-to-zero). They come back on
+# the first request, via the state server's /wake page.
+# EVA_IDLE_MIN: minutes of inactivity (default 20).
+# EVASTATE_DOMAIN and EVASTATE_APP_PREFIX select which apps it looks at.
 IDLE=${EVA_IDLE_MIN:-20}
 DOM=${EVASTATE_DOMAIN:-example.com}
 PREFIJO=${EVASTATE_APP_PREFIX:-eva-app-}
