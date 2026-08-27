@@ -78,27 +78,25 @@ re-reads the whole file. This MCP provides:
 
 ## Installation (summary)
 
-1. A VPS with Python 3.12+, Caddy and systemd. Create the `evastate` user.
-2. `server.py` to `/opt/evastate/`, scripts to `/usr/local/sbin/`, units
-   from `systemd/` to `/etc/systemd/system/`.
-3. Copy `config.example.env` to `/etc/evastate.env` and set **all** the
-   variables (code defaults are neutral: unconfigured, the server answers
-   for `state.example.com`).
-4. Adapt `caddy/Caddyfile.example` to your domain (apex + wildcard with
-   on-demand TLS approved by the server's `/tls-check` endpoint).
-5. Register the first participant, and flag your authority (the identity
-   allowed to publish on the bulletin board):
-   `sudo /opt/evastate/venv/bin/python /opt/evastate/participante.py alta <id> <type> "<Name>" <machine>`
-   (types: cowork|agente|servicio|humano; prints the token ONCE), then
-   `sudo ... participante.py autoridad <id> on`.
-6. Client: `examples/client.py` (configured via environment). Recommended
-   first call of every session: `state_overview()`.
-7. Optional web console: put `panel.html` next to `server.py` (or set
-   `EVASTATE_PANEL`) and open `https://state.<your-domain>/panel`. Put the
-   whole host behind a CDN/WAF; for an extra gate, front `/panel` with an
-   identity proxy (e.g. Cloudflare Access) — the token check stays either way.
+Run `bash scripts/instalar.sh` and pick a mode:
 
-Full detail: `docs/OPERATIONS.md` · design rationale: `docs/ARCHITECTURE.md`
+**Exposed to the internet** — Caddy in front, public certificates, real
+subdomains. The installer pulls Caddy from its official repository.
+
+**Private LAN** — no proxy, no DNS. The server serves its own HTTPS with a
+local authority and publishes sites under `/s/<name>/`; the certificate carries
+the server's IP, so `https://192.168.x.x:8787` validates with no DNS at all.
+The installer spells out that there is no CDN in this mode.
+
+Then register the first identity and flag it as authority:
+
+    sudo /opt/evastate/statectl alta <id> cowork "<Name>" <machine>
+    sudo /opt/evastate/statectl autoridad <id> on
+
+Manual installation, the platform matrix (Linux / macOS / Windows) and running
+without any reverse proxy are covered in `docs/OPERATIONS.md`.
+
+Design rationale: `docs/ARCHITECTURE.md`
 · known limits: `docs/SCOPE-AND-LIMITS.md`.
 
 ## Tests
@@ -109,6 +107,14 @@ load. Meant to run against a **sandbox instance** (same server, own
 port/database/participants) exposed through the same public route as
 production; against production only `--humo` (smoke) is allowed. Configured
 via environment: see the file header and `config.example.env`.
+
+It needs two tokens of **different identities** and reads their ids from the
+server, so it works against any installation, not just the one it was written
+for. Set `BAT_SIN_CDN=1` when nothing filters traffic in front,
+`BAT_SIN_RESPALDO=1` before the first backup exists, and `BAT_SITIO=<name>` to
+also exercise the built-in static server. Install `node` if you want the
+console's JavaScript checked: without it that case is skipped rather than
+guessed at.
 
 `tests/install_check.sh` verifies a **from-scratch install of this repo**:
 it sets up an isolated instance (own port, database, participants file and

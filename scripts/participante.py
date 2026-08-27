@@ -3,6 +3,16 @@
 Prints the token ONCE."""
 import hashlib, json, os, secrets, subprocess, sys, datetime
 
+# Sin entorno tomaria los valores por defecto, que son los de OTRA instalacion:
+# con dos instalaciones en la misma maquina se escribe en la equivocada.
+_ENV = os.environ.get("EVASTATE_ENV", "")
+if _ENV and os.path.exists(_ENV):
+    for _l in open(_ENV, encoding="utf-8"):
+        _l = _l.strip()
+        if _l and not _l.startswith("#") and "=" in _l:
+            _k, _v = _l.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 P = os.environ.get("EVASTATE_PARTICIPANTS", "/etc/evastate/participants.json")
 SERVICIO = os.environ.get("EVASTATE_SERVICE", "evastate")
 GRUPO = os.environ.get("EVASTATE_GROUP", "evastate")
@@ -59,6 +69,7 @@ def main():
     else:
         sys.exit("operacion desconocida")
     subprocess.run(["systemctl", "restart", SERVICIO])
-    print("evastate reiniciado para aplicar el cambio")
+    print(f"{SERVICIO} reiniciado para aplicar el cambio")
 
+print(f"instalacion: {P}  ·  servicio: {SERVICIO}", file=sys.stderr)
 main()

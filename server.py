@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared-state MCP server: identity-sealed messaging, facts, decisions,
 subdomain/app deployment. All config via EVASTATE_* env vars."""
-import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, subprocess, hashlib, secrets
+import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, hashlib, secrets
 import time
 from collections import deque
 
@@ -18,6 +18,11 @@ PUBLIC_HOST = os.environ.get("EVASTATE_PUBLIC_HOST", f"state.{DOMAIN}")
 SERVER_NAME = os.environ.get("EVASTATE_NAME", "estado-mcp")
 PANEL_PATH = os.environ.get("EVASTATE_PANEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html"))
 SITES_DIR = os.environ.get("EVASTATE_SITES", "/var/www/sites")
+MODO = os.environ.get("EVASTATE_MODO", "web")          # web | lan
+SERVE_SITES = os.environ.get("EVASTATE_SERVE_SITES") == "1"
+BIND = os.environ.get("EVASTATE_BIND", "127.0.0.1")
+TLS_CERT = os.environ.get("EVASTATE_TLS_CERT", "")
+TLS_KEY = os.environ.get("EVASTATE_TLS_KEY", "")
 APPS_DIR = os.environ.get("EVASTATE_APPS", "/srv/apps")
 CTL = "/usr/local/sbin/eva-app-ctl"
 MAX_UPLOAD = 50 * 1024 * 1024  # 50 MB
@@ -1017,14 +1022,22 @@ def _ctl_pedir(accion, nombre, extra=None):
     req = {"id": rid, "accion": accion, "nombre": nombre, **(extra or {})}
     tmp = os.path.join(SPOOL, f".{rid}.tmp")
     with open(tmp, "w") as f: json.dump(req, f)
-    os.replace(tmp, os.path.join(SPOOL, f"{rid}.json"))
+    pet_p = os.path.join(SPOOL, f"{rid}.json")
+    os.replace(tmp, pet_p)
     res_p = os.path.join(CTL_OUT, f"{rid}.json")
-    for _ in range(240):                      # hasta 120 s
+    for i in range(240):                      # hasta 120 s
         if os.path.exists(res_p):
             res = json.load(open(res_p)); os.remove(res_p)
             return res.get("rc", 1), res.get("out", "")
+        # El ayudante borra la peticion al recogerla. Si sigue ahi pasado el
+        # margen de arranque, nadie la va a recoger: no hacemos esperar 2 min.
+        if i == 16 and os.path.exists(pet_p):
+            os.remove(pet_p)
+            return 1, ("ERROR: las apps dinamicas necesitan el ayudante eva-appd "
+                       "(systemd) y aqui no esta activo. El resto del canal "
+                       "funciona con normalidad.")
         time.sleep(0.5)
-    return 1, "timeout: el ayudante eva-appd no respondió en 120 s"
+    return 1, "timeout: el ayudante eva-appd no respondio en 120 s"
 
 def _sudo_ctl(*args):
     accion, nombre = args[0], args[1]
@@ -1116,8 +1129,19 @@ def _extraer_seguro(blob, destino):
             if p.startswith("/") or ".." in p.split("/") or m.issym() or m.islnk():
                 raise ValueError(f"entrada insegura en el tar: {p}")
         os.makedirs(destino, exist_ok=True)
-        subprocess.run(["find", destino, "-mindepth", "1", "-delete"], check=False)
+        _vaciar(destino)
         tf.extractall(destino)
+
+def _vaciar(d):
+    """Deja el directorio existente pero sin contenido. Sin binarios externos:
+    `find -delete` no existe en Windows."""
+    import shutil
+    for e in os.scandir(d):
+        if e.is_dir() and not e.is_symlink():
+            shutil.rmtree(e.path, ignore_errors=True)
+        else:
+            try: os.unlink(e.path)
+            except OSError: pass
 
 async def _leer_cuerpo(request):
     body = b""
@@ -1260,16 +1284,40 @@ async def panel_get(_):
     except Exception:
         return PlainTextResponse("panel no instalado", status_code=404)
 
-base = Starlette(routes=[Route("/health", health), Route("/tls-check", tls_check),
-                         Route("/panel", panel_get)],
-                 lifespan=lifespan)
+async def sitio_get(request):
+    """Sirve /s/<nombre>/... desde SITES_DIR cuando no hay proxy delante.
+    Resuelve en cada peticion: un sitio recien desplegado aparece sin reiniciar."""
+    nombre = request.path_params["nombre"]
+    if not NOMBRE_RE.match(nombre):
+        return PlainTextResponse("no encontrado", status_code=404)
+    raiz = os.path.realpath(os.path.join(SITES_DIR, nombre))
+    pedido = request.path_params.get("resto") or "index.html"
+    destino = os.path.realpath(os.path.join(raiz, pedido))
+    if destino != raiz and not destino.startswith(raiz + os.sep):
+        return PlainTextResponse("no encontrado", status_code=404)
+    if os.path.isdir(destino):
+        destino = os.path.join(destino, "index.html")
+    if not os.path.isfile(destino):
+        return PlainTextResponse("no encontrado", status_code=404)
+    from starlette.responses import FileResponse
+    return FileResponse(destino)
+
+_rutas = [Route("/health", health), Route("/tls-check", tls_check), Route("/panel", panel_get)]
+if SERVE_SITES:
+    _rutas += [Route("/s/{nombre}/{resto:path}", sitio_get), Route("/s/{nombre}", sitio_get)]
+
+base = Starlette(routes=_rutas, lifespan=lifespan)
+# El SDK rechaza con 421 cualquier Host que no este aqui (anti DNS-rebinding).
+# Sin el puerto explicito, una instalacion que no escuche en 443 no responde.
+_EXTRA_HOSTS = [h.strip() for h in os.environ.get("EVASTATE_EXTRA_HOSTS", "").split(",") if h.strip()]
+_HOSTS = [PUBLIC_HOST, f"{PUBLIC_HOST}:443", "127.0.0.1:*", "localhost:*"] + _EXTRA_HOSTS
+
 mcp_asgi = mcp.streamable_http_app(
     stateless_http=True,
     json_response=True,
     transport_security=TransportSecuritySettings(
-        allowed_hosts=[PUBLIC_HOST, f"{PUBLIC_HOST}:443",
-                       "127.0.0.1:*", "localhost:*"],
-        allowed_origins=[f"https://{PUBLIC_HOST}"],
+        allowed_hosts=_HOSTS,
+        allowed_origins=[f"https://{PUBLIC_HOST}"] + [f"https://{h}" for h in _EXTRA_HOSTS],
     ),
 )
 
@@ -1323,4 +1371,7 @@ async def app(scope, receive, send):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("EVASTATE_PORT", "8787")))
+    extra = {}
+    if TLS_CERT and TLS_KEY:
+        extra = {"ssl_certfile": TLS_CERT, "ssl_keyfile": TLS_KEY}
+    uvicorn.run(app, host=BIND, port=int(os.environ.get("EVASTATE_PORT", "8787")), **extra)

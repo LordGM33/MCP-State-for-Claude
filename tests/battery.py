@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""Test battery (7 gates), stdlib only. Configure via env: BAT_URL_BASE,
-BAT_TOKEN_1/2, optional BAT_TOKEN_AJENO/BAT_SSH/BAT_SERVICIO/BAT_PROD.
+"""Test battery (7 gates), stdlib only.
+
+Required: BAT_URL_BASE, BAT_TOKEN_1, BAT_TOKEN_2 (two different identities;
+their ids are read from the server, not assumed).
+Optional: BAT_TOKEN_AJENO, BAT_TOKEN_OTRA_ESTACION, BAT_SSH, BAT_UA, BAT_PROD.
+  BAT_SIN_CDN=1       no CDN in front (skips the User-Agent filter case)
+  BAT_SIN_RESPALDO=1  no backup generated yet (skips the backup case)
+  BAT_SITIO=<name>    a deployed site, to check the built-in static server
 Against production only --humo (smoke) is allowed."""
 import json, os, sys, time, gzip, hashlib, io, subprocess, threading, urllib.request, urllib.error
 RUN = str(int(time.time()))
@@ -19,6 +25,12 @@ _ta = os.environ.get("BAT_TOKEN_AJENO")
 TA = open(_ta).read().strip() if _ta else None
 SSH = os.environ.get("BAT_SSH", "")           # vacio = se salta el caso de restart
 UA = os.environ.get("BAT_UA", "estado-mcp-bateria/1.0")
+
+# Los ids no se asumen: se preguntan al servidor. Antes estaban escritos en el
+# codigo y la bateria solo servia en la instalacion de quien la escribio.
+SIN_CDN = os.environ.get("BAT_SIN_CDN") == "1"   # instalacion sin CDN delante
+SIN_RESPALDO = os.environ.get("BAT_SIN_RESPALDO") == "1"  # aun no hay respaldo generado
+SITIO_PRUEBA = os.environ.get("BAT_SITIO", "")   # nombre de un sitio ya desplegado (modo autonomo)
 
 R = {"ok": 0, "fallo": 0, "salto": 0}
 FALLOS = []
@@ -50,6 +62,9 @@ def rpc(tok, metodo, params=None, _id=1, ua=UA):
                    "Accept": "application/json, text/event-stream"})
     return json.loads(r.read().decode())
 
+class SinNode(Exception):
+    pass
+
 class Rechazo(Exception):
     """El tool rechazó la operación (texto 'ERROR: ...' o isError)."""
 
@@ -61,6 +76,17 @@ def call(tok, tool, args=None):
         raise Rechazo(txt[:200])
     try: return json.loads(txt)
     except Exception: return txt
+
+def _quien(tok):
+    try:
+        return call(tok, "whoami")["id"]
+    except Exception as e:
+        sys.exit(f"no pude identificar el token: {e}")
+
+ID1 = _quien(T1)
+ID2 = _quien(T2)
+if ID1 == ID2:
+    sys.exit("BAT_TOKEN_1 y BAT_TOKEN_2 son la misma identidad: hacen falta dos")
 
 def status_de(fn):
     try:
@@ -102,8 +128,20 @@ def puerta_A():
                              assert_(h.get("Cache-Control") == "no-store", "el panel es cacheable"),
                              assert_(h.get("X-Content-Type-Options") == "nosniff", "sin nosniff")))
                  (http("GET", f"{BASE}/panel").headers))
-    caso("A", "el JavaScript del panel es sintácticamente válido", _a_panel_js)
+    try:
+        _a_panel_js(); R["ok"] += 1
+        print("  [OK]    A · el JavaScript del panel es sintácticamente válido")
+    except SinNode:
+        salto("A", "el JavaScript del panel es válido", "hace falta node para comprobarlo")
+    except AssertionError as e:
+        R["fallo"] += 1; FALLOS.append(f"A · el JavaScript del panel es sintácticamente válido: {e}")
+        print(f"  [FALLO] A · el JavaScript del panel es sintácticamente válido: {e}")
     caso("A", "/wake responde la página de despertar sin exponer nada", _a_wake)
+    if SITIO_PRUEBA:
+        caso("A", "modo autonomo: el sitio se sirve en /s/<nombre>/", _a_sitios_ruta)
+        caso("A", "modo autonomo: no se puede salir del directorio del sitio", _a_sitios_fuga)
+    else:
+        salto("A", "sitios servidos por el propio canal", "sin BAT_SITIO (instalacion con proxy delante)")
     n_tools = int(os.environ.get("BAT_TOOLS", "46"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
@@ -133,6 +171,23 @@ def _a_wake():
         assert "active" not in despues.replace("inactive", ""), \
             "un simple GET encendio la app: los escaneres la mantendrian viva"
 
+def _a_sitios_ruta():
+    """Modo autonomo: los sitios se publican en /s/<nombre>/ sin proxy delante."""
+    c = status_de(lambda: http("GET", f"{BASE}/s/{SITIO_PRUEBA}/"))
+    assert_(c == 200, f"el sitio no se sirve: http {c}")
+
+def _a_sitios_fuga():
+    """El handler no puede servir nada fuera del directorio del sitio."""
+    intentos = [
+        f"/s/{SITIO_PRUEBA}/../../../etc/passwd",
+        "/s/../../etc/passwd",
+        f"/s/{SITIO_PRUEBA}/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        "/s/..%2f..%2fetc%2fpasswd",
+    ]
+    for u in intentos:
+        c = status_de(lambda u=u: http("GET", BASE + u))
+        assert_(c == 404, f"{u} devolvio {c}, deberia ser 404")
+
 def _a_panel_js():
     """Un error de sintaxis deja el panel mudo: los botones no hacen NADA y la
     página se ve perfecta. Se valida con node si existe; si no, con un balance
@@ -149,9 +204,10 @@ def _a_panel_js():
         os.unlink(ruta)
         assert r.returncode == 0, f"node --check: {(r.stderr or '')[:300]}"
     else:
-        limpio = re.sub(r'`(?:[^`\\]|\\.)*`|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|//[^\n]*', "", js)
-        for a, c in (("{", "}"), ("(", ")"), ("[", "]")):
-            assert limpio.count(a) == limpio.count(c), f"desbalance de {a}{c}"
+        # Contar llaves no es analizar JavaScript: una expresion regular con
+        # llaves basta para dar un rojo falso, y un rojo falso ensena a
+        # ignorar los rojos. Mejor decir que no se pudo comprobar.
+        raise SinNode()
 
 # ---------- PUERTA B · PROTOCOLO ----------
 def puerta_B():
@@ -165,9 +221,12 @@ def puerta_B():
          lambda: assert_(status_de(lambda: http("POST", f"{BASE}/{T1}/mcp", b"esto no es json",
                 hdrs={"Content-Type":"application/json","Accept":"application/json"})) in (400, 406, 422),
                 "aceptó basura"))
-    caso("B", "User-Agent de librería → 403 de Cloudflare (OP-085 sigue vigente)",
-         lambda: assert_(status_de(lambda: rpc(T1, "tools/list", ua="Python-urllib/3.10")) == 403,
-                "Cloudflare dejó pasar el UA de urllib"))
+    if SIN_CDN:
+        salto("B", "el CDN filtra el User-Agent de libreria", "instalacion sin CDN (BAT_SIN_CDN=1)")
+    else:
+        caso("B", "User-Agent de librería → 403 del CDN (OP-085 sigue vigente)",
+             lambda: assert_(status_de(lambda: rpc(T1, "tools/list", ua="Python-urllib/3.10")) == 403,
+                    "el CDN dejó pasar el UA de urllib"))
 
 # ---------- PUERTA C · IDENTIDAD/SEGURIDAD ----------
 def puerta_C():
@@ -178,8 +237,8 @@ def puerta_C():
                      (espera_404(lambda: rpc(TA, "tools/list"))))
     else:
         salto("C", "aislamiento entre instancias", "sin BAT_TOKEN_AJENO")
-    caso("C", "el emisor lo sella el servidor: msg de T1 llega firmado 'prueba'",
-         lambda: assert_(_msg_firmado() == "prueba", f"firmado {_msg_firmado()}"))
+    caso("C", "el emisor lo sella el servidor: msg de T1 llega firmado con la identidad de T1",
+         lambda: assert_(_msg_firmado() == ID1, f"firmado {_msg_firmado()}, esperado {ID1}"))
     caso("C", "sol_cerrar por un NO involucrado → rechazo",
          lambda: _c_sol_cerrar_ajeno())
     if SSH:
@@ -193,7 +252,7 @@ def puerta_C():
 
 _ult_ref = {}
 def _msg_firmado():
-    call(T1, "msg_send", {"para": "prueba2", "asunto": "prueba de firma",
+    call(T1, "msg_send", {"para": ID2, "asunto": "prueba de firma",
                           "cuerpo": "quién firma este mensaje", "tipo": "aviso"})
     inbox = call(T2, "msg_inbox")
     m = [x for x in inbox if x["asunto"] == "prueba de firma"][-1]
@@ -201,12 +260,12 @@ def _msg_firmado():
     return m["de"]
 
 def _c_sol_cerrar_ajeno():
-    r = call(T1, "msg_send", {"para": "prueba2", "asunto": "solicitud para cierre ajeno",
+    r = call(T1, "msg_send", {"para": ID2, "asunto": "solicitud para cierre ajeno",
                               "cuerpo": "x", "tipo": "solicitud"})
     ref = r.get("ref") or r.get("sol") or ""
     assert ref, f"la solicitud no recibió ref: {r}"
     _ult_ref["c"] = ref
-    # 'prueba2' SÍ está involucrado; el no-involucrado sería un tercero.
+    # el dueño de T2 SÍ está involucrado; el no-involucrado sería un tercero.
     # En sandbox de 2 participantes: probamos que un token INVÁLIDO no puede, y
     # que el involucrado SÍ puede (cierre limpio del caso).
     ok = call(T2, "sol_cerrar", {"ref": ref, "estado": "descartada"})
@@ -360,7 +419,7 @@ def puerta_D():
     caso("D", "overview: esperando_respuesta lista mis solicitudes abiertas (D9)", _d_esperando)
 
 def _d_ciclo_msg():
-    call(T1, "msg_send", {"para": "prueba2", "asunto": "ciclo completo",
+    call(T1, "msg_send", {"para": ID2, "asunto": "ciclo completo",
                           "cuerpo": "ida", "tipo": "aviso"})
     m = [x for x in call(T2, "msg_inbox") if x["asunto"] == "ciclo completo"]
     assert m, "no llegó a la bandeja"
@@ -371,24 +430,24 @@ def _d_ciclo_msg():
     assert not m2, "sigue pendiente tras el ack"
 
 def _d_refs():
-    r1 = call(T1, "msg_send", {"para": "prueba2", "asunto": "sol auto",
+    r1 = call(T1, "msg_send", {"para": ID2, "asunto": "sol auto",
                                "cuerpo": "x", "tipo": "solicitud"})
     ref1 = r1.get("ref") or ""
     assert ref1.startswith("SOL-"), f"sin ref automática: {r1}"
     n1 = int(ref1.split("-")[1])
     exp = f"SOL-{n1 + 10}"
-    r2 = call(T1, "msg_send", {"para": "prueba2", "asunto": "sol explícita",
+    r2 = call(T1, "msg_send", {"para": ID2, "asunto": "sol explícita",
                                "cuerpo": "x", "tipo": "solicitud", "ref": exp})
     assert int((r2.get("ref") or "SOL-0").split("-")[1]) == n1 + 10, \
         f"no respetó la ref explícita: {r2}"
     exp = r2["ref"]  # forma canónica devuelta por el servidor
     try:
-        call(T1, "msg_send", {"para": "prueba2", "asunto": "sol duplicada",
+        call(T1, "msg_send", {"para": ID2, "asunto": "sol duplicada",
                               "cuerpo": "x", "tipo": "solicitud", "ref": exp})
         assert False, "aceptó una ref duplicada"
     except Rechazo:
         pass  # rechazo correcto
-    r3 = call(T1, "msg_send", {"para": "prueba2", "asunto": "sol salto",
+    r3 = call(T1, "msg_send", {"para": ID2, "asunto": "sol salto",
                                "cuerpo": "x", "tipo": "solicitud"})
     n3 = int((r3.get("ref") or "SOL-0").split("-")[1])
     assert n3 > n1 + 10, f"el contador no saltó la explícita: {r3}"
@@ -397,10 +456,10 @@ def _d_refs():
         call(T2, "sol_cerrar", {"ref": ref, "estado": "descartada"})
 
 def _d_hilo():
-    r = call(T1, "msg_send", {"para": "prueba2", "asunto": "hilo pregunta",
+    r = call(T1, "msg_send", {"para": ID2, "asunto": "hilo pregunta",
                               "cuerpo": "¿?", "tipo": "solicitud"})
     ref = r["ref"]
-    call(T2, "msg_send", {"para": "prueba", "asunto": "hilo respuesta",
+    call(T2, "msg_send", {"para": ID1, "asunto": "hilo respuesta",
                           "cuerpo": "!", "tipo": "respuesta", "responde_a": ref})
     hilo = call(T1, "msg_hilo", {"ref": ref})
     txt = json.dumps(hilo, ensure_ascii=False)
@@ -469,20 +528,20 @@ def _d_puertos_aislados():
     call(T1, "puerto_liberar", {"puerto": p}); call(T3, "puerto_liberar", {"puerto": p})
 
 def _d_serie_test():
-    a = call(T1, "msg_send", {"para": "prueba2", "asunto": "ancla pre-test",
+    a = call(T1, "msg_send", {"para": ID2, "asunto": "ancla pre-test",
                               "cuerpo": "x", "tipo": "solicitud"})
     na = int(a["ref"].split("-")[1])
     tref = f"TEST-{int(time.time()) % 100000}"
-    t = call(T1, "msg_send", {"para": "prueba2", "asunto": "sol de la serie test",
+    t = call(T1, "msg_send", {"para": ID2, "asunto": "sol de la serie test",
                               "cuerpo": "x", "tipo": "solicitud", "ref": tref})
     assert t["ref"].startswith("TEST-"), t
     try:
-        call(T1, "msg_send", {"para": "prueba2", "asunto": "test duplicada",
+        call(T1, "msg_send", {"para": ID2, "asunto": "test duplicada",
                               "cuerpo": "x", "tipo": "solicitud", "ref": tref})
         assert False, "aceptó una TEST duplicada"
     except Rechazo:
         pass
-    b = call(T1, "msg_send", {"para": "prueba2", "asunto": "ancla post-test",
+    b = call(T1, "msg_send", {"para": ID2, "asunto": "ancla post-test",
                               "cuerpo": "x", "tipo": "solicitud"})
     nb = int(b["ref"].split("-")[1])
     assert nb == na + 1, f"la serie TEST movió el contador SOL ({na}→{nb})"
@@ -492,12 +551,12 @@ def _d_serie_test():
         call(T2, "sol_cerrar", {"ref": ref, "estado": "descartada"})
 
 def _d_norm():
-    r = call(T1, "msg_send", {"para": "prueba2", "asunto": "sol para normalizar",
+    r = call(T1, "msg_send", {"para": ID2, "asunto": "sol para normalizar",
                               "cuerpo": "x", "tipo": "solicitud"})
     n = int(r["ref"].split("-")[1])
     sin_ceros = f"sol-{n}"
     try:
-        call(T1, "msg_send", {"para": "prueba2", "asunto": "dup sin ceros",
+        call(T1, "msg_send", {"para": ID2, "asunto": "dup sin ceros",
                               "cuerpo": "x", "tipo": "solicitud", "ref": sin_ceros})
         assert False, f"aceptó {sin_ceros} existiendo {r['ref']}"
     except Rechazo:
@@ -523,7 +582,7 @@ def _d_cartel_regla():
     tab2 = [c for c in call(T2, "cartelera") if c["ref"] == ref][0]
     assert tab2["mi_estado"] == "al dia", tab2["mi_estado"]
     est = call(T1, "cartel_estado", {"ref": ref})
-    assert "prueba2" in est["confirmados"] and est["confirmados"]["prueba2"]["tipo"] == "integrada", est
+    assert ID2 in est["confirmados"] and est["confirmados"][ID2]["tipo"] == "integrada", est
     try:
         call(T2, "cartel_estado", {"ref": ref})
         assert False, "un no-autoridad pudo ver la matriz"
@@ -541,20 +600,20 @@ def _d_cartel_peticion():
         assert False, "permitió responder una petición de cartelera a todos"
     except Rechazo:
         pass
-    call(T2, "msg_send", {"para": "prueba", "tipo": "respuesta", "responde_a": ref,
+    call(T2, "msg_send", {"para": ID1, "tipo": "respuesta", "responde_a": ref,
                           "asunto": "resp privada", "cuerpo": "{\"dato\": 1}"})
     est = call(T1, "cartel_estado", {"ref": ref})
-    assert est["confirmados"].get("prueba2", {}).get("tipo") == "respuesta", est
+    assert est["confirmados"].get(ID2, {}).get("tipo") == "respuesta", est
     tab = [c for c in call(T2, "cartelera") if c["ref"] == ref][0]
     assert tab["mi_estado"] == "al dia", tab["mi_estado"]
     call(T1, "cartel_cerrar", {"ref": ref})
 
 def _d_historial():
     a1 = "hist ida " + RUN; a2 = "hist vuelta " + RUN
-    call(T1, "msg_send", {"para": "prueba2", "tipo": "aviso", "asunto": a1, "cuerpo": "x"})
-    call(T2, "msg_send", {"para": "prueba", "tipo": "aviso", "asunto": a2, "cuerpo": "y"})
-    h1 = call(T1, "msg_historial", {"con_quien": "prueba2"})
-    h2 = call(T2, "msg_historial", {"con_quien": "prueba"})
+    call(T1, "msg_send", {"para": ID2, "tipo": "aviso", "asunto": a1, "cuerpo": "x"})
+    call(T2, "msg_send", {"para": ID1, "tipo": "aviso", "asunto": a2, "cuerpo": "y"})
+    h1 = call(T1, "msg_historial", {"con_quien": ID2})
+    h2 = call(T2, "msg_historial", {"con_quien": ID1})
     t1 = [m["asunto"] for m in h1["mensajes"]]; t2 = [m["asunto"] for m in h2["mensajes"]]
     assert a1 in t1 and a2 in t1, "faltan direcciones en el historial"
     assert t1 == t2, "las dos partes ven historiales distintos"
@@ -563,7 +622,7 @@ def _d_esperando():
     # con la base ya grande, esto solo pasa si el overview mira lo RECIENTE:
     # con ORDER BY id ASC + LIMIT la bandeja se congela en el pasado
     a = "espera d9 " + RUN
-    r = call(T1, "msg_send", {"para": "prueba2", "tipo": "solicitud", "asunto": a, "cuerpo": "x"})
+    r = call(T1, "msg_send", {"para": ID2, "tipo": "solicitud", "asunto": a, "cuerpo": "x"})
     ov = call(T1, "state_overview")
     assert any(m.get("ref") == r["ref"] for m in ov.get("esperando_respuesta", [])), \
         "mi solicitud abierta no aparece en esperando_respuesta"
@@ -575,7 +634,10 @@ def _d_esperando():
 # ---------- PUERTA E · PERSISTENCIA/RESPALDO ----------
 def puerta_E(con_restart):
     print("PUERTA E · persistencia y respaldo")
-    caso("E", "GET /backup: SHA256 de cabecera coincide y el gz es una SQLite íntegra", _e_backup)
+    if SIN_RESPALDO:
+        salto("E", "GET /backup entrega el respaldo del dia", "aun no hay respaldo generado (BAT_SIN_RESPALDO=1)")
+    else:
+        caso("E", "GET /backup: SHA256 de cabecera coincide y el gz es una SQLite íntegra", _e_backup)
     if con_restart and not ES_PROD and SSH:
         caso("E", "restart del servicio: los datos sobreviven", _e_restart)
     else:
@@ -607,13 +669,13 @@ def _f_d1():
     call(T1, "msg_send", {"para": "todos", "asunto": "aviso propio bandeja " + RUN,
                           "cuerpo": "x", "tipo": "aviso"})
     propios = [m for m in call(T1, "msg_inbox")
-               if m["asunto"] == "aviso propio bandeja " + RUN and m["de"] == "prueba"]
+               if m["asunto"] == "aviso propio bandeja " + RUN and m["de"] == ID1]
     assert not propios, "el emisor ve su propio aviso como pendiente (defecto D1)"
 
 def _f_d2():
-    r = call(T1, "msg_send", {"para": "prueba2", "asunto": "sol para d2 " + RUN,
+    r = call(T1, "msg_send", {"para": ID2, "asunto": "sol para d2 " + RUN,
                               "cuerpo": "x", "tipo": "solicitud"})
-    call(T2, "msg_send", {"para": "prueba", "asunto": "resp para d2 " + RUN,
+    call(T2, "msg_send", {"para": ID1, "asunto": "resp para d2 " + RUN,
                           "cuerpo": "y", "tipo": "respuesta", "responde_a": r["ref"]})
     call(T1, "sol_cerrar", {"ref": r["ref"], "estado": "respondida"})
     pend = [m for m in call(T1, "msg_inbox")

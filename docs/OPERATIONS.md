@@ -1,9 +1,42 @@
 # Operations and installation
 
+## What you can install, and where
+
+| Platform | Channel, console, backups | Static sites | Own HTTPS | Subdomains | Dynamic apps |
+|---|---|---|---|---|---|
+| Linux + systemd | yes | yes | yes | yes (needs a proxy) | yes |
+| macOS | yes | yes | yes | no | no |
+| Windows | yes | yes | yes | no | no |
+
+Dynamic apps and scale-to-zero need systemd and the root helper. Everything
+else is plain Python and SQLite. Architecture is irrelevant to the channel
+itself: it runs wherever CPython 3.12+ runs, Raspberry Pi included.
+
+## Two installation modes
+
+`scripts/instalar.sh` (Linux + systemd) asks which one you want:
+
+**Exposed to the internet.** What a public deployment needs: a reverse proxy
+in front, public certificates, real subdomains. The installer pulls Caddy from
+its official repository, so it keeps receiving security updates with the rest
+of the system.
+
+**Private LAN.** No proxy and no DNS. The server serves its own HTTPS with a
+local certificate authority created at install time, and sites are published
+under `/s/<name>/`. The certificate carries the server's IP address, so
+`https://192.168.x.x:8787` validates without any DNS at all.
+
+The installer states plainly that the LAN mode has no CDN in front: the scan
+filter and the edge rate limit do not exist there, the only brake is the
+server's own per-identity limit, and the whole thing rests on the local
+network being trusted.
+
 ## Requirements
 
-Ubuntu ≥ 24.04, Caddy ≥ 2.10, Python ≥ 3.12 with venv, systemd. DNS: apex +
-wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
+Python ≥ 3.12 with venv. On Linux, systemd for the service and the root helper.
+Caddy ≥ 2.10 **only for the internet mode**: apex + wildcard `*.your-domain`
+pointing at the server (tested behind Cloudflare). The LAN mode needs neither
+a proxy nor DNS.
 
 ## Installation (mirrors the real deployment)
 
@@ -32,8 +65,12 @@ wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
 
 ## Participant registration (admin only)
 
-    sudo /opt/evastate/venv/bin/python /opt/evastate/participante.py alta <id> <type> "<Name>" <machine>
+    sudo /opt/evastate/statectl alta <id> <type> "<Name>" <machine>
     # prints the token ONCE; hand it over through a safe channel (local file)
+    # Use statectl, not participante.py directly: without the installation's
+    # environment the script falls back to the DEFAULT paths, which on a host
+    # with two installations means writing into the wrong one. It now prints
+    # which participants file and service it is about to touch.
     # also: baja <id> · rotar <id> · lista · autoridad <id> on|off
     # "autoridad" marks who may publish rules/requests on the bulletin board
 
@@ -93,6 +130,31 @@ To verify a fresh install end to end, run `tests/install_check.sh` (see the
 Tests section of the README): it installs an isolated instance from this
 repo, registers an authority, and checks health, the panel, its security
 headers and an authenticated call, then removes everything.
+
+## Running without a reverse proxy
+
+Set `EVASTATE_SERVE_SITES=1` and the server publishes `SITES_DIR` under
+`/s/<name>/` itself, resolving on each request so a freshly deployed site
+appears without a restart. Point `EVASTATE_TLS_CERT` and `EVASTATE_TLS_KEY` at
+a certificate and uvicorn terminates TLS directly; `EVASTATE_BIND=0.0.0.0`
+makes it reachable from the network. All four default to off, so a proxied
+deployment behaves exactly as before.
+
+Two things to know:
+
+- **Put the port in `EVASTATE_PUBLIC_HOST`.** The SDK rejects any Host header
+  it does not recognise with `421 Invalid Host header`, and the list is built
+  from that variable plus `:443`. On any other port the channel answers 421 and
+  nothing explains why. `EVASTATE_EXTRA_HOSTS` accepts a comma-separated list
+  for additional names.
+- **Sites served this way share an origin** with the console, whereas
+  subdomains do not. For internal demos that is usually fine; if you need
+  browser-level isolation between deployments, use subdomains and a proxy.
+
+If you generate a certificate authority by hand, give it
+`keyUsage=critical,keyCertSign,cRLSign`. OpenSSL 3 rejects a CA without it, so
+Python clients fail to verify while curl still accepts the chain — the failure
+shows up only in the clients that matter.
 
 ## Subdomains and deployments (authority-gated)
 
