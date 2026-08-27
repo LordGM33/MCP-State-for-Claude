@@ -111,6 +111,30 @@ Dynamic apps should not burn CPU or RAM while nobody is using them:
 - Owners can sleep an app on demand with `app_dormir(name)`, or from the
   console. Static sites need none of this: they run no process.
 
+## Hardening the origin (no extra cost)
+
+If the host sits behind a CDN like Cloudflare, the origin IP is still reachable
+directly unless you close it. Two settings pay for themselves:
+
+- **Only accept 80/443 from the CDN.** Fetch the provider's published ranges
+  and allow just those; drop the rest. Measured on the reference deployment:
+  inbound packets fell 49% and failed connection attempts went from 1218/min
+  to 0 — that traffic was port scanning against the bare IP. Add the rules
+  *before* removing the open ones so there is never a gap, and schedule an
+  automatic rollback (`systemd-run --on-active=12min`) that restores the saved
+  ruleset, cancelling it only after you have verified access still works.
+  Note the ranges file may lack a trailing newline: normalise it or two ranges
+  will concatenate into one invalid entry.
+- **Tell the reverse proxy to trust the CDN**, otherwise every log line shows
+  the CDN's address and any IP-based defence would ban the CDN itself:
+
+      servers {
+          trusted_proxies static <cdn ranges>
+      }
+
+Neither costs anything, and both are prerequisites for meaningful rate
+limiting or IP bans later.
+
 ## Remote registration (invitation flow)
 
 For a new client on another machine or account, no SSH needed:
