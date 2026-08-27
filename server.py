@@ -493,7 +493,7 @@ def _texto_invitacion(codigo, id_sugerido=""):
     usuario y proyecto sin que la autoridad tenga que editar nada."""
     base = f"https://{PUBLIC_HOST}"
     linea_id = (f'ID = "{id_sugerido}"' if id_sugerido
-                else 'ID = ""   # <-- pon aqui tu id: minusculas, corto (ej. "editorial", "abel-01")')
+                else 'ID = ""   # <-- pon aqui tu id: minusculas, corto (ej. "marketing", "agente-01")')
     aviso_id = (f"Tu id asignado es `{id_sugerido}` y es inmutable." if id_sugerido
                 else "Elige un id corto en minusculas y ponlo en la linea ID del script; sera inmutable.")
     return (

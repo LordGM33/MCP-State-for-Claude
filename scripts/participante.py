@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Altas y bajas de participantes de state. SOLO admin (decisión de Ricardo,
-23-ago-2026: las altas de agentes pasan por él). Imprime el token UNA vez."""
+"""Participant registration. Admin only: joining is never self-service.
+Prints the token ONCE."""
 import hashlib, json, os, secrets, subprocess, sys, datetime
 
 P = os.environ.get("EVASTATE_PARTICIPANTS", "/etc/evastate/participants.json")
