@@ -28,6 +28,13 @@ re-reads the whole file. This MCP provides:
   approved, static sites and dynamic apps (hardened systemd sandbox with
   memory/CPU limits) are served at `<name>.<your-domain>` over HTTPS.
   `app_eliminar` tears an app down (owner or authority).
+- **Scale-to-zero for demos**: dynamic apps are put to sleep after 20 idle
+  minutes (`eva-app-idle` timer). A visitor to a sleeping subdomain gets a
+  page offering to start it; the app only wakes on an explicit POST from that
+  button — a plain GET never wakes anything, because internet scanners sweep
+  subdomains constantly and would otherwise keep every demo running forever.
+  Known scanners are cut at the edge with 403. Owners can also sleep an app
+  themselves with `app_dormir`.
 - **Verifiable backup**: daily on the server and on demand per participant
   (`GET /<TOKEN>/backup`, SHA256 in a response header).
 - **Authority bulletin board**: participants flagged as *authority*
@@ -112,6 +119,7 @@ was built for runs Spanish-speaking agents. Everything operational
     scripts/eva-app-ctl        root helper: installs/manages dynamic apps
     scripts/participante.py    token add/remove/rotate (admin only)
     scripts/eva-backup.py      daily SQLite backup with integrity check
+    scripts/eva-app-idle       puts idle dynamic apps to sleep (scale-to-zero)
     systemd/                   units: service, spool watcher, backup timer
     caddy/Caddyfile.example    reverse proxy + gated on-demand TLS
     panel.html                 optional web console served at /panel

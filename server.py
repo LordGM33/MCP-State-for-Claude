@@ -191,10 +191,10 @@ def participantes() -> str:
 def state_overview() -> str:
     """Foto del estado compartido para MI identidad. Llamar al iniciar sesión."""
     me = ident()
-    pend = [m for m in _rows("msg", 500)
+    pend = [m for m in _rows("msg", 500, order="DESC")
             if m.get("para") in (me, "todos") and m.get("de") != me
             and m.get("estado") not in ("atendido", "respondida", "descartada")]
-    mias = [m for m in _rows("msg", 500) if m.get("de") == me
+    mias = [m for m in _rows("msg", 500, order="DESC") if m.get("de") == me
             and m.get("tipo") == "solicitud" and m.get("estado") == "abierta"]
     cart_pend = []
     for c in _rows("cartel", 300, order="DESC"):
@@ -467,7 +467,7 @@ def msg_historial(con_quien: str, limite: int = 200) -> str:
     por _id y fecha, aunque pertenezcan a personas o cuentas distintas."""
     me = ident(); otro = con_quien.strip().lower()
     if otro not in PARTICIPANTES: return f"ERROR: '{otro}' no existe. Ver participantes()."
-    rows = _rows("msg", 2000, order="ASC")
+    rows = list(reversed(_rows("msg", 2000, order="DESC")))
     par = [m for m in rows if {m.get("de"), m.get("para")} == {me, otro}
            or (me == otro and m.get("de") == me and m.get("para") == me)]
     return _jd({"entre": sorted([me, otro]), "total": len(par), "mensajes": par[-limite:]})
@@ -860,6 +860,21 @@ def subdomain_rechazar(nombre: str, motivo: str = "") -> str:
     return _jd({"accion": "rechazado", "nombre": nombre})
 
 @mcp.tool()
+def app_dormir(nombre: str) -> str:
+    """Duerme una app: la para sin desinstalarla. Vuelve sola al primer visitante
+    (scale-to-zero). Solo el dueño o la autoridad."""
+    me = ident()
+    nombre = nombre.strip().lower()
+    _, d = _get("app", nombre)
+    if not d or d.get("estado") == "eliminada": return f"ERROR: no existe la app '{nombre}'."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{nombre}' es de '{d.get('dueno')}'."
+    rc, out = _sudo_ctl("stop", nombre)
+    d["ultimo_dormir"] = now(); _put("app", nombre, d)
+    return _jd({"accion": "dormida", "nombre": nombre,
+                "aviso": "despierta sola con la primera visita a su subdominio"})
+
+@mcp.tool()
 def app_eliminar(nombre: str) -> str:
     """Elimina una app dinámica: para el servicio, borra su unidad y su snippet de
     Caddy. Solo el dueño o la autoridad. Los archivos desplegados se conservan."""
@@ -1096,6 +1111,48 @@ async def lifespan(app):
     async with mcp.session_manager.run():
         yield
 
+PAGINA_WAKE = """<!doctype html><meta charset="utf-8"><title>Demo en reposo</title>
+<meta name="robots" content="noindex">
+<style>body{font-family:system-ui,sans-serif;background:#0f0f0f;color:#e6e6e6;display:flex;
+height:100vh;margin:0;align-items:center;justify-content:center;text-align:center}
+.c{max-width:430px}h1{font-size:19px;font-weight:600;margin:0 0 8px}
+p{font-size:14px;color:#9a9a9a;line-height:1.6}b{color:#d50c2d}
+button{font:inherit;font-weight:600;margin-top:14px;padding:9px 20px;border-radius:6px;
+border:1px solid #d50c2d;background:#d50c2d;color:#fff;cursor:pointer}
+#e{font-size:13px;color:#9a9a9a;margin-top:12px}</style>
+<div class="c"><h1><b>%(n)s</b> está en reposo</h1>
+<p>Esta demo se apaga cuando nadie la usa, para no consumir recursos.
+Pulsa para encenderla: tarda unos segundos.</p>
+<button id="b" onclick="ir()">Encender demo</button><div id="e"></div>
+<script>
+async function ir(){
+  document.getElementById("b").disabled=true;
+  document.getElementById("e").textContent="Encendiendo…";
+  try{ await fetch("/wake/%(n)s",{method:"POST"}); }catch(x){}
+  setTimeout(()=>location.reload(), 4000);
+}
+</script></div>"""
+
+async def wake_get(nombre, arrancar=False):
+    """Puerta del scale-to-zero. GET solo muestra la pagina de encendido: los
+    escaneres de internet barren los subdominios sin parar y arrancarian las
+    demos solas. Solo el POST del boton (accion humana) enciende la app."""
+    nombre = (nombre or "").strip().lower()
+    if not NOMBRE_RE.match(nombre):
+        return PlainTextResponse("no", status_code=404)
+    _, d = _get("app", nombre)
+    if not d or d.get("estado") == "eliminada":
+        return PlainTextResponse("no", status_code=404)
+    if arrancar:
+        rc, out = _sudo_ctl("status", nombre)
+        if "ActiveState=active" not in out:
+            _sudo_ctl("start", nombre)
+            d["ultimo_despertar"] = now(); d["despertares"] = d.get("despertares", 0) + 1
+            _put("app", nombre, d)
+        return JSONResponse({"ok": True, "nombre": nombre}, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(PAGINA_WAKE % {"n": nombre}, status_code=503,
+                        headers={"Cache-Control": "no-store", "Retry-After": "10"})
+
 async def panel_get(_):
     """Panel de administracion: pagina estatica same-origin; la identidad la pone
     el token que el usuario introduce (no hay sesion en el servidor)."""
@@ -1129,6 +1186,11 @@ async def app(scope, receive, send):
     path = scope.get("path", "")
     partes = path.split("/")
     # /<token>/mcp | /<token>/deploy/<nombre> | /<token>/app/<nombre>
+    if len(partes) >= 3 and partes[1] == "wake" and scope.get("method") in ("GET", "HEAD", "POST"):
+        if not _rate_ok("__wake__", 60):
+            return await PlainTextResponse("demasiadas peticiones", status_code=429)(scope, receive, send)
+        resp = await wake_get(partes[2], arrancar=(scope["method"] == "POST"))
+        return await resp(scope, receive, send)
     if len(partes) >= 2 and partes[1] == "registro" and scope.get("method") == "POST":
         if not _rate_ok("__registro__", 30):
             return await JSONResponse({"error": "demasiadas solicitudes"}, status_code=429)(scope, receive, send)

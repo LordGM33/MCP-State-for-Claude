@@ -1,22 +1,27 @@
-# Example Caddyfile — shared-state MCP server
-#  1) example.com + www  -> main site (regular certificate)
-#  2) *.example.com      -> everything else, with on-demand TLS:
-#       state.example.com  -> the MCP server (127.0.0.1:8787)
-#       <name>.example.com -> /var/www/sites/<name>/
-# NOTE: do NOT give `state` its own block: a name covered by a present
-# wildcard is left unmanaged by Caddy (no cert, no logs). Keep the apex
-# alone and everything non-apex inside the single on-demand block.
+# ===========================================================================
+# Twincastia — Caddyfile
+#
+#  1) example.com + www  -> sitio principal (certificado normal, ya emitido)
+#  2) *.example.com      -> TODO lo demás, con TLS bajo demanda:
+#       · state.example.com -> MCP de estado compartido (127.0.0.1:8787)
+#       · <nombre>.example.com -> /var/www/sites/<nombre>/
+#
+# NOTA (23-ago): antes `state` tenía su propio bloque. Al coexistir con el
+# wildcard, Caddy lo daba por cubierto por éste (que es on-demand) y nunca pedía
+# su certificado, mientras el wildcard tampoco podía emitirse sin DNS-01.
+# Se resuelve metiendo todo lo no-apex en un único bloque on-demand.
+# ===========================================================================
 
 {
 	email admin@example.com
 
-	# Caddy only requests certificates for hosts the state server approves.
+	# Caddy solo pide certificado para hosts que el servidor de estado autorice.
 	on_demand_tls {
 		ask http://127.0.0.1:8787/tls-check
 	}
 }
 
-# --- 1. Main site ----------------------------------------------------------
+# --- 1. Sitio principal ----------------------------------------------------
 example.com {
 	root * /var/www/principal
 	file_server
@@ -31,28 +36,44 @@ example.com {
 	}
 }
 
-# --- 2. Everything else under the domain -----------------------------------
+# --- 2. Todo lo demás bajo el dominio --------------------------------------
 *.example.com {
 	tls {
 		on_demand
 	}
 
-	# 2-pre. www -> apex. Served through on-demand TLS like any subdomain
-	# (explicitly allowed by /tls-check). Do NOT move it into the apex block.
+	# log de acceso a journald: lo usa eva-app-idle para saber que demos
+	# siguen visitandose. A stdout para no depender de permisos de archivo.
+	log {
+		output stdout
+		format json
+	}
+
+	# 2-pre. www -> apex. Se sirve por on-demand TLS como cualquier subdominio
+	# (listado explícito en /tls-check). NO volver a ponerlo en el bloque del
+	# apex: Caddy deja sin gestionar un nombre individual cubierto por un
+	# wildcard presente, y el handshake muere sin log (visto 23-ago).
+	# Escaneres de internet: barren los subdominios buscando paneles y
+	# mantendrian despiertas las demos dormidas. Se cortan en la puerta.
+	@escaner header_regexp User-Agent (?i)(l9scan|leakix|masscan|zgrab|zmap|censys|shodan|nmap|sqlmap|nuclei|expanse|internet-measurement)
+	handle @escaner {
+		respond 403
+	}
+
 	@www host www.example.com
 	handle @www {
 		redir https://example.com{uri} permanent
 	}
 
-	# 2a-pre. Dynamic apps (reverse proxy), one snippet per app.
+	# 2a-pre. Apps dinamicas (reverse proxy), un snippet por app.
 	import /etc/caddy/apps.d/*.caddy
 
-	# 2a. Shared state (MCP). No valid token in the path -> 404.
+	# 2a. Estado compartido (MCP). Sin token válido en la ruta -> 404.
 	@state host state.example.com
 	handle @state {
 		encode gzip
 		reverse_proxy 127.0.0.1:8787 {
-			# The MCP may stream (SSE): do not buffer or time out.
+			# El MCP usa streaming (SSE): no bufferizar ni cortar por tiempo.
 			flush_interval -1
 			transport http {
 				read_timeout 1h
@@ -61,7 +82,7 @@ example.com {
 		}
 	}
 
-	# 2b. Demo subdomains: served straight from /var/www/sites/<name>/
+	# 2b. Subdominios de demos: se publican solos desde /var/www/sites/<nombre>/
 	@desplegado file {
 		root /var/www/sites/{labels.2}
 		try_files index.html
@@ -72,10 +93,20 @@ example.com {
 		encode gzip
 	}
 
-	# 2c. Reserved but empty, or nonexistent.
+	# 2c. Reservado pero aún sin archivos, o inexistente.
 	handle {
-		respond "Subdomain not deployed yet. Reserve it with subdomain_claim() and upload files to /var/www/sites/<name>/" 404
+		respond "Subdominio no desplegado todavia. Reserva con subdomain_claim() y sube los archivos a /var/www/sites/<nombre>/" 404
 	}
 
 	header -Server
+
+	# Scale-to-zero: si una app esta dormida su proxy da 502; en vez del error
+	# se sirve la pagina de despertar del servidor de estado, que la arranca.
+	handle_errors {
+		@dormida expression {err.status_code} == 502
+		handle @dormida {
+			rewrite * /wake/{labels.2}
+			reverse_proxy 127.0.0.1:8787
+		}
+	}
 }

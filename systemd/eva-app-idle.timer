@@ -1,0 +1,7 @@
+[Unit]
+Description=Check for idle apps every 5 minutes
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target

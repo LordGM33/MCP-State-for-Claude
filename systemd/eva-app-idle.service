@@ -1,0 +1,6 @@
+[Unit]
+Description=Sleep idle dynamic apps (scale-to-zero)
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/evastate.env
+ExecStart=/usr/local/sbin/eva-app-idle

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Duerme las apps dinamicas sin visitas recientes (scale-to-zero). Vuelven solas
+# con la primera peticion, via /wake del servidor de estado.
+# EVA_IDLE_MIN: minutos de inactividad (20 por defecto).
+# EVASTATE_DOMAIN y EVASTATE_APP_PREFIX definen que apps mira.
+IDLE=${EVA_IDLE_MIN:-20}
+DOM=${EVASTATE_DOMAIN:-example.com}
+PREFIJO=${EVASTATE_APP_PREFIX:-eva-app-}
+VENTANA="${IDLE} min ago"
+
+visitada() {   # 0 si el host aparece en el log de acceso dentro de la ventana
+  journalctl -u caddy --since "$VENTANA" --no-pager 2>/dev/null \
+    | grep -qF "\"host\":\"$1\""
+}
+
+for u in $(systemctl list-units --state=running --no-legend "${PREFIJO}*.service" | awk '{print $1}'); do
+  n=${u#$PREFIJO}; n=${n%.service}
+  arranque=$(date -d "$(systemctl show "$u" -p ActiveEnterTimestamp --value)" +%s 2>/dev/null || echo 0)
+  edad=$(( ($(date +%s) - arranque) / 60 ))
+  [ "$edad" -lt "$IDLE" ] && continue          # recien arrancada: dale margen
+  if visitada "$n.$DOM"; then continue; fi
+  systemctl stop "$u" && echo "dormida $n (sin visitas en $IDLE min)"
+done

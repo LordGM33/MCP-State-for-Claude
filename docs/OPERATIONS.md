@@ -18,7 +18,7 @@ wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
     sudo /opt/evastate/venv/bin/pip install "mcp>=2" starlette uvicorn
     # code
     sudo install -m644 server.py /opt/evastate/
-    sudo install -m755 scripts/eva-app-ctl scripts/eva-backup.py /usr/local/sbin/
+    sudo install -m755 scripts/eva-app-ctl scripts/eva-backup.py scripts/eva-app-idle /usr/local/sbin/
     sudo install -m755 scripts/participante.py /opt/evastate/
     sudo install -m644 systemd/* /etc/systemd/system/
     # environment: copy config.example.env to /etc/evastate.env and set
@@ -27,7 +27,7 @@ wildcard `*.your-domain` pointing at the server (tested behind Cloudflare).
     echo "{}" | sudo tee /etc/evastate/participants.json
     # caddy: adapt caddy/Caddyfile.example to your domain
     sudo systemctl daemon-reload
-    sudo systemctl enable --now evastate eva-appd.path eva-backup.timer
+    sudo systemctl enable --now evastate eva-appd.path eva-backup.timer eva-app-idle.timer
     sudo systemctl reload caddy
 
 ## Participant registration (admin only)
@@ -93,6 +93,23 @@ headers and an authenticated call, then removes everything.
    Caddy snippet. Deployed files are left on disk for the admin to remove.
 
 An authority's own `subdomain_claim` is approved on the spot.
+
+### Scale-to-zero (idle demos cost nothing)
+
+Dynamic apps should not burn CPU or RAM while nobody is using them:
+
+- `eva-app-idle.timer` runs every 5 minutes and stops any app whose subdomain
+  has had no request in `EVA_IDLE_MIN` minutes (default 20). It reads Caddy's
+  access log from journald, so enable access logging on the wildcard block
+  (`log { output stdout · format json }`) — the example Caddyfile does.
+- A visitor to a sleeping app hits a 502, which the wildcard's `handle_errors`
+  rewrites to the state server's `/wake/<app>`. That page explains the demo is
+  at rest and offers a button; **only the button's POST starts the app**.
+  A bare GET never starts anything: internet scanners sweep subdomains all day
+  and would keep every demo alive. Known scanner user-agents are answered 403
+  at the edge, before reaching any backend.
+- Owners can sleep an app on demand with `app_dormir(name)`, or from the
+  console. Static sites need none of this: they run no process.
 
 ## Remote registration (invitation flow)
 

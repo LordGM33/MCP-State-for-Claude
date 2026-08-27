@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Root controller for dynamic apps (CLI or spool). Validation here IS the
-security boundary: it does not trust the requester."""
+"""Controlador root de apps dinámicas. Vías: CLI directa (admin) o spool
+(peticiones de evastate). La validación de este archivo ES la frontera de
+seguridad: todo lo que entra se valida aquí, no importa quién lo pida."""
 import glob, json, os, re, subprocess, sys
 
 NOMBRE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 import os as _os
 DOMAIN = _os.environ.get("EVASTATE_DOMAIN", "example.com")
-APPS = "/srv/apps"; UNITDIR = "/etc/systemd/system"; CADDYD = "/etc/caddy/apps.d"
-SPOOL = "/var/lib/evastate/ctl-spool"; OUTD = "/var/lib/evastate/ctl-out"
+PORT_STATE = _os.environ.get("EVASTATE_PORT", "8787")
+APPS = _os.environ.get("EVASTATE_APPS", "/srv/apps"); UNITDIR = "/etc/systemd/system"; CADDYD = "/etc/caddy/apps.d"
+SPOOL = _os.environ.get("EVASTATE_SPOOL", "/var/lib/evastate/ctl-spool")
+OUTD = _os.environ.get("EVASTATE_CTL_OUT", "/var/lib/evastate/ctl-out")
+PREFIJO = _os.environ.get("EVASTATE_APP_PREFIX", "eva-app-")
 
 UNIT = """[Unit]
 Description=Eva app dinamica: {n}
@@ -64,7 +68,7 @@ def leer_cmd(n):
         raise ValueError("cmd invalido: 1 linea, <=300 chars, sin comillas simples")
     return cmd
 
-def unidad(n): return f"eva-app-{n}.service"
+def unidad(n): return f"{PREFIJO}{n}.service"
 
 def install(n, puerto):
     val_nombre(n); puerto = int(puerto)

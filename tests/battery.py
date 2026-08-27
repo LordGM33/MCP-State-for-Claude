@@ -101,13 +101,35 @@ def puerta_A():
                              assert_(h.get("X-Content-Type-Options") == "nosniff", "sin nosniff")))
                  (http("GET", f"{BASE}/panel").headers))
     caso("A", "el JavaScript del panel es sintácticamente válido", _a_panel_js)
-    n_tools = int(os.environ.get("BAT_TOOLS", "41"))
+    caso("A", "/wake responde la página de despertar sin exponer nada", _a_wake)
+    n_tools = int(os.environ.get("BAT_TOOLS", "42"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
 
 def assert_(cond, msg=""):
     assert cond, msg
+
+def _a_wake():
+    """El despertador es publico a proposito: 404 para lo que no existe, y un GET
+    NUNCA debe encender nada (los escaneres barren los subdominios sin parar)."""
+    assert status_de(lambda: http("GET", f"{BASE}/wake/no-existe-{RUN}")) == 404, \
+        "el despertador responde a nombres inexistentes"
+    assert status_de(lambda: http("GET", f"{BASE}/wake/..%2Fetc")) in (404, 400), \
+        "el despertador acepta rutas raras"
+    apps = [a for a in call(T1, "app_list") if a.get("estado") != "eliminada"]
+    if not apps: return
+    n = apps[0]["nombre"]
+    antes = json.dumps(call(T1, "app_status", {"nombre": n}))
+    try: http("GET", f"{BASE}/wake/{n}")
+    except urllib.error.HTTPError as e:
+        assert e.code == 503, f"GET /wake devolvio {e.code}"
+        assert b"Encender demo" in e.read(), "la pagina no ofrece encender a mano"
+    time.sleep(2)
+    despues = json.dumps(call(T1, "app_status", {"nombre": n}))
+    if "inactive" in antes or "dead" in antes:
+        assert "active" not in despues.replace("inactive", ""), \
+            "un simple GET encendio la app: los escaneres la mantendrian viva"
 
 def _a_panel_js():
     """Un error de sintaxis deja el panel mudo: los botones no hacen NADA y la
@@ -488,6 +510,8 @@ def _d_historial():
     assert t1 == t2, "las dos partes ven historiales distintos"
 
 def _d_esperando():
+    # con la base ya grande, esto solo pasa si el overview mira lo RECIENTE:
+    # con ORDER BY id ASC + LIMIT la bandeja se congela en el pasado
     a = "espera d9 " + RUN
     r = call(T1, "msg_send", {"para": "prueba2", "tipo": "solicitud", "asunto": a, "cuerpo": "x"})
     ov = call(T1, "state_overview")
