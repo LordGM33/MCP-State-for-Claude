@@ -463,6 +463,7 @@ def puerta_D():
     caso("D", "cartelera: solo autoridad publica; regla exige confirmación por receptor", _d_cartel_regla)
     caso("D", "cartelera: petición se responde EN PRIVADO a la autoridad, nunca a todos", _d_cartel_peticion)
     caso("D", "msg_historial: mismo historial del par visto desde ambos lados", _d_historial)
+    caso("F", "D10: una aclaracion del propio solicitante NO cierra su solicitud", _f_d10_aclaracion_propia)
     caso("D", "fechas: comprometer, mover con motivo, avanzar y cerrar", _d_fecha_ciclo)
     caso("D", "fechas: el dueño lo sella el servidor y solo el mueve lo suyo", _d_fecha_dueno)
     caso("D", "fechas: choque de recurso avisa pero no bloquea", _d_fecha_choque)
@@ -682,6 +683,23 @@ def _d_esperando():
     ov2 = call(T1, "state_overview")
     assert not any(m.get("ref") == r["ref"] for m in ov2.get("esperando_respuesta", [])), \
         "sigue en esperando_respuesta tras cerrarse"
+
+def _f_d10_aclaracion_propia():
+    """Una aclaracion del PROPIO solicitante no cierra su solicitud: si lo hiciera,
+    el trabajo pendiente desaparece de las listas sin que nadie lo haya atendido.
+    Caso real: SOL-015, reportado por un cowork el 28-ago."""
+    r = call(T1, "msg_send", {"para": ID2, "asunto": f"d10 {RUN}", "cuerpo": "x",
+                              "tipo": "solicitud"})
+    ref = r["ref"]
+    call(T1, "msg_send", {"para": ID2, "asunto": f"d10 aclaracion {RUN}", "cuerpo": "matizo",
+                          "tipo": "respuesta", "responde_a": ref})
+    abiertas = [m.get("ref") for m in call(T1, "state_overview")["esperando_respuesta"]]
+    assert_(ref in abiertas, f"{ref} se cerro con la aclaracion de quien la abrio")
+    # y la respuesta del destinatario SI la cierra
+    call(T2, "msg_send", {"para": ID1, "asunto": f"d10 respuesta {RUN}", "cuerpo": "ahi va",
+                          "tipo": "respuesta", "responde_a": ref})
+    abiertas2 = [m.get("ref") for m in call(T1, "state_overview")["esperando_respuesta"]]
+    assert_(ref not in abiertas2, f"{ref} sigue abierta tras responder el destinatario")
 
 def _d_fecha_ciclo():
     """Comprometer, mover conservando el motivo, avanzar y cerrar."""

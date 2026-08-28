@@ -368,12 +368,15 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
                     con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
                                 (json.dumps(dc, ensure_ascii=False), now(), r["id"]))
     if tipo == "respuesta" and _REF_RE.match(d["responde_a"]):
-        # la solicitud del canal pasa a respondida (el hilo conserva todo);
-        # las refs externas (archivo:...) no cierran nada: son enlace, no estado
+        # La solicitud pasa a respondida SALVO que responda quien la abrio: una
+        # aclaracion propia es parte del hilo, no una respuesta. Cerrarla ahi
+        # esconde trabajo pendiente que nadie ha atendido (D10, visto en SOL-015).
         with db() as con:
             for r in con.execute("SELECT id,data FROM items WHERE kind='msg'").fetchall():
                 dd = json.loads(r["data"])
                 if _norm_ref(dd.get("ref")) == d["responde_a"] and dd.get("tipo") == "solicitud":
+                    if dd.get("de") == me:
+                        continue
                     dd["estado"] = "respondida"
                     con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
                                 (json.dumps(dd, ensure_ascii=False), now(), r["id"]))
