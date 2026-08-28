@@ -156,6 +156,33 @@ If you generate a certificate authority by hand, give it
 Python clients fail to verify while curl still accepts the chain — the failure
 shows up only in the clients that matter.
 
+## Commitments and progress (the lightweight scrum)
+
+Dates live in the channel, not in someone's calendar. `fecha_comprometer` returns
+a stable `FECHA-N`; `fecha_mover` requires a reason and **keeps the history of
+every move**, which is the part that a calendar cannot do — a date that slides
+three times tells you the problem is not the date. `fecha_estado` tracks
+pendiente / en_curso / bloqueada / hecha / cancelada, and "bloqueada" refuses to
+be set without saying what is blocking it: that note is the whole point, because
+it surfaces the problem while there is still time to act.
+
+The owner is sealed by the server from the caller's identity, exactly as with
+messages and ports. Nobody can commit a date in someone else's name.
+
+Two dates that claim the same `recurso` in overlapping days produce a warning,
+not a rejection. Sometimes the overlap is legitimate and the people involved are
+the ones who should decide.
+
+Overdue, blocked and upcoming dates appear on their own in `state_overview` and
+in the handshake instructions, so noticing them does not depend on remembering
+to look.
+
+`scripts/eva-scrum-doc.py` renders the whole thing as plain text for a knowledge
+base or a daily digest; with `--drive` it replaces the contents of a Google Doc
+so a notebook that follows that file stays current on its own. The document is
+created by a person and shared with the service account, so it lives in their
+Drive and not in the service account's quota.
+
 ## Unknown parameters are rejected
 
 An argument that is not in a tool's signature makes the call fail. This is not

@@ -163,7 +163,7 @@ def _next_ref(prefijo="SOL"):
     _put("seq", prefijo, {"n": n})
     return f"{prefijo}-{n:03d}"
 
-_REF_RE = re.compile(r"(?i)^(SOL|TEST|CART)-(\d+)$")
+_REF_RE = re.compile(r"(?i)^(SOL|TEST|CART|FECHA)-(\d+)$")
 def _norm_ref(s):
     """Forma canonica de una ref del canal (SOL-007 == SOL-7). None si no es ref."""
     m = _REF_RE.match((s or "").strip())
@@ -274,9 +274,27 @@ def state_overview() -> str:
                for r in _rows("puerto", 500, order="DESC")
                if r.get("maquina") == maq and r.get("estado") == "ocupado"] if maq else []
     puertos.sort(key=lambda r: int(r["puerto"]))
+    hoy_ = _hoy()
+    f_todas = [r for r in _rows("fecha", 500, order="DESC") if r.get("estado") not in FINALES]
+    def _resumen(r):
+        return {"ref": r.get("_key"), "que": r.get("que"), "cuando": r["cuando"],
+                "en_dias": _dias(hoy_, r["cuando"]), "estado": r.get("estado"),
+                "dueno": r.get("dueno")}
+    mis_fechas = sorted([_resumen(r) for r in f_todas if r.get("dueno") == me],
+                        key=lambda x: x["cuando"])
+    mis_prox = [f for f in mis_fechas if f["en_dias"] <= 14]
+    del_resto = sorted([_resumen(r) for r in f_todas if r.get("dueno") != me
+                        and 0 <= _dias(hoy_, r["cuando"]) <= 7], key=lambda x: x["cuando"])
+    vencidas = [f for f in mis_fechas if f["en_dias"] < 0]
+    bloqueadas = [f for f in mis_fechas if f["estado"] == "bloqueada"]
+
     return _jd({
         "yo": me,
         "mi_estacion": maq or "(sin asignar)",
+        **({"FECHAS_MIAS_VENCIDAS": vencidas} if vencidas else {}),
+        **({"mis_fechas_bloqueadas": bloqueadas} if bloqueadas else {}),
+        **({"mis_fechas_14_dias": mis_prox} if mis_prox else {}),
+        **({"del_resto_esta_semana": del_resto} if del_resto else {}),
         "puertos_de_mi_estacion": puertos,
         **({"por_aprobar": por_aprobar} if por_aprobar else {}),
         "cartelera_pendiente": cart_pend,
@@ -538,6 +556,250 @@ def msg_historial(con_quien: str, limite: int = 200) -> str:
     par = [m for m in rows if {m.get("de"), m.get("para")} == {me, otro}
            or (me == otro and m.get("de") == me and m.get("para") == me)]
     return _jd({"entre": sorted([me, otro]), "total": len(par), "mensajes": par[-limite:]})
+
+# ───────────── FECHAS Y AVANCE (el scrum vive aqui) ─────────────
+ESTADOS = ("pendiente", "en_curso", "bloqueada", "hecha", "cancelada")
+FINALES = ("hecha", "cancelada")
+
+
+def _fecha_ok(s):
+    """Acepta 2026-09-01 y tambien 2026-09. Devuelve (iso, es_mes) o (None, None)."""
+    s = (s or "").strip()
+    try:
+        if len(s) == 7:
+            datetime.datetime.strptime(s, "%Y-%m")
+            return s + "-01", True
+        datetime.datetime.strptime(s[:10], "%Y-%m-%d")
+        return s[:10], False
+    except ValueError:
+        return None, None
+
+
+def _dias(a, b):
+    da = datetime.date.fromisoformat(a)
+    db_ = datetime.date.fromisoformat(b)
+    return (db_ - da).days
+
+
+def _hoy():
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _choques(rango, recurso, excluir=None):
+    """Fechas comprometidas del mismo recurso cuyo trabajo se solapa. Avisa, no
+    bloquea: a veces el solape es legitimo y quien decide es la persona."""
+    if not recurso:
+        return []
+    d1, d2 = rango
+    fuera = []
+    for r in _rows("fecha", 500, order="DESC"):
+        if r.get("_key") == excluir or r.get("estado") in FINALES:
+            continue
+        if (r.get("recurso") or "").strip().lower() != recurso:
+            continue
+        if r.get("tipo") != "comprometida":
+            continue
+        o1 = r.get("desde") or r.get("cuando")
+        o2 = r.get("cuando")
+        if _solapa(_dias("2000-01-01", d1), _dias("2000-01-01", d2),
+                   _dias("2000-01-01", o1), _dias("2000-01-01", o2)):
+            fuera.append({"ref": r.get("_key"), "de": r.get("dueno"),
+                          "que": r.get("que"), "cuando": o2})
+    return fuera
+
+
+@mcp.tool()
+def fecha_comprometer(que: str, cuando: str, tipo: str = "comprometida",
+                      desde: str = "", recurso: str = "", depende_de: str = "",
+                      notas: str = "") -> str:
+    """Registra una fecha que te comprometes a cumplir. Devuelve FECHA-N.
+    `cuando`: 2026-09-15, o 2026-09 si solo sabes el mes. `tipo`: comprometida o
+    aproximada. `desde`: cuando empiezas, si ocupa varios dias. `recurso`: lo que
+    necesitas y otros podrian necesitar a la vez (GPU-3090, sala-de-grabacion, servidor-de-render...).
+    El dueño lo pone el servidor desde tu identidad."""
+    me = ident()
+    que = que.strip()
+    if not que:
+        return "ERROR: di en una linea que te comprometes a hacer."
+    tipo = (tipo or "comprometida").strip().lower()
+    if tipo not in ("comprometida", "aproximada"):
+        return "ERROR: tipo debe ser 'comprometida' o 'aproximada'."
+    iso, es_mes = _fecha_ok(cuando)
+    if not iso:
+        return "ERROR: `cuando` debe ser 2026-09-15 o 2026-09 (solo el mes)."
+    ini = iso
+    if desde:
+        ini, _ = _fecha_ok(desde)
+        if not ini:
+            return "ERROR: `desde` debe ser 2026-09-15 o 2026-09."
+        if ini > iso:
+            return "ERROR: `desde` es posterior a `cuando`."
+    dep = (depende_de or "").strip()
+    if dep:
+        nd = _norm_ref(dep) or dep
+        if nd.startswith("FECHA-") and not _get("fecha", nd)[1]:
+            return f"ERROR: {nd} no existe. Consulta fecha_list()."
+        dep = nd
+    rec = (recurso or "").strip().lower()
+    ref = _next_ref("FECHA")
+    d = {"que": que, "cuando": iso, "solo_mes": es_mes, "desde": ini if ini != iso else "",
+         "tipo": tipo, "recurso": rec, "depende_de": dep, "notas": notas.strip(),
+         "dueno": me, "estado": "pendiente", "historial": []}
+    _put("fecha", ref, d)
+    ch = _choques((ini, iso), rec, excluir=ref)
+    out = {"ref": ref, "que": que, "cuando": iso, "tipo": tipo, "estado": "pendiente"}
+    if ch:
+        out["AVISO_CHOQUE"] = (f"otros usan '{rec}' en esas fechas; no lo bloqueo, "
+                               "pero hablalo antes")
+        out["choca_con"] = ch
+    return _jd(out)
+
+
+@mcp.tool()
+def fecha_mover(ref: str, nueva_fecha: str, motivo: str) -> str:
+    """Cambia la fecha CONSERVANDO el historial de movimientos: sin esto, una
+    fecha que se corre varias veces borra su propio rastro y nadie sabe cuanto
+    se movio ni por que. El motivo es obligatorio, y no es para justificarse:
+    es lo que permite ver patrones."""
+    me = ident()
+    nref = _norm_ref(ref) or (ref or "").strip().upper()
+    _, d = _get("fecha", nref)
+    if not d:
+        return f"ERROR: {nref} no existe. Consulta fecha_list()."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: {nref} es de '{d.get('dueno')}'. Solo su dueño (o la autoridad) la mueve."
+    if d.get("estado") in FINALES:
+        return f"ERROR: {nref} ya esta {d.get('estado')}; no se mueve."
+    if not (motivo or "").strip():
+        return "ERROR: di por que se mueve. Es el dato que hace util el historial."
+    iso, es_mes = _fecha_ok(nueva_fecha)
+    if not iso:
+        return "ERROR: la fecha debe ser 2026-09-15 o 2026-09."
+    anterior = d["cuando"]
+    if iso == anterior:
+        return f"ERROR: {nref} ya estaba en {iso}."
+    d.setdefault("historial", []).append(
+        {"de": anterior, "a": iso, "motivo": motivo.strip(), "quien": me, "cuando": _hoy()})
+    d["cuando"] = iso
+    d["solo_mes"] = es_mes
+    if d.get("desde") and d["desde"] > iso:
+        d["desde"] = ""
+    _put("fecha", nref, d)
+    ch = _choques((d.get("desde") or iso, iso), d.get("recurso"), excluir=nref)
+    out = {"ref": nref, "antes": anterior, "ahora": iso,
+           "veces_movida": len(d["historial"]), "que": d.get("que")}
+    if len(d["historial"]) >= 3:
+        out["nota"] = f"esta fecha se ha movido {len(d['historial'])} veces; quiza el problema no es la fecha"
+    if ch:
+        out["AVISO_CHOQUE"] = f"otros usan '{d.get('recurso')}' en la fecha nueva"
+        out["choca_con"] = ch
+    return _jd(out)
+
+
+@mcp.tool()
+def fecha_estado(ref: str, estado: str, nota: str = "") -> str:
+    """Avance de una fecha tuya: pendiente, en_curso, bloqueada, hecha o
+    cancelada. 'bloqueada' es la mas util de todas: dice que no avanza y por que,
+    antes de que llegue el dia."""
+    me = ident()
+    nref = _norm_ref(ref) or (ref or "").strip().upper()
+    _, d = _get("fecha", nref)
+    if not d:
+        return f"ERROR: {nref} no existe. Consulta fecha_list()."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: {nref} es de '{d.get('dueno')}'."
+    e = (estado or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if e not in ESTADOS:
+        return f"ERROR: estado debe ser uno de {', '.join(ESTADOS)}."
+    if e == "bloqueada" and not (nota or "").strip():
+        return "ERROR: si esta bloqueada, di que la bloquea: es el dato que permite ayudarte."
+    antes = d.get("estado")
+    d["estado"] = e
+    d.setdefault("avance", []).append(
+        {"estado": e, "nota": nota.strip(), "quien": me, "cuando": _hoy()})
+    if e in FINALES:
+        d["cerrada_el"] = _hoy()
+    _put("fecha", nref, d)
+    out = {"ref": nref, "antes": antes, "ahora": e, "que": d.get("que")}
+    if e in FINALES:
+        colgadas = [r.get("_key") for r in _rows("fecha", 500)
+                    if r.get("depende_de") == nref and r.get("estado") not in FINALES]
+        if colgadas:
+            out["dependian_de_esta"] = colgadas
+    return _jd(out)
+
+
+@mcp.tool()
+def fecha_list(de: str = "", horizonte_dias: int = 0, incluir_cerradas: bool = False) -> str:
+    """Fechas del proyecto. `de` filtra por dueño, `horizonte_dias` deja solo las
+    que vencen en ese plazo. Por defecto no muestra las cerradas."""
+    quien = (de or "").strip().lower()
+    if quien and quien not in PARTICIPANTES:
+        return f"ERROR: '{quien}' no es un participante. Ver participantes()."
+    hoy = _hoy()
+    out = []
+    for r in _rows("fecha", 500, order="DESC"):
+        if not incluir_cerradas and r.get("estado") in FINALES:
+            continue
+        if quien and r.get("dueno") != quien:
+            continue
+        dias = _dias(hoy, r["cuando"])
+        if horizonte_dias and dias > int(horizonte_dias):
+            continue
+        out.append({"ref": r.get("_key"), "que": r.get("que"), "cuando": r["cuando"],
+                    "en_dias": dias, "tipo": r.get("tipo"), "estado": r.get("estado"),
+                    "dueno": r.get("dueno"),
+                    **({"recurso": r["recurso"]} if r.get("recurso") else {}),
+                    **({"depende_de": r["depende_de"]} if r.get("depende_de") else {}),
+                    **({"movida_veces": len(r["historial"])} if r.get("historial") else {})})
+    out.sort(key=lambda x: x["cuando"])
+    vencidas = [x for x in out if x["en_dias"] < 0 and x["estado"] not in FINALES]
+    return _jd({"total": len(out), **({"VENCIDAS": vencidas} if vencidas else {}), "fechas": out})
+
+
+@mcp.tool()
+def fecha_quien(recurso: str = "", cuando: str = "") -> str:
+    """Quien tiene comprometido un recurso, o que hay comprometido para una fecha.
+    Preguntalo ANTES de comprometer algo que necesite la misma maquina."""
+    rec = (recurso or "").strip().lower()
+    if not rec and not cuando:
+        return "ERROR: di un recurso (GPU-3090) o una fecha (2026-09-15)."
+    iso = None
+    if cuando:
+        iso, _ = _fecha_ok(cuando)
+        if not iso:
+            return "ERROR: la fecha debe ser 2026-09-15 o 2026-09."
+    out = []
+    for r in _rows("fecha", 500, order="DESC"):
+        if r.get("estado") in FINALES:
+            continue
+        if rec and (r.get("recurso") or "").lower() != rec:
+            continue
+        if iso:
+            ini = r.get("desde") or r["cuando"]
+            if not (ini <= iso <= r["cuando"]):
+                continue
+        out.append({"ref": r.get("_key"), "dueno": r.get("dueno"), "que": r.get("que"),
+                    "cuando": r["cuando"], "estado": r.get("estado"),
+                    **({"desde": r["desde"]} if r.get("desde") else {}),
+                    **({"recurso": r["recurso"]} if r.get("recurso") else {})})
+    out.sort(key=lambda x: x["cuando"])
+    return _jd({"encontrado": bool(out), "criterio": {"recurso": rec or None, "cuando": iso},
+                "total": len(out), "fechas": out})
+
+
+@mcp.tool()
+def fecha_hilo(ref: str) -> str:
+    """Todo lo que le ha pasado a una fecha: movimientos con su motivo y avance."""
+    nref = _norm_ref(ref) or (ref or "").strip().upper()
+    _, d = _get("fecha", nref)
+    if not d:
+        return f"ERROR: {nref} no existe."
+    return _jd({"ref": nref, "que": d.get("que"), "dueno": d.get("dueno"),
+                "cuando": d.get("cuando"), "tipo": d.get("tipo"), "estado": d.get("estado"),
+                "recurso": d.get("recurso") or None, "depende_de": d.get("depende_de") or None,
+                "notas": d.get("notas") or None,
+                "movimientos": d.get("historial", []), "avance": d.get("avance", [])})
 
 # ───────────── ALTAS REMOTAS (invitación + aprobación de la autoridad) ─────────────
 
@@ -1391,6 +1653,25 @@ def _saludo(pid):
     if avisos:
         lineas.append(f"AVISOS AL CANAL SIN ATENDER: {len(avisos)} — " +
                       "; ".join(f"{m['de']}: {m['asunto'][:50]}" for m in avisos[:3]))
+    try:
+        hoy_ = _hoy()
+        fs = [r for r in _rows("fecha", 500, order="DESC")
+              if r.get("dueno") == pid and r.get("estado") not in FINALES]
+        vencidas = [r for r in fs if _dias(hoy_, r["cuando"]) < 0]
+        pronto = [r for r in fs if 0 <= _dias(hoy_, r["cuando"]) <= 3]
+        blq = [r for r in fs if r.get("estado") == "bloqueada"]
+        if vencidas:
+            lineas.insert(0, "FECHAS TUYAS YA VENCIDAS: " + ", ".join(
+                f"{r['_key']} {r['que'][:40]} (era {r['cuando']})" for r in vencidas[:4]) +
+                " — muevelas con fecha_mover o cierralas con fecha_estado")
+        if pronto:
+            lineas.append("VENCEN EN 3 DIAS O MENOS: " + ", ".join(
+                f"{r['_key']} {r['que'][:40]} ({r['cuando']})" for r in pronto[:4]))
+        if blq:
+            lineas.append("TUYAS BLOQUEADAS: " + ", ".join(
+                f"{r['_key']} {r['que'][:40]}" for r in blq[:3]))
+    except Exception:
+        pass
     abiertas = [m for m in msgs if m.get("de") == pid and m.get("tipo") == "solicitud"
                 and m.get("estado") == "abierta"]
     if abiertas:

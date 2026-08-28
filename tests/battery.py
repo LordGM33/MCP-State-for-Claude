@@ -143,7 +143,7 @@ def puerta_A():
         caso("A", "modo autonomo: no se puede salir del directorio del sitio", _a_sitios_fuga)
     else:
         salto("A", "sitios servidos por el propio canal", "sin BAT_SITIO (instalacion con proxy delante)")
-    n_tools = int(os.environ.get("BAT_TOOLS", "47"))
+    n_tools = int(os.environ.get("BAT_TOOLS", "53"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
@@ -463,6 +463,11 @@ def puerta_D():
     caso("D", "cartelera: solo autoridad publica; regla exige confirmación por receptor", _d_cartel_regla)
     caso("D", "cartelera: petición se responde EN PRIVADO a la autoridad, nunca a todos", _d_cartel_peticion)
     caso("D", "msg_historial: mismo historial del par visto desde ambos lados", _d_historial)
+    caso("D", "fechas: comprometer, mover con motivo, avanzar y cerrar", _d_fecha_ciclo)
+    caso("D", "fechas: el dueño lo sella el servidor y solo el mueve lo suyo", _d_fecha_dueno)
+    caso("D", "fechas: choque de recurso avisa pero no bloquea", _d_fecha_choque)
+    caso("D", "fechas: mover exige motivo y bloquear exige causa", _d_fecha_exige_motivo)
+    caso("D", "fechas: una vencida aparece sola en el overview", _d_fecha_en_overview)
     caso("D", "overview: esperando_respuesta lista mis solicitudes abiertas (D9)", _d_esperando)
 
 def _d_ciclo_msg():
@@ -677,6 +682,70 @@ def _d_esperando():
     ov2 = call(T1, "state_overview")
     assert not any(m.get("ref") == r["ref"] for m in ov2.get("esperando_respuesta", [])), \
         "sigue en esperando_respuesta tras cerrarse"
+
+def _d_fecha_ciclo():
+    """Comprometer, mover conservando el motivo, avanzar y cerrar."""
+    r = call(T1, "fecha_comprometer", {"que": f"entrega {RUN}", "cuando": "2026-11-20"})
+    ref = r["ref"]
+    assert_(r["estado"] == "pendiente", f"nace en {r['estado']}")
+    m = call(T1, "fecha_mover", {"ref": ref, "nueva_fecha": "2026-11-27", "motivo": "prueba"})
+    assert_(m["antes"] == "2026-11-20" and m["ahora"] == "2026-11-27", m)
+    h = call(T1, "fecha_hilo", {"ref": ref})
+    assert_(len(h["movimientos"]) == 1 and h["movimientos"][0]["motivo"] == "prueba",
+            f"el historial no guardo el motivo: {h['movimientos']}")
+    call(T1, "fecha_estado", {"ref": ref, "estado": "en_curso"})
+    call(T1, "fecha_estado", {"ref": ref, "estado": "hecha", "nota": "listo"})
+    l = call(T1, "fecha_list", {})
+    assert_(not [f for f in l["fechas"] if f["ref"] == ref], "una fecha hecha sigue en la lista abierta")
+
+def _d_fecha_dueno():
+    """El dueño lo sella el servidor y solo el mueve lo suyo."""
+    r = call(T1, "fecha_comprometer", {"que": f"mia {RUN}", "cuando": "2026-11-21"})
+    ref = r["ref"]
+    l = call(T1, "fecha_list", {})
+    mia = [f for f in l["fechas"] if f["ref"] == ref][0]
+    assert_(mia["dueno"] == ID1, f"firmada como {mia['dueno']}")
+    try:
+        call(T2, "fecha_mover", {"ref": ref, "nueva_fecha": "2026-12-01", "motivo": "ajena"})
+    except Rechazo:
+        return
+    raise AssertionError("otro cowork pudo mover una fecha que no es suya")
+
+def _d_fecha_choque():
+    """Dos fechas comprometidas del mismo recurso avisan, pero NO se bloquean:
+    a veces el solape es legitimo y decide la persona."""
+    rec = f"gpu-prueba-{RUN}"
+    call(T1, "fecha_comprometer", {"que": f"a {RUN}", "cuando": "2026-12-10", "recurso": rec})
+    r2 = call(T2, "fecha_comprometer", {"que": f"b {RUN}", "cuando": "2026-12-10", "recurso": rec})
+    assert_("AVISO_CHOQUE" in r2, f"no aviso del choque: {r2}")
+    assert_(r2.get("ref"), "el choque bloqueo la reserva; solo debia avisar")
+    r3 = call(T1, "fecha_comprometer", {"que": f"c {RUN}", "cuando": "2026-12-10",
+                                        "recurso": f"otro-{RUN}"})
+    assert_("AVISO_CHOQUE" not in r3, "aviso de choque con un recurso distinto")
+
+def _d_fecha_exige_motivo():
+    """Sin motivo no se mueve, y una bloqueada tiene que decir que la bloquea."""
+    r = call(T1, "fecha_comprometer", {"que": f"motivos {RUN}", "cuando": "2026-12-15"})
+    ref = r["ref"]
+    for args, que in (({"ref": ref, "nueva_fecha": "2026-12-20", "motivo": ""}, "fecha_mover"),):
+        try:
+            call(T1, que, args); raise AssertionError(f"{que} acepto motivo vacio")
+        except Rechazo:
+            pass
+    try:
+        call(T1, "fecha_estado", {"ref": ref, "estado": "bloqueada"})
+        raise AssertionError("acepto bloquear sin decir por que")
+    except Rechazo:
+        pass
+    call(T1, "fecha_estado", {"ref": ref, "estado": "bloqueada", "nota": "falta algo"})
+
+def _d_fecha_en_overview():
+    """Una fecha vencida tiene que aparecer sola, sin que nadie la busque."""
+    r = call(T1, "fecha_comprometer", {"que": f"vencida {RUN}", "cuando": "2020-01-15"})
+    o = call(T1, "state_overview")
+    v = o.get("FECHAS_MIAS_VENCIDAS", [])
+    assert_(any(x["ref"] == r["ref"] for x in v), f"la vencida no salio en el overview: {v}")
+    call(T1, "fecha_estado", {"ref": r["ref"], "estado": "cancelada", "nota": "limpieza"})
 
 # ---------- PUERTA E · PERSISTENCIA/RESPALDO ----------
 def puerta_E(con_restart):
