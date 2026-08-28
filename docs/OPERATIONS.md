@@ -31,6 +31,23 @@ filter and the edge rate limit do not exist there, the only brake is the
 server's own per-identity limit, and the whole thing rests on the local
 network being trusted.
 
+## Optional modules
+
+Anything that reaches outside the channel — a third-party service, the network,
+another machine — lives in `modulos/` and is opt-in. Each one ships a `MODULO.md`
+that states what it requires, what it can reach once installed, **what it cannot
+do**, and how to remove it. Their installers print that list and refuse to
+continue without an explicit confirmation, because a module that asks for a
+credential should make you look at what you are handing over.
+
+| Module | Reaches | Needs a credential |
+|---|---|---|
+| `scrum-drive` | one Google Doc | yes — a service account key |
+| `vigia-red` | nothing outside the host | no |
+
+No module ever becomes a dependency: uninstall it and the channel behaves
+exactly as before.
+
 ## Requirements
 
 Python ≥ 3.12 with venv. On Linux, systemd for the service and the root helper.
@@ -177,27 +194,10 @@ Overdue, blocked and upcoming dates appear on their own in `state_overview` and
 in the handshake instructions, so noticing them does not depend on remembering
 to look.
 
-`scripts/eva-scrum-doc.py` renders the whole thing as plain text for a knowledge
-base or a daily digest; with `--drive` it replaces the contents of a Google Doc
-so a notebook that follows that file stays current on its own. The document is
-created by a person and shared with the service account, so it lives in their
-Drive and not in the service account's quota.
-
-Three things cost time when wiring that up, in case they save you some:
-
-- **`drive.file` is not enough.** That scope only reaches files the application
-  itself created; a document shared *with* the service account answers 404, not
-  403, which reads like the file does not exist. Use the full `drive` scope — on
-  a service account that means its own (empty) Drive plus whatever is shared
-  with it, not access to anyone else's.
-- **A read still needs write permission on the database directory**, because
-  SQLite in WAL mode maintains its side files even for `SELECT`. Grant the unit
-  `ReadWritePaths` for that directory and set `PRAGMA query_only=ON` so the
-  process cannot alter data anyway.
-- Organisations created recently may enforce Google's secure-by-default policy
-  set, which blocks service account key creation. There are **two** constraints
-  for it, the classic and the managed one, and changes take a few minutes to
-  propagate.
+Publishing this outwards — to a Google Doc that a notebook follows, so people
+without channel access can read it — is an **optional module**, not part of the
+channel: see `modulos/scrum-drive/`. It states every permission it needs before
+it installs anything, and removing it leaves the channel untouched.
 
 ## Unknown parameters are rejected
 

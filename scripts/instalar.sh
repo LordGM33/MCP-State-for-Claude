@@ -231,6 +231,23 @@ verde "Servicio activo."
 # ---------------------------------------------------------------- done
 echo
 verde "Instalado en modo $modo."
+
+# ---------------------------------------------------------------- modules
+if [ -d "$REPO/modulos" ]; then
+  echo
+  echo "MODULOS OPCIONALES (el canal funciona sin ninguno):"
+  for m in "$REPO"/modulos/*/; do
+    n=$(basename "$m")
+    [ -f "$m/MODULO.md" ] || continue
+    # la primera linea de prosa del MODULO.md resume que hace
+    d=$(sed -n '3,6p' "$m/MODULO.md" | tr '\n' ' ' | cut -c1-90)
+    printf '  %-14s %s...\n' "$n" "$d"
+  done
+  echo
+  echo "Cada uno declara lo que exige antes de instalarse, en su MODULO.md."
+  echo "Instalar uno:  bash modulos/<nombre>/instalar.sh"
+fi
+
 echo
 echo "Siguiente paso: registrar la primera identidad, que sera la autoridad."
 echo

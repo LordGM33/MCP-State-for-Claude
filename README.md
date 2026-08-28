@@ -96,6 +96,10 @@ Then register the first identity and flag it as authority:
 Manual installation, the platform matrix (Linux / macOS / Windows) and running
 without any reverse proxy are covered in `docs/OPERATIONS.md`.
 
+**Optional modules** live in `modulos/` and are opt-in: publishing the register
+to a Google Doc, watching network traffic. Each declares the permissions it
+requires before installing, and the channel works without any of them.
+
 Design rationale: `docs/ARCHITECTURE.md`
 · known limits: `docs/SCOPE-AND-LIMITS.md`.
 
