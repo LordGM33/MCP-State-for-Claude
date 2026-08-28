@@ -183,6 +183,27 @@ def es_autoridad(pid):
 
 init_db()
 
+def _rechazar_parametros_desconocidos():
+    """Sin esto el SDK IGNORA en silencio un argumento que no existe: quien llama
+    cree que filtro y recibe todo. Paso de verdad (28-ago): un cowork leyo con un
+    filtro inexistente, no filtro nada, y reporto que otro no habia respondido.
+    Devuelve el nombre del modulo parcheado, o "" si el SDK cambio de sitio."""
+    for mod in ("mcp.server.mcpserver.utilities.func_metadata",
+                "mcp.server.fastmcp.utilities.func_metadata"):
+        try:
+            m = __import__(mod, fromlist=["ArgModelBase"])
+            m.ArgModelBase.model_config["extra"] = "forbid"
+            return mod
+        except Exception:
+            continue
+    return ""
+
+# Debe correr ANTES de registrar las tools: los modelos heredan la config al crearse.
+SDK_ESTRICTO = _rechazar_parametros_desconocidos()
+if not SDK_ESTRICTO:
+    print("AVISO: no pude exigir parametros estrictos; el SDK cambio de estructura",
+          file=sys.stderr)
+
 mcp = MCPServer(SERVER_NAME)
 
 # ───────────── IDENTIDAD ─────────────
@@ -192,6 +213,33 @@ def whoami() -> str:
     pid = ident()
     p = {k: v for k, v in PARTICIPANTES[pid].items() if k not in ("token", "token_sha256")}
     return _jd({"id": pid, **p})
+
+@mcp.tool()
+def parametros(herramienta: str = "") -> str:
+    """Los parametros que acepta cada herramienta, leidos del propio servidor.
+    Sin argumento los lista todos. Lo que no este aqui se RECHAZA: el canal ya no
+    ignora en silencio un parametro que no existe."""
+    import asyncio
+    try:
+        tools = asyncio.run(mcp.list_tools())
+    except RuntimeError:
+        return "ERROR: no pude leer el catalogo en este momento."
+    out = {}
+    for t in tools:
+        # el SDK lo expone como input_schema; por el cable viaja como inputSchema
+        esq = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}
+        props = esq.get("properties", {}) or {}
+        req = set(esq.get("required", []) or [])
+        out[t.name] = {
+            "obligatorios": {k: v.get("type", "?") for k, v in props.items() if k in req},
+            "opcionales": {k: v.get("type", "?") for k, v in props.items() if k not in req},
+        }
+    if herramienta:
+        h = herramienta.strip()
+        if h not in out:
+            return f"ERROR: no existe la herramienta '{h}'. Llama a parametros() sin argumento para verlas."
+        return _jd({h: out[h]})
+    return _jd({"total": len(out), "nota": "un parametro que no figure aqui se rechaza", "herramientas": out})
 
 @mcp.tool()
 def participantes() -> str:
@@ -1311,6 +1359,68 @@ base = Starlette(routes=_rutas, lifespan=lifespan)
 # Sin el puerto explicito, una instalacion que no escuche en 443 no responde.
 _EXTRA_HOSTS = [h.strip() for h in os.environ.get("EVASTATE_EXTRA_HOSTS", "").split(",") if h.strip()]
 _HOSTS = [PUBLIC_HOST, f"{PUBLIC_HOST}:443", "127.0.0.1:*", "localhost:*"] + _EXTRA_HOSTS
+
+def _saludo(pid):
+    """Lo que el canal tiene que decirle a ESTA identidad nada mas conectarse.
+    Va en las instructions del handshake: el cliente lo ve antes de preguntar
+    nada, sin depender de que se acuerde de llamar a state_overview."""
+    if not pid or pid not in PARTICIPANTES:
+        return None
+    lineas = []
+    msgs = _rows("msg", 500, order="DESC")
+    privados = [m for m in msgs if m.get("para") == pid and m.get("de") != pid
+                and m.get("estado") not in ("atendido", "respondida", "descartada")]
+    avisos = [m for m in msgs if m.get("para") == "todos" and m.get("de") != pid
+              and m.get("estado") not in ("atendido", "respondida", "descartada")]
+    carteles = [c for c in _rows("cartel", 300, order="DESC")
+                if c.get("estado") == "activo" and pid in c.get("dirigido_a", [])
+                and pid not in c.get("confirmaciones", {})
+                and c.get("requiere") in ("confirmacion", "respuesta")]
+    if carteles:
+        reglas = [c for c in carteles if c["tipo"] == "regla"]
+        peticiones = [c for c in carteles if c["tipo"] != "regla"]
+        if reglas:
+            lineas.append("REGLAS SIN CONFIRMAR (cartel_confirmar): " +
+                          ", ".join(f"{c['ref']} {c['asunto']}" for c in reglas[:5]))
+        if peticiones:
+            lineas.append("PETICIONES DE LA AUTORIDAD SIN RESPONDER (en privado a quien la emitio): " +
+                          ", ".join(f"{c['ref']} {c['asunto']}" for c in peticiones[:5]))
+    if privados:
+        lineas.append(f"MENSAJES PRIVADOS PARA TI: {len(privados)} — " +
+                      "; ".join(f"{m['de']}: {m['asunto'][:60]}" for m in privados[:4]))
+    if avisos:
+        lineas.append(f"AVISOS AL CANAL SIN ATENDER: {len(avisos)} — " +
+                      "; ".join(f"{m['de']}: {m['asunto'][:50]}" for m in avisos[:3]))
+    abiertas = [m for m in msgs if m.get("de") == pid and m.get("tipo") == "solicitud"
+                and m.get("estado") == "abierta"]
+    if abiertas:
+        lineas.append(f"TUS SOLICITUDES ABIERTAS: " + ", ".join(m.get("ref", "?") for m in abiertas[:6]))
+    if not lineas:
+        return f"Canal state. Identidad: {pid}. No tienes nada pendiente."
+    return (f"Canal state. Identidad: {pid}. Atiende esto antes de trabajar:\n- " +
+            "\n- ".join(lineas) +
+            "\n\nDetalle con state_overview(). El servidor sella tu identidad: "
+            "no existe ningun parametro para decir quien eres.")
+
+def _instrucciones_dinamicas():
+    """El SDK guarda instructions como atributo fijo al construir el servidor.
+    Aqui se convierte en algo que se calcula por identidad en cada handshake."""
+    try:
+        low = mcp._lowlevel_server
+        cls = type(low)
+        base = getattr(low, "instructions", None)
+        def _get(self):
+            try:
+                return _saludo(CURRENT.get(None)) or base
+            except Exception:
+                return base
+        cls.instructions = property(_get, lambda self, v: None)
+        return True
+    except Exception as e:
+        print(f"AVISO: instrucciones dinamicas no disponibles: {e}", file=sys.stderr)
+        return False
+
+SALUDO_DINAMICO = _instrucciones_dinamicas()
 
 mcp_asgi = mcp.streamable_http_app(
     stateless_http=True,

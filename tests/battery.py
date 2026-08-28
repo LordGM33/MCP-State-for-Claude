@@ -137,12 +137,13 @@ def puerta_A():
         R["fallo"] += 1; FALLOS.append(f"A · el JavaScript del panel es sintácticamente válido: {e}")
         print(f"  [FALLO] A · el JavaScript del panel es sintácticamente válido: {e}")
     caso("A", "/wake responde la página de despertar sin exponer nada", _a_wake)
+    caso("A", "el handshake saluda con lo pendiente de esa identidad", _a_saludo_al_conectar)
     if SITIO_PRUEBA:
         caso("A", "modo autonomo: el sitio se sirve en /s/<nombre>/", _a_sitios_ruta)
         caso("A", "modo autonomo: no se puede salir del directorio del sitio", _a_sitios_fuga)
     else:
         salto("A", "sitios servidos por el propio canal", "sin BAT_SITIO (instalacion con proxy delante)")
-    n_tools = int(os.environ.get("BAT_TOOLS", "46"))
+    n_tools = int(os.environ.get("BAT_TOOLS", "47"))
     caso("A", f"tools/list expone las {n_tools} herramientas",
          lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
                          f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
@@ -217,6 +218,9 @@ def puerta_B():
                  (espera_404(lambda: rpc("token-falso-123", "tools/list"))))
     caso("B", "método JSON-RPC inexistente → error controlado, no 500",
          lambda: assert_("error" in rpc(T1, "metodo/inexistente"), "no devolvió error JSON-RPC"))
+    caso("B", "un parametro que no existe se RECHAZA, no se ignora", _b_extra_rechazado)
+    caso("B", "el catalogo declara additionalProperties:false", _b_esquema_declara_estricto)
+    caso("B", "parametros() publica lo que acepta cada herramienta", _b_parametros_se_publican)
     caso("B", "cuerpo no-JSON → rechazo controlado",
          lambda: assert_(status_de(lambda: http("POST", f"{BASE}/{T1}/mcp", b"esto no es json",
                 hdrs={"Content-Type":"application/json","Accept":"application/json"})) in (400, 406, 422),
@@ -227,6 +231,49 @@ def puerta_B():
         caso("B", "User-Agent de librería → 403 del CDN (OP-085 sigue vigente)",
              lambda: assert_(status_de(lambda: rpc(T1, "tools/list", ua="Python-urllib/3.10")) == 403,
                     "el CDN dejó pasar el UA de urllib"))
+
+def _b_extra_rechazado():
+    """Un parametro que no existe debe RECHAZARSE. Si se ignora, quien llama cree
+    que filtro y recibe todo: paso el 28-ago y rompio una comunicacion real.
+    Depende de que el SDK herede extra=forbid; si cambia de estructura, este caso
+    es el que avisa."""
+    try:
+        call(T1, "whoami", {"parametro_que_no_existe": "x"})
+    except Rechazo as e:
+        assert_("extra" in str(e).lower() or "no permit" in str(e).lower()
+                or "not permitted" in str(e).lower(), f"rechazado, pero por otro motivo: {e}")
+        return
+    raise AssertionError("ACEPTO un parametro inexistente: el filtro silencioso volvio")
+
+def _b_esquema_declara_estricto():
+    """El catalogo debe decir additionalProperties:false, para que el cliente lo
+    sepa antes de equivocarse."""
+    r = rpc(T1, "tools/list")
+    tools = r.get("result", {}).get("tools", [])
+    assert_(tools, "tools/list vacio")
+    laxas = [t["name"] for t in tools
+             if (t.get("inputSchema") or {}).get("additionalProperties") is not False]
+    assert_(not laxas, f"herramientas sin additionalProperties:false: {laxas[:5]}")
+
+def _b_parametros_se_publican():
+    p = call(T1, "parametros", {"herramienta": "msg_desde"})
+    assert_(isinstance(p, dict) and "msg_desde" in p, f"respuesta inesperada: {str(p)[:120]}")
+    assert_("fecha_iso" in p["msg_desde"]["obligatorios"], f"no declara fecha_iso: {p}")
+    todos = call(T1, "parametros")
+    assert_(todos.get("total", 0) >= 40, f"catalogo corto: {todos.get('total')}")
+
+def _a_saludo_al_conectar():
+    """El handshake debe traer lo pendiente de ESA identidad, sin que el cliente
+    tenga que acordarse de preguntar."""
+    r = rpc(T1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "bateria", "version": "1"}})
+    ins = r.get("result", {}).get("instructions") or ""
+    assert_("state" in ins.lower(), f"sin instrucciones en el handshake: {ins[:120]}")
+    assert_(ID1 in ins, f"el saludo no nombra la identidad {ID1}: {ins[:160]}")
+    r2 = rpc(T2, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": {"name": "bateria", "version": "1"}})
+    ins2 = r2.get("result", {}).get("instructions") or ""
+    assert_(ID2 in ins2 and ins2 != ins, "el saludo no distingue identidades")
 
 # ---------- PUERTA C · IDENTIDAD/SEGURIDAD ----------
 def puerta_C():

@@ -156,6 +156,31 @@ If you generate a certificate authority by hand, give it
 Python clients fail to verify while curl still accepts the chain — the failure
 shows up only in the clients that matter.
 
+## Unknown parameters are rejected
+
+An argument that is not in a tool's signature makes the call fail. This is not
+strictness for its own sake: the SDK's default is to ignore extras silently, so
+a caller passing a filter that does not exist gets everything back and believes
+it filtered. That happened here — a participant read with a non-existent
+`de=` filter, saw the whole channel, missed a reply buried in it, and reported
+that a colleague had not answered when they had.
+
+It is enforced by giving the argument model `extra="forbid"` **before any tool
+is registered**, since the per-tool models inherit the config when they are
+created. The catalogue then advertises `additionalProperties: false`, so a
+client can know before it makes the mistake. If a future SDK release moves that
+model, the server prints a warning at startup and a battery case fails.
+
+`parametros()` lists what every tool accepts, generated from the running server
+so it cannot drift from reality.
+
+## The handshake tells each identity what is waiting
+
+`initialize` returns `instructions` computed per identity: unconfirmed rules,
+unanswered authority requests, private messages, unattended notices and the
+caller's own open requests. Reading state should not depend on the client
+remembering to ask for it.
+
 ## Subdomains and deployments (authority-gated)
 
 1. A participant calls `subdomain_claim("name")` → state `solicitado`.
