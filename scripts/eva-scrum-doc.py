@@ -10,6 +10,9 @@ FINALES = ("hecha", "cancelada")
 def filas(kind):
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
+    # El servicio necesita escritura en el directorio porque la base esta en
+    # modo WAL, pero no tiene por que poder modificar datos: query_only lo impide.
+    con.execute("PRAGMA query_only=ON")
     try:
         out = []
         for r in con.execute("SELECT key, data, updated FROM items WHERE kind=?", (kind,)):
@@ -165,8 +168,12 @@ def subir(contenido):
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaInMemoryUpload
+    # drive.file solo alcanza lo que la propia app creo: un documento compartido
+    # con la cuenta de servicio le responde 404. Hace falta el scope completo,
+    # que en una cuenta de servicio significa su Drive (vacio) mas lo que le
+    # compartan: no da acceso al Drive de nadie.
     creds = service_account.Credentials.from_service_account_file(
-        cred, scopes=["https://www.googleapis.com/auth/drive.file"])
+        cred, scopes=["https://www.googleapis.com/auth/drive"])
     api = build("drive", "v3", credentials=creds, cache_discovery=False)
     api.files().update(
         fileId=doc,

@@ -183,6 +183,22 @@ so a notebook that follows that file stays current on its own. The document is
 created by a person and shared with the service account, so it lives in their
 Drive and not in the service account's quota.
 
+Three things cost time when wiring that up, in case they save you some:
+
+- **`drive.file` is not enough.** That scope only reaches files the application
+  itself created; a document shared *with* the service account answers 404, not
+  403, which reads like the file does not exist. Use the full `drive` scope — on
+  a service account that means its own (empty) Drive plus whatever is shared
+  with it, not access to anyone else's.
+- **A read still needs write permission on the database directory**, because
+  SQLite in WAL mode maintains its side files even for `SELECT`. Grant the unit
+  `ReadWritePaths` for that directory and set `PRAGMA query_only=ON` so the
+  process cannot alter data anyway.
+- Organisations created recently may enforce Google's secure-by-default policy
+  set, which blocks service account key creation. There are **two** constraints
+  for it, the classic and the managed one, and changes take a few minutes to
+  propagate.
+
 ## Unknown parameters are rejected
 
 An argument that is not in a tool's signature makes the call fail. This is not
