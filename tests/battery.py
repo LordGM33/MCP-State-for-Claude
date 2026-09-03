@@ -244,6 +244,7 @@ def puerta_B():
     caso("B", "el catalogo declara additionalProperties:false", _b_esquema_declara_estricto)
     caso("B", "un rechazo llega con isError=True, no solo con el texto", _b_rechazo_va_marcado)
     caso("B", "una llamada valida NO llega marcada como error", _b_lo_correcto_no_va_marcado)
+    caso("B", "una entrada ilegible se rechaza, no se devuelve vacia", _b_lo_ilegible_se_rechaza_no_se_vacia)
     caso("B", "parametros() publica lo que acepta cada herramienta", _b_parametros_se_publican)
     caso("B", "cuerpo no-JSON → rechazo controlado",
          lambda: assert_(status_de(lambda: http("POST", f"{BASE}/{T1}/mcp", b"esto no es json",
@@ -288,6 +289,27 @@ def _b_lo_correcto_no_va_marcado():
         r = rpc(T1, "tools/call", {"name": nombre, "arguments": {}})
         res = r.get("result", {})
         assert not res.get("isError"), f"{nombre} es valida y llega con isError=True"
+
+def _b_lo_ilegible_se_rechaza_no_se_vacia():
+    """Devolver vacio ante una entrada ilegible es la forma mas cara de mentir:
+    quien pregunta 'que ha pasado desde el lunes' con la fecha mal escrita recibe
+    silencio y se lo cree. Encontrado el 3-sep barriendo las validaciones, en la
+    MISMA funcion (msg_desde) donde produccion habia reportado el 28-ago un filtro
+    que no filtraba. La forma cambia, la familia no."""
+    for tool, args in (("msg_desde", {"fecha_iso": "no-es-fecha"}),
+                       ("msg_desde", {"fecha_iso": "2026-13-45"}),
+                       ("search", {"texto": "   "}),
+                       ("decision_log", {"titulo": "x", "decision": "y", "motivo": "z",
+                                         "supersede": 999999})):
+        r = rpc(T1, "tools/call", {"name": tool, "arguments": args})
+        res = r.get("result", {})
+        txt = "\n".join(c.get("text", "") for c in res.get("content", []))
+        assert res.get("isError"), f"{tool}({args}) NO se rechaza; devuelve: {txt[:90]}"
+
+    # Y lo que no existe se dice, no se insinua con una lista vacia.
+    h = call(T1, "msg_hilo", {"ref": "SOL-999999"})
+    assert isinstance(h, dict) and h.get("encontrado") is False, \
+        f"una ref inexistente se ve igual que un hilo vacio: {str(h)[:90]}"
 
 def _b_extra_rechazado():
     """Un parametro que no existe debe RECHAZARSE. Si se ignora, quien llama cree
@@ -609,6 +631,7 @@ def puerta_D():
         caso("D", "puertos: cada estación solo ve la suya y el mismo número convive", _d_puertos_aislados)
     else:
         salto("D", "aislamiento entre estaciones", "sin BAT_TOKEN_OTRA_ESTACION")
+    caso("D", "recursos: avisan del exceso con nombres y cifras, y no bloquean", _d_recursos_avisan_sin_bloquear)
     caso("D", "cartelera: solo autoridad publica; regla exige confirmación por receptor", _d_cartel_regla)
     caso("D", "cartelera: petición se responde EN PRIVADO a la autoridad, nunca a todos", _d_cartel_peticion)
     caso("D", "msg_historial: mismo historial del par visto desde ambos lados", _d_historial)
@@ -739,6 +762,65 @@ def _d_cartelera_respeta_quien_no_confirma():
             for x in exentos:
                 assert x not in (e.get("pendientes") or []), \
                     f"{x} esta exento y sigue como pendiente en {c['ref']}"
+
+def _d_recursos_avisan_sin_bloquear():
+    """El registro de puertos resolvia el conflicto equivocado: en PC1 los puertos
+    ya no chocan y la VRAM si. Hallazgo de voicetf en SOL-021, dicho antes por
+    produccion: 'el problema es la descarga, no el puerto'.
+
+    Se comprueba lo que de verdad protege: que declarar sea de la autoridad, que
+    tomar de mas AVISE con nombres y cifras pero DEJE PASAR (el canal informa, no
+    manda), y que la sobrecarga se lea como sobrecarga y no como un numero mas."""
+    rid = "gpu-bat-" + RUN[-6:]
+    try:
+        call(T2, "recurso_declarar", {"id": rid, "capacidad": 1000})
+        raise AssertionError("un participante sin autoridad ha declarado un recurso")
+    except Rechazo as e:
+        assert "autoridad" in str(e), f"rechazo por otro motivo: {e}"
+    r = call(T1, "recurso_declarar", {"id": rid, "capacidad": 1000, "unidad": "MB"})
+    assert r.get("recurso") == rid, r
+
+    try:
+        call(T1, "recurso_tomar", {"recurso": rid + "-noexiste", "cuanto": 1, "para": "x"})
+        raise AssertionError("deja tomar un recurso no declarado")
+    except Rechazo:
+        pass
+
+    a = call(T2, "recurso_tomar", {"recurso": rid, "cuanto": 600, "para": "lo de prueba2"})
+    assert a.get("tomas_tuyas") == 600, a
+    b = call(T1, "recurso_tomar", {"recurso": rid, "cuanto": 700, "para": "lo mio", "minutos": 10})
+    assert "AVISO" in b, f"pide mas de lo que queda y NO avisa: {b}"
+    assert any(q["dueno"] == ID2 for q in b.get("quien_mas", [])), \
+        f"avisa pero no dice con quien hablarlo: {b}"
+    assert b.get("accion") in ("creado", "actualizado"), f"bloqueo en vez de avisar: {b}"
+
+    est = call(T1, "recurso_estado", {"recurso": rid})
+    f = est["recursos"][0]
+    assert f["declarado"] == 1300 and f["libre_segun_lo_declarado"] == -300, f
+    assert "SOBREPASADO" in f, f"el exceso se lee como un numero mas: {f}"
+    assert "SIN_MEDIR" in f, f"nadie ha medido y no se avisa de que todo es declarado: {f}"
+
+    # Lo declarado y lo medido tienen que poder contradecirse A LA VISTA. Sin esto,
+    # el registro se separa de la realidad igual que la convencion que sustituye:
+    # voicetf lo demostro sobre si mismo publicando durante dias una cifra que era
+    # el tamano del fichero del modelo y no lo que ocupaba en la tarjeta.
+    # Medir POR DEBAJO de lo reservado es normal: se reserva por pico y casi nunca
+    # se esta en el pico. Marcarlo seria un rojo permanente, y un rojo siempre
+    # encendido no informa.
+    call(T1, "recurso_medir", {"recurso": rid, "usado": 100, "fuente": "bateria"})
+    f3 = call(T1, "recurso_estado", {"recurso": rid})["recursos"][0]
+    assert f3.get("medido") == 100, f3
+    assert "SIN_MEDIR" not in f3, f3
+    assert "MAS_USO_DEL_CONTABILIZADO" not in f3, f"usar menos de lo reservado no es un problema: {f3}"
+    # Lo que SI importa: que se use mas de lo que nadie ha anotado.
+    call(T1, "recurso_medir", {"recurso": rid, "usado": 9000, "fuente": "bateria"})
+    f4 = call(T1, "recurso_estado", {"recurso": rid})["recursos"][0]
+    assert "MAS_USO_DEL_CONTABILIZADO" in f4, f"hay 9000 en uso y 1300 contabilizados: {f4}"
+
+    call(T2, "recurso_soltar", {"recurso": rid})
+    f2 = call(T1, "recurso_estado", {"recurso": rid})["recursos"][0]
+    assert f2["declarado"] == 700 and "SOBREPASADO" not in f2, f2
+    call(T1, "recurso_soltar", {"recurso": rid})
 
 def _d_refs():
     r1 = call(T1, "msg_send", {"para": ID2, "asunto": "sol auto",

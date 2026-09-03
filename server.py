@@ -374,6 +374,278 @@ def _marcar_errores_como_errores():
 SDK_MARCA_ERRORES = _marcar_errores_como_errores()
 
 
+# ───────────── RECURSOS COMPARTIDOS (la tarjeta, no el puerto) ─────────────
+# El registro de puertos resolvia el conflicto equivocado. Produccion lo dijo en
+# SOL-021 y nadie lo recogio: "compartir instancia no sirve: el problema es la
+# descarga, no el puerto". En PC1 conviven tres puertos de produccion y un modelo
+# de 10,5 GB de voicetf: los puertos ya no chocan y la VRAM si, sin que nada avise.
+#
+# Tres decisiones que conviene entender antes de tocar esto:
+#  · AVISA, NO BLOQUEA. El canal no puede impedir que alguien use la tarjeta.
+#    Fingir que si lo impide ensena a no consultarlo, que es peor que no tenerlo.
+#  · LA MAQUINA LA SELLA EL SERVIDOR, igual que en los puertos.
+#  · EL FALLO REAL ES OLVIDARSE DE SOLTAR, no tomar de mas. Por eso la reserva
+#    declara cuanto va a durar y el estado ensena "tomado hace 6h, previsto 30min".
+#    No se caduca sola: matar por reloj un lote legitimo que se alargo seria el
+#    mismo error de fondo — decidir por alguien con menos informacion que el.
+
+def _n(v, campo):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{campo} debe ser un numero entero")
+    if n < 0:
+        raise ValueError(f"{campo} no puede ser negativo")
+    return n
+
+
+@mcp.tool()
+def recurso_medir(recurso: str, usado: int, fuente: str = "") -> str:
+    """Reporta una lectura REAL de cuanto se esta usando de un recurso de tu
+    estacion (por ejemplo, la salida de nvidia-smi).
+
+    Existe por la critica de voicetf al diseno, que es la buena: un registro de
+    DECLARACIONES se separa de la realidad igual que la convencion de mensajes que
+    sustituye. Cambia la sintaxis, no la naturaleza. El lo demostro sobre si mismo:
+    llevaba dias publicando '10,5 GB' —que era el tamano del fichero del modelo, no
+    lo que ocupa en la tarjeta— y 'solo mientras genera', cuando en realidad no
+    suelta la memoria hasta apagar el servidor. Nadie mintio: nadie midio.
+
+    El canal no lee ninguna maquina; reporta cada estacion la suya. Lo unico que
+    hace el canal es poner DECLARADO y MEDIDO uno al lado del otro, porque la
+    divergencia entre los dos es la senal que hoy no existe."""
+    me = ident(); maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    rid = recurso.strip().lower()
+    if not _recurso_de(maq, rid):
+        return f"ERROR: en {maq} no hay declarado ningun recurso '{rid}'."
+    try:
+        u = _n(usado, "usado")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    _put("medicion", f"{maq}:{rid}", {"maquina": maq, "recurso": rid, "usado": u,
+                                      "medido_por": me, "cuando": now(),
+                                      "fuente": fuente.strip() or "(sin indicar)"})
+    return _jd({"accion": "medido", "recurso": rid, "maquina": maq, "usado": u})
+
+@mcp.tool()
+def recurso_declarar(id: str, capacidad: int, unidad: str = "MB", base: int = 0,
+                     notas: str = "") -> str:
+    """(SOLO autoridad) Declara que existe un recurso compartido en TU estacion.
+
+    `capacidad` es la cifra FISICA, tal y como la da el hardware.
+    `base` es lo que consume siempre algo que no pasa por este registro — el
+    escritorio de Windows se come ~1.540 MiB de la 4060 Ti pase lo que pase.
+
+    Las dos por separado y no una capacidad ya restada, porque si no se comparan
+    peras con manzanas: la lectura de nvidia-smi es absoluta e incluye esa base,
+    asi que restarla de la capacidad hacia saltar una divergencia falsa con la
+    tarjeta en reposo. Y un rojo falso ensena a ignorar los rojos."""
+    me = ident()
+    if not es_autoridad(me):
+        return "ERROR: declarar recursos es de la autoridad."
+    maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    rid = id.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,31}", rid):
+        return "ERROR: id invalido (minusculas, 2-32, letras/numeros/.-_). Ej: gpu-3090"
+    try:
+        cap = _n(capacidad, "capacidad")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if cap <= 0:
+        return "ERROR: la capacidad tiene que ser mayor que cero."
+    try:
+        base_n = _n(base, "base")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if base_n >= cap:
+        return f"ERROR: la base ({base_n}) no puede ser mayor o igual que la capacidad ({cap})."
+    res = _put("recurso", f"{maq}:{rid}", {"maquina": maq, "recurso": rid,
+               "capacidad": cap, "base": base_n, "unidad": unidad.strip() or "MB",
+               "notas": notas.strip(), "declarado_por": me})
+    return _jd({**res, "maquina": maq, "recurso": rid, "capacidad": cap,
+                "base_fuera_del_registro": base_n, "repartible": cap - base_n})
+
+
+def _recurso_de(maq, rid):
+    _, r = _get("recurso", f"{maq}:{rid}")
+    return r
+
+
+def _tomas_vivas(maq, rid):
+    return [t for t in _rows("toma", 500, order="DESC")
+            if t.get("maquina") == maq and t.get("recurso") == rid
+            and t.get("estado") == "tomado"]
+
+
+@mcp.tool()
+def recurso_tomar(recurso: str, cuanto: int, para: str, minutos: int = 0,
+                  en_reposo: int = 0) -> str:
+    """Anota que estas usando parte de un recurso compartido de tu estacion.
+
+    `cuanto` es tu PICO PREVISTO, no lo que ocupas en reposo. Lo pidio asi voicetf
+    con la medicion delante: su cerebro ocupa 9.736 MiB cargado y pica a 12.494 al
+    generar. Si declarase el reposo, quien tomara los 14.800 restantes se quedaria
+    sin memoria a mitad de su trabajo Y EL REGISTRO LE HABRIA DICHO QUE CABIA.
+    Reservar por el pico desperdicia un poco de tarjeta; reservar por el reposo
+    hace fallar a otro. `en_reposo` es opcional y solo informa.
+
+    `para` evita que alguien mate tu proceso creyendo que sobra. `minutos` es lo
+    que ESPERAS tardar: no caduca nada. Pedir de mas se avisa con nombres y cifras
+    y se registra igual — el canal informa, no manda."""
+    me = ident(); maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    rid = recurso.strip().lower()
+    r = _recurso_de(maq, rid)
+    if not r:
+        hay = sorted(x["recurso"] for x in _rows("recurso", 200) if x.get("maquina") == maq)
+        return (f"ERROR: en {maq} no hay declarado ningun recurso '{rid}'."
+                + (f" Declarados: {', '.join(hay)}." if hay else
+                   " No hay ninguno; pide a la autoridad que lo declare."))
+    if not para.strip():
+        return "ERROR: di para que lo usas; es lo que evita que alguien lo mate creyendo que sobra."
+    try:
+        cuanto_n = _n(cuanto, "cuanto")
+        mins = _n(minutos, "minutos")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if cuanto_n <= 0:
+        return "ERROR: 'cuanto' tiene que ser mayor que cero."
+
+    vivas = [t for t in _tomas_vivas(maq, rid) if t.get("dueno") != me]
+    usado = sum(int(t.get("cuanto", 0)) for t in vivas)
+    repartible = int(r["capacidad"]) - int(r.get("base", 0))
+    libre = repartible - usado
+    try:
+        reposo_n = _n(en_reposo, "en_reposo")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    d = {"maquina": maq, "recurso": rid, "dueno": me, "cuanto": cuanto_n,
+         "en_reposo": reposo_n, "para": para.strip(), "minutos_previstos": mins,
+         "estado": "tomado", "desde": now()}
+    res = _put("toma", f"{maq}:{rid}:{me}", d)
+    salida = {**res, "recurso": rid, "maquina": maq, "tomas_tuyas": cuanto_n,
+              "capacidad": r["capacidad"], "base_fuera_del_registro": r.get("base", 0),
+              "repartible": repartible, "unidad": r.get("unidad", "MB"),
+              "usado_por_otros": usado, "libre_antes_de_ti": libre,
+              "quien_mas": [{"dueno": t["dueno"], "cuanto": t["cuanto"], "para": t.get("para")}
+                            for t in vivas]}
+    if cuanto_n > libre:
+        salida["AVISO"] = (f"pides {cuanto_n} y solo quedaban {libre} de los {repartible} "
+                           f"{r.get('unidad','MB')} repartibles. Queda registrado igual, "
+                           "pero hablalo con quien lo tiene antes de arrancar: el canal avisa, "
+                           "no impide.")
+    return _jd(salida)
+
+
+@mcp.tool()
+def recurso_soltar(recurso: str) -> str:
+    """Suelta lo que tenias tomado de un recurso de tu estacion."""
+    me = ident(); maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    rid = recurso.strip().lower()
+    i, d = _get("toma", f"{maq}:{rid}:{me}")
+    if not d or d.get("estado") != "tomado":
+        return f"ERROR: no tienes nada tomado de '{rid}' en {maq}."
+    d["estado"] = "libre"; d["soltado"] = now()
+    _put("toma", f"{maq}:{rid}:{me}", d)
+    return _jd({"accion": "soltado", "recurso": rid, "maquina": maq,
+                "tenias": d.get("cuanto")})
+
+
+@mcp.tool()
+def recurso_estado(recurso: str = "") -> str:
+    """Quien tiene que, cuanto queda, y desde cuando. Sin `recurso`, todos los de
+    tu estacion. Las reservas que pasan de lo previsto salen marcadas: casi siempre
+    es alguien que se olvido de soltar, y verlo es lo unico que lo arregla."""
+    maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    pedidos = [recurso.strip().lower()] if recurso.strip() else \
+              sorted(x["recurso"] for x in _rows("recurso", 200) if x.get("maquina") == maq)
+    if not pedidos:
+        return _jd({"maquina": maq, "recursos": [],
+                    "nota": "no hay ningun recurso declarado en esta estacion"})
+    ahora = datetime.datetime.now(datetime.timezone.utc)
+    salida = []
+    for rid in pedidos:
+        r = _recurso_de(maq, rid)
+        if not r:
+            salida.append({"recurso": rid, "error": "no declarado en esta estacion"}); continue
+        tomas = []
+        usado = 0
+        for t in _tomas_vivas(maq, rid):
+            usado += int(t.get("cuanto", 0))
+            fila = {"dueno": t["dueno"], "cuanto": t["cuanto"], "para": t.get("para"),
+                    "desde": t.get("desde")}
+            try:
+                mins = int((ahora - datetime.datetime.fromisoformat(t["desde"])).total_seconds() // 60)
+                fila["lleva_minutos"] = mins
+                prev = int(t.get("minutos_previstos") or 0)
+                if prev and mins > prev * 2:
+                    fila["SE_PASO"] = (
+                        f"lleva {mins} min y preveia {prev}. Puede ser un lote que se alargo, "
+                        "alguien que se olvido de soltarlo, o un proceso que retiene la memoria "
+                        "POR DISENO hasta que se apaga (el cerebro local de voicetf es asi). "
+                        "Preguntale; no des por libre la maquina.")
+            except Exception:
+                pass
+            tomas.append(fila)
+        base = int(r.get("base", 0))
+        repartible = int(r["capacidad"]) - base
+        libre = repartible - usado
+        fila = {"recurso": rid, "capacidad": r["capacidad"],
+                "base_fuera_del_registro": base, "repartible": repartible,
+                "unidad": r.get("unidad", "MB"), "declarado": usado,
+                "libre_segun_lo_declarado": libre, "notas": r.get("notas", ""),
+                "tomado_por": tomas}
+        _, med = _get("medicion", f"{maq}:{rid}")
+        if med:
+            fila["medido"] = med.get("usado")
+            fila["medido_cuando"] = med.get("cuando")
+            fila["medido_por"] = med.get("medido_por")
+            try:
+                edad = int((ahora - datetime.datetime.fromisoformat(med["cuando"])).total_seconds() // 60)
+                fila["medido_hace_minutos"] = edad
+                if edad > 120:
+                    fila["MEDICION_VIEJA"] = (f"la ultima lectura real es de hace {edad} min: "
+                                              "compara con cuidado o vuelve a medir.")
+                # Solo importa que lo medido SUPERE lo contabilizado. Medir por debajo
+                # es lo normal y esperado: las reservas se declaran por PICO y casi
+                # nunca se esta en el pico. Marcar eso como divergencia seria un rojo
+                # permanente, y un rojo que siempre esta encendido no informa de nada.
+                elif int(med.get("usado", 0)) > (usado + base) + max(512, (usado + base) * 0.15):
+                    exceso = int(med["usado"]) - (usado + base)
+                    fila["MAS_USO_DEL_CONTABILIZADO"] = (
+                        f"se estan usando {med['usado']} y solo hay {usado + base} contabilizados "
+                        f"({usado} reservados + {base} de base): sobran {exceso} sin dueno. "
+                        "O alguien esta usando la tarjeta sin anotarlo, o la base real es mayor "
+                        "que la declarada. Lo segundo se arregla ajustando la base; lo primero "
+                        "no se arregla solo.")
+            except Exception:
+                pass
+        else:
+            fila["medido"] = None
+            fila["SIN_MEDIR"] = ("nadie ha reportado una lectura real de este recurso. Todo lo "
+                                 "de arriba es lo que la gente CREE que ocupa, y eso se separa "
+                                 "de la realidad sin que nadie lo note (recurso_medir).")
+        # Un 'libre' negativo es EL dato que importa y pasaba como un numero mas.
+        # Que el estado grave se lea igual que el normal es el fallo que llevamos
+        # toda la semana cerrando; aqui lo cometi yo en la propia herramienta que
+        # existe para hacerlo visible.
+        if libre < 0:
+            fila["SOBREPASADO"] = (
+                f"hay {-libre} {r.get('unidad','MB')} comprometidos DE MAS sobre una capacidad de "
+                f"{r['capacidad']}. Si todos usan a la vez lo que han anotado, alguien se va a "
+                "quedar sin memoria a media faena. Hablalo antes de arrancar.")
+        salida.append(fila)
+    return _jd({"maquina": maq, "recursos": salida})
+
 # ───────────── ROTACION DE TOKENS (nadie se queda fuera) ─────────────
 def _confirmo_esta_rotacion(pid):
     """Confirmar UNA vez no vale para siempre. La confirmacion lleva el identificador
@@ -646,14 +918,29 @@ def msg_inbox(incluir_atendidos: bool = False) -> str:
 
 @mcp.tool()
 def msg_desde(fecha_iso: str) -> str:
-    """Todo lo escrito desde una fecha (ISO: 2026-08-23 o 2026-08-23T15:00:00+00:00)."""
+    """Todo lo escrito desde una fecha (ISO: 2026-08-23 o 2026-08-23T15:00:00+00:00).
+
+    Una fecha ilegible se RECHAZA. Antes devolvia la lista vacia, y vacio se lee
+    como "no ha pasado nada": quien preguntaba que habia desde el lunes con la
+    fecha mal escrita recibia silencio y se lo creia. Es el mismo defecto que
+    produccion reporto sobre esta herramienta el 28-ago —un filtro que no filtra—
+    en otra forma, y en la misma funcion."""
     # SIN TOPE, y no es descuido. Con ORDER BY id ASC + LIMIT N, pasado el mensaje N
     # esto devuelve los N mas VIEJOS y descarta callado los recientes: justo lo que se
     # pide aqui. Detectado al cruzar el sandbox los 1000 mensajes (31-ago). Un recorte
     # silencioso en una herramienta de lectura es peor que un error: quien pregunta
     # "que ha pasado desde el lunes" se lleva un "nada" que se cree.
+    f = (fecha_iso or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ].*)?", f):
+        return (f"ERROR: '{fecha_iso}' no es una fecha ISO. Usa 2026-08-23 o "
+                "2026-08-23T15:00:00+00:00. Se rechaza en vez de devolver una lista "
+                "vacia, porque vacio se lee como 'no ha pasado nada'.")
+    try:
+        datetime.date.fromisoformat(f[:10])
+    except ValueError:
+        return f"ERROR: '{fecha_iso[:10]}' no es una fecha valida del calendario."
     rows = _rows("msg", None, order="ASC")
-    return _jd([m for m in rows if m["_creado"] >= fecha_iso])
+    return _jd([m for m in rows if m["_creado"] >= f])
 
 @mcp.tool()
 def msg_hilo(ref: str) -> str:
@@ -662,8 +949,18 @@ def msg_hilo(ref: str) -> str:
     # Sin tope: un hilo incompleto no avisa de que le faltan piezas (ver msg_desde).
     rows = _rows("msg", None, order="ASC")
     def _eq(v): return bool(v) and (_norm_ref(v) or v.strip()) == nref
-    return _jd(_entregar(ident(), [m for m in rows
-                if _eq(m.get("ref")) or _eq(m.get("responde_a"))]))
+    hilo = _entregar(ident(), [m for m in rows
+                               if _eq(m.get("ref")) or _eq(m.get("responde_a"))])
+    if not hilo:
+        # Una lista vacia no distingue "esa ref no existe" de "hilo sin mensajes",
+        # y las dos se leen igual: como si no hubiera nada que ver. Sus vecinos ya
+        # lo hacen explicito (puerto_quien dice encontrado:false, fact_get lo dice
+        # con palabras); esta se habia quedado atras.
+        return _jd({"ref": nref, "encontrado": False, "mensajes": [],
+                    "nota": ("no hay ningun mensaje con esa referencia. Comprueba el numero "
+                             "con search() o msg_inbox(): una ref mal escrita y un hilo vacio "
+                             "se ven igual desde fuera, y no son lo mismo.")})
+    return _jd(hilo)
 
 @mcp.tool()
 def msg_ack(id: int, nota: str = "") -> str:
@@ -1653,6 +1950,17 @@ def puerto_liberar(puerto: int) -> str:
 @mcp.tool()
 def decision_log(titulo: str, decision: str, motivo: str, proyecto: str = "", supersede: int = 0) -> str:
     """Registra una decisión duradera (append-only; para cambiarla, nueva con `supersede`)."""
+    if supersede:
+        # Antes se aceptaba cualquier numero: una decision podia declarar que
+        # supera a otra que no existe, y nadie se enteraba. Una referencia rota
+        # que se guarda callada es peor que un rechazo.
+        _i, _d = None, None
+        with db() as con:
+            _r = con.execute("SELECT data FROM items WHERE id=? AND kind='decision'",
+                             (int(supersede),)).fetchone()
+        if not _r:
+            return (f"ERROR: no existe la decision {supersede}, asi que no se puede superar. "
+                    "Mira decision_list() para el numero correcto.")
     d = {"de": ident(), "titulo": titulo, "decision": decision, "motivo": motivo, "proyecto": proyecto}
     if supersede: d["supersede"] = supersede
     return _jd(_append("decision", d))
@@ -1704,6 +2012,9 @@ def infra_list() -> str:
 @mcp.tool()
 def search(texto: str, limite: int = 30) -> str:
     """Busca texto libre en todo el estado compartido."""
+    if not texto.strip():
+        return ("ERROR: search sin texto devolveria el canal entero, que casi nunca es lo "
+                "que se quiere y oculta que la busqueda estaba vacia. Di que buscas.")
     q = f"%{texto.lower()}%"
     with db() as con:
         cur = con.execute("SELECT id,kind,key,data,updated FROM items WHERE lower(data) LIKE ? "

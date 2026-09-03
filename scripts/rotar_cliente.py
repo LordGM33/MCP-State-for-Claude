@@ -88,9 +88,18 @@ def main():
         sys.exit(f"No existe el fichero {ruta}. Compruébalo antes de rotar.")
 
     print()
-    codigo = getpass.getpass("Pega el código de rotación (no se verá): ").strip()
+    codigo = getpass.getpass(
+        "Pega el CODIGO de rotacion de 24 caracteres (no tu frase; no se vera): ").strip()
     if not codigo:
         sys.exit("No escribiste nada.")
+    # El error simetrico: pegar la frase donde va el codigo. Da 403 "codigo no
+    # valido", que manda a mirar el codigo en vez de lo que se esta pegando.
+    if " " in codigo or len(codigo) != 24:
+        sys.exit(f"Eso no tiene forma de codigo de rotacion ({len(codigo)} caracteres"
+                 + (", con espacios" if " " in codigo else "") + ").\n"
+                 "Un codigo son 24 caracteres sin espacios. Si has pegado tu frase de\n"
+                 "seguridad, no es aqui: este guion canjea un codigo, no autoriza nada.\n"
+                 "No he mandado nada al canal.")
 
     # ── el cliente genera SU token; el servidor nunca lo emite ────────────────
     nuevo = secrets.token_urlsafe(36)
