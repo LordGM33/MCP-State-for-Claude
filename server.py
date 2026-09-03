@@ -2,7 +2,7 @@
 """Shared-state MCP server: identity-sealed messaging, facts, decisions,
 subdomain/app deployment. All config via EVASTATE_* env vars."""
 import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, hashlib, secrets
-import time
+import time, logging, functools, inspect
 from collections import deque
 
 from mcp.server import MCPServer
@@ -51,22 +51,30 @@ def _sha(t):
     return hashlib.sha256(t.encode()).hexdigest()
 
 def cargar_participantes():
+    """El token ANTERIOR sigue abriendo la puerta mientras dure una rotacion.
+    Sin esto, rotar deja al participante incomunicado en el instante exacto en que
+    mas necesita el canal: para avisar de que no puede entrar. Se le deja entrar,
+    se le marca, y se le grita en el saludo — pero no se le echa."""
     with open(PARTICIPANTS_PATH) as f:
         data = json.load(f)
-    idx = {}
+    idx, viejos = {}, set()
     for pid, p in data.items():
         if not p.get("activo", True): continue
         h = p.get("token_sha256")
         if not h and p.get("token") and len(p["token"]) >= 24:
             h = _sha(p["token"])
         if h: idx[h] = pid
-    return data, idx
+        hv = p.get("token_anterior_sha256")
+        if hv and hv != h:
+            idx[hv] = pid; viejos.add(hv)
+    return data, idx, viejos
 
-PARTICIPANTES, TOKEN_INDEX = cargar_participantes()
+PARTICIPANTES, TOKEN_INDEX, TOKEN_VIEJOS = cargar_participantes()
+CON_TOKEN_VIEJO = contextvars.ContextVar("token_viejo", default=False)
 
 def _recargar_participantes():
-    global PARTICIPANTES, TOKEN_INDEX
-    PARTICIPANTES, TOKEN_INDEX = cargar_participantes()
+    global PARTICIPANTES, TOKEN_INDEX, TOKEN_VIEJOS
+    PARTICIPANTES, TOKEN_INDEX, TOKEN_VIEJOS = cargar_participantes()
     sembrar_participantes()
 
 def _guardar_participantes():
@@ -137,10 +145,12 @@ def _append(kind, data):
         return {"accion": "creado", "id": cur.lastrowid, "kind": kind}
 
 def _rows(kind, limit=300, order="ASC"):
+    """limit=None trae TODO (en SQLite, LIMIT -1 no limita). Usarlo solo donde una
+    respuesta recortada enganaria en silencio, no por comodidad."""
     with db() as con:
         cur = con.execute(
             f"SELECT id,key,data,created,updated FROM items WHERE kind=? ORDER BY id {order} LIMIT ?",
-            (kind, limit))
+            (kind, -1 if limit is None else limit))
         out = []
         for r in cur.fetchall():
             d = json.loads(r["data"]); d["_id"] = r["id"]
@@ -155,6 +165,106 @@ def _get(kind, key):
         r = con.execute("SELECT id,data FROM items WHERE kind=? AND key=?", (kind, key)).fetchone()
     if not r: return None, None
     return r["id"], json.loads(r["data"])
+
+# ───────────── HUELLA: quién sigue vivo, y quién ya lo tuvo delante ─────────────
+# Esto existe por el desencuentro produccion/voicetf del 30-ago: los dos sostenian
+# creencias opuestas y CONFIADAS sobre si habian hablado, y el canal no le ensenaba
+# a ninguno el dato que las refutaba. Produccion leyo abandono donde habia trabajo;
+# voicetf leyo, resolvio y no escribio, y el otro no tenia como distinguir "no la ha
+# visto" de "la vio y no contesta". No se arregla pidiendo por regla que avisen: se
+# arregla quitandole al canal la posibilidad de ocultar el dato.
+
+_AUTOR = ("de", "dueno", "por", "autor", "quien", "solicitante", "cerrada_por")
+
+def _tocar(pid):
+    """Sella que esta identidad se conecto. Va en el unico punto por el que pasa
+    TODA peticion autenticada: no hay manera de trabajar sin dejar huella, ni de
+    olvidarse de dejarla."""
+    try:
+        _put("actividad", pid, {"id": pid, "ultima_conexion": now()})
+    except Exception:
+        pass    # la huella jamas puede tumbar una peticion
+
+def _ultima_escritura():
+    """Ultima vez que cada participante ESCRIBIO algo, del tipo que sea: mensaje,
+    reserva de puerto, fecha, decision, hecho. Se DERIVA de la tabla, no de un
+    contador aparte que haya que acordarse de subir — un contador se desincroniza
+    cuando aparece un tipo nuevo, una derivacion no puede."""
+    out = {}
+    with db() as con:
+        for r in con.execute("SELECT kind,data,created FROM items WHERE kind NOT IN "
+                             "('participant','actividad') ORDER BY id DESC LIMIT 4000"):
+            try: d = json.loads(r["data"])
+            except Exception: continue
+            for campo in _AUTOR:
+                a = d.get(campo)
+                if isinstance(a, str) and a in PARTICIPANTES:
+                    out.setdefault(a, {"cuando": r["created"], "que": r["kind"]})
+                    break
+    return out
+
+def _actividad(pid=None):
+    """Quien esta vivo y quien contribuye. Dos columnas distintas a proposito:
+    conectarse prueba que miras, escribir prueba que aportas, y confundirlas fue
+    justo el error del 30-ago."""
+    esc = _ultima_escritura()
+    con_ = {r.get("id"): r.get("ultima_conexion") for r in _rows("actividad", 200)}
+    ids = [pid] if pid else list(PARTICIPANTES)
+    out = {}
+    for i in ids:
+        e = esc.get(i)
+        out[i] = {"ultima_conexion": con_.get(i),
+                  "ultima_escritura": (e or {}).get("cuando"),
+                  "ultimo_escrito": (e or {}).get("que")}
+    return out
+
+def _entregar(pid, msgs):
+    """Sella en el mensaje que su destinatario YA LO TUVO DELANTE, con hora.
+    Se llama desde todo camino por el que el canal le ensena un mensaje a quien va
+    dirigido. Convierte "no me respondio" de sospecha en dato, y separa lo que antes
+    era indistinguible: no la ha abierto / la abrio y no contesta.
+    Solo anade la primera vez; un camino de lectura que se olvide de llamarlo deja
+    de sellar, pero NUNCA puede sellar de mas."""
+    nuevos = [m for m in msgs if isinstance(m, dict) and m.get("_id")
+              and m.get("para") == pid and m.get("de") != pid and not m.get("visto")]
+    if not nuevos: return msgs
+    t = now()
+    try:
+        with db() as con:
+            for m in nuevos:
+                r = con.execute("SELECT data FROM items WHERE id=?", (m["_id"],)).fetchone()
+                if not r: continue
+                d = json.loads(r["data"])
+                if d.get("visto"): continue
+                d["visto"] = t
+                # No se toca `updated`: haber leido algo no es haberlo modificado.
+                con.execute("UPDATE items SET data=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), m["_id"]))
+                m["visto"] = t
+    except Exception:
+        pass
+    return msgs
+
+def _mis_solicitudes(me, msgs):
+    """Mis solicitudes abiertas, con lo que antes habia que adivinar: si el otro ya
+    la leyo, y que YO puedo cerrarla. Lo segundo va aqui porque voicetf afirmo que
+    produccion no podia cerrar su propia solicitud —era falso— y produccion le creyo.
+    Un permiso que no viaja junto al objeto se acaba inventando."""
+    out = []
+    for m in msgs:
+        if m.get("de") != me or m.get("tipo") != "solicitud" or m.get("estado") != "abierta":
+            continue
+        ref = m.get("ref") or "?"
+        e = {"ref": ref, "para": m.get("para"), "asunto": m.get("asunto"),
+             "enviada": m.get("_creado")}
+        if m.get("visto"):
+            e["lectura"] = f"LA LEYO el {m['visto']} y no ha respondido"
+        else:
+            e["lectura"] = "AUN NO LA HA ABIERTO — no des por hecho que te ignora"
+        e["puedes_cerrarla_tu"] = True
+        e["como"] = f"sol_cerrar(ref='{ref}') — eres quien la abrio; no necesitas al otro"
+        out.append(e)
+    return out
 
 def _next_ref(prefijo="SOL"):
     with db() as con:
@@ -206,12 +316,146 @@ if not SDK_ESTRICTO:
 
 mcp = MCPServer(SERVER_NAME)
 
+
+def _marcar_errores_como_errores():
+    """Un rechazo tiene que llegar marcado COMO rechazo, no solo escrito.
+
+    El SDK pone is_error=True cuando la tool levanta una excepcion, pero deja
+    is_error=False cuando devuelve una cadena normalmente. Todas nuestras
+    validaciones hacian `return "ERROR: ..."`, asi que el cliente recibia el texto
+    de un rechazo con el campo diciendo que todo fue bien.
+
+    Lo encontro editorial el 2-sep-2026, y lo peor es a quien castigaba: un cliente
+    que hace LO CORRECTO —fiarse de is_error— se tragaba el rechazo como si fuera
+    un envio realizado. El que leia el texto a mano se salvaba por accidente. Es la
+    misma familia que llevamos una semana cerrando, con el agravante de que aqui el
+    campo existia y decia lo contrario de la verdad.
+
+    Se arregla envolviendo el decorador UNA vez, no corrigiendo cincuenta returns:
+    asi queda cubierta tambien cualquier tool que se escriba manana. La excepcion
+    produce exactamente la misma forma que ya devuelven la tool inexistente y el
+    parametro invalido, asi que los clientes no tienen que aprender nada nuevo.
+    """
+    try:
+        from mcp.server.mcpserver.exceptions import ToolError
+    except Exception:
+        try:
+            from mcp.server.fastmcp.exceptions import ToolError
+        except Exception:
+            ToolError = RuntimeError
+    original = mcp.tool
+
+    def tool_estricta(*a, **kw):
+        decorar = original(*a, **kw)
+
+        def envolver(fn):
+            if inspect.iscoroutinefunction(fn):
+                @functools.wraps(fn)
+                async def guardia(*args, **kwargs):
+                    r = await fn(*args, **kwargs)
+                    if isinstance(r, str) and r.lstrip().startswith("ERROR"):
+                        raise ToolError(r)
+                    return r
+            else:
+                @functools.wraps(fn)
+                def guardia(*args, **kwargs):
+                    r = fn(*args, **kwargs)
+                    if isinstance(r, str) and r.lstrip().startswith("ERROR"):
+                        raise ToolError(r)
+                    return r
+            return decorar(guardia)
+        return envolver
+
+    mcp.tool = tool_estricta
+    return True
+
+
+# Debe correr ANTES de registrar las tools, igual que el de parametros estrictos.
+SDK_MARCA_ERRORES = _marcar_errores_como_errores()
+
+
+# ───────────── ROTACION DE TOKENS (nadie se queda fuera) ─────────────
+def _confirmo_esta_rotacion(pid):
+    """Confirmar UNA vez no vale para siempre. La confirmacion lleva el identificador
+    de la rotacion que confirmaba; si no coincide con la abierta ahora, no cuenta."""
+    p = PARTICIPANTES.get(pid) or {}
+    if not p.get("token_anterior_sha256"):
+        return True                       # no esta rotando: nada que confirmar
+    _, r = _get("rotacion", pid)
+    return bool(r) and r.get("rot_id") and r.get("rot_id") == p.get("rot_id")
+
+@mcp.tool()
+def token_confirmar() -> str:
+    """Confirma que YA estas usando tu token nuevo. Llamalo despues de cambiarlo
+    en tu configuracion. Solo cuenta si la llamada llega CON el token nuevo: por eso
+    no puedes confirmar por error ni de buena fe sin haberlo probado."""
+    me = ident()
+    p = PARTICIPANTES.get(me) or {}
+    if not p.get("token_anterior_sha256"):
+        return _jd({"estado": "sin_rotacion_en_curso",
+                    "nota": "No tienes ninguna rotacion pendiente. Nada que confirmar."})
+    if CON_TOKEN_VIEJO.get():
+        return ("ERROR: esta llamada ha llegado con tu token ANTIGUO, asi que no confirmo nada.\n"
+                "Cambia el token en tu configuracion, reinicia tu cliente y vuelve a llamar.\n"
+                "Que te deje entrar con el viejo es a proposito: para que puedas avisar si algo "
+                "sale mal. No es senal de que ya lo hayas cambiado.")
+    _put("rotacion", me, {"id": me, "confirmado": now(), "desde": p.get("rota_hasta"),
+                          "rot_id": p.get("rot_id")})
+    faltan = [q for q, v in PARTICIPANTES.items()
+              if v.get("activo", True) and v.get("token_anterior_sha256")
+              and not _confirmo_esta_rotacion(q)]
+    return _jd({"estado": "confirmado", "id": me,
+                "faltan_por_confirmar": faltan,
+                "nota": ("Tu token viejo seguira valiendo hasta que el administrador cierre la "
+                         "rotacion. No te quedaras fuera por haber confirmado.")})
+
+@mcp.tool()
+def rotacion_estado() -> str:
+    """Quien ha confirmado ya su token nuevo y quien no. Solo la autoridad."""
+    me = ident()
+    if not es_autoridad(me):
+        return "ERROR: solo la autoridad del canal consulta el estado de la rotacion."
+    # Codigos emitidos y aun sin canjear, por participante. Un permiso vivo que no
+    # se ve es un permiso que no se puede retirar.
+    pendientes_cod = {}
+    for r in _rows("rot_invitacion", 500, order="DESC"):
+        if r.get("estado") == "emitida":
+            pendientes_cod.setdefault(r.get("para"), r.get("emitida"))
+    filas = []
+    for q, v in PARTICIPANTES.items():
+        if not v.get("activo", True): continue
+        en_rot = bool(v.get("token_anterior_sha256"))
+        _, r = _get("rotacion", q)
+        vale = _confirmo_esta_rotacion(q)
+        act = _actividad(q).get(q, {})
+        filas.append({"id": q,
+                      "en_rotacion": en_rot,
+                      **({"codigo_emitido_sin_usar": pendientes_cod[q]}
+                         if q in pendientes_cod else {}),
+                      "confirmado": ((r or {}).get("confirmado") if vale else None),
+                      **({"confirmacion_vieja_ignorada": (r or {}).get("confirmado")}
+                         if (r and not vale and en_rot) else {}),
+                      "ultima_conexion": act.get("ultima_conexion"),
+                      "ultima_escritura": act.get("ultima_escritura")})
+    pend = [f["id"] for f in filas if f["en_rotacion"] and not f["confirmado"]]
+    sueltos = sorted(pendientes_cod)
+    return _jd({"participantes": filas, "faltan": pend,
+                "codigos_emitidos_sin_usar": sueltos,
+                "listo_para_cerrar": not pend,
+                "nota": ("Cerrar con: sudo participante.py cerrar-rotacion. Mientras alguien "
+                         "figure en 'faltan', cerrar lo deja incomunicado. Si lleva dias sin "
+                         "conectarse, mira ultima_conexion antes de dar por hecho que te ignora.")})
+
 # ───────────── IDENTIDAD ─────────────
 @mcp.tool()
 def whoami() -> str:
     """Devuelve la identidad con la que este cliente escribe (la sella el servidor)."""
     pid = ident()
-    p = {k: v for k, v in PARTICIPANTES[pid].items() if k not in ("token", "token_sha256")}
+    p = {k: v for k, v in PARTICIPANTES[pid].items()
+         if k not in ("token", "token_sha256", "token_anterior_sha256")}
+    if PARTICIPANTES[pid].get("token_anterior_sha256"):
+        p["rotacion"] = ("ESTAS USANDO EL TOKEN ANTIGUO" if CON_TOKEN_VIEJO.get()
+                         else "usando el token nuevo; llama a token_confirmar() si aun no lo hiciste")
     return _jd({"id": pid, **p})
 
 @mcp.tool()
@@ -243,8 +487,13 @@ def parametros(herramienta: str = "") -> str:
 
 @mcp.tool()
 def participantes() -> str:
-    """Lista de participantes registrados (coworks, agentes, servicios, humanos)."""
-    return _jd(_rows("participant"))
+    """Lista de participantes registrados, con cuando se conecto y cuando escribio
+    cada uno por ultima vez. Las dos columnas van AQUI para que nadie tenga que
+    deducir de su bandeja si otro sigue activo: la bandeja solo ve mensajes
+    dirigidos a uno, y por eso el 30-ago se leyo como abandono lo que era trabajo
+    en registros que la bandeja no muestra."""
+    act = _actividad()
+    return _jd([{**p, **act.get(p.get("id"), {})} for p in _rows("participant")])
 
 # ───────────── ARRANQUE ─────────────
 @mcp.tool()
@@ -254,11 +503,13 @@ def state_overview() -> str:
     pend = [m for m in _rows("msg", 500, order="DESC")
             if m.get("para") in (me, "todos") and m.get("de") != me
             and m.get("estado") not in ("atendido", "respondida", "descartada")]
-    mias = [m for m in _rows("msg", 500, order="DESC") if m.get("de") == me
-            and m.get("tipo") == "solicitud" and m.get("estado") == "abierta"]
+    _entregar(me, pend)
+    _todos_msg = _rows("msg", 500, order="DESC")
+    mias = _mis_solicitudes(me, _todos_msg)
     cart_pend = []
     for c in _rows("cartel", 300, order="DESC"):
         if c.get("estado") != "activo": continue
+        if not (PARTICIPANTES.get(me) or {}).get("confirma_cartelera", True): continue
         if me in c.get("dirigido_a", []) and me not in c.get("confirmaciones", {}) \
                 and c.get("requiere") in ("confirmacion", "respuesta"):
             cart_pend.append({"ref": c["ref"], "tipo": c["tipo"], "de": c["de"],
@@ -299,6 +550,7 @@ def state_overview() -> str:
         **({"por_aprobar": por_aprobar} if por_aprobar else {}),
         "cartelera_pendiente": cart_pend,
         "esperando_respuesta": mias,
+        "actividad_de_todos": _actividad(),
         "mensajes_pendientes": pend,
         "decisiones_recientes": _rows("decision", 8, order="DESC"),
         "hechos": _rows("fact", 100),
@@ -390,21 +642,28 @@ def msg_inbox(incluir_atendidos: bool = False) -> str:
     out = [m for m in rows if m.get("para") in (me, "todos") and m.get("de") != me
            and (incluir_atendidos or m.get("estado") not in ("atendido", "respondida", "descartada"))]
     # los envios propios no son "bandeja": se consultan con search o msg_hilo (D1, 25-ago)
-    return _jd(out)
+    return _jd(_entregar(me, out))
 
 @mcp.tool()
 def msg_desde(fecha_iso: str) -> str:
     """Todo lo escrito desde una fecha (ISO: 2026-08-23 o 2026-08-23T15:00:00+00:00)."""
-    rows = _rows("msg", 1000, order="ASC")
+    # SIN TOPE, y no es descuido. Con ORDER BY id ASC + LIMIT N, pasado el mensaje N
+    # esto devuelve los N mas VIEJOS y descarta callado los recientes: justo lo que se
+    # pide aqui. Detectado al cruzar el sandbox los 1000 mensajes (31-ago). Un recorte
+    # silencioso en una herramienta de lectura es peor que un error: quien pregunta
+    # "que ha pasado desde el lunes" se lleva un "nada" que se cree.
+    rows = _rows("msg", None, order="ASC")
     return _jd([m for m in rows if m["_creado"] >= fecha_iso])
 
 @mcp.tool()
 def msg_hilo(ref: str) -> str:
     """El hilo completo de una ref (SOL-007): la solicitud y todas sus respuestas."""
     nref = _norm_ref(ref) or ref.strip()
-    rows = _rows("msg", 1000, order="ASC")
+    # Sin tope: un hilo incompleto no avisa de que le faltan piezas (ver msg_desde).
+    rows = _rows("msg", None, order="ASC")
     def _eq(v): return bool(v) and (_norm_ref(v) or v.strip()) == nref
-    return _jd([m for m in rows if _eq(m.get("ref")) or _eq(m.get("responde_a"))])
+    return _jd(_entregar(ident(), [m for m in rows
+                if _eq(m.get("ref")) or _eq(m.get("responde_a"))]))
 
 @mcp.tool()
 def msg_ack(id: int, nota: str = "") -> str:
@@ -469,7 +728,14 @@ def cartel_publicar(tipo: str, asunto: str, cuerpo: str, requiere: str = "", for
     if tipo == "peticion" and req == "respuesta" and not formato_respuesta:
         return "ERROR: una peticion de informacion declara `formato_respuesta` (el formato acordado)."
     ref = _next_ref("CART")
-    dirigidos = [p for p, v in PARTICIPANTES.items() if v.get("activo", True) and p != me]
+    # `confirma_cartelera: false` saca a un participante de la lista. Se puso para
+    # Ricardo: la cartelera existe para propagar SU autoridad, y pedirle que confirme
+    # lo que el mismo manda es ruido — ademas su nombre en `pendientes` hacia parecer
+    # incompleta una cartelera que si lo estaba, y eso ensena a ignorar los pendientes.
+    # Es un ATRIBUTO, no un caso especial por id: manana otro humano puede necesitarlo.
+    dirigidos = [p for p, v in PARTICIPANTES.items()
+                 if v.get("activo", True) and p != me
+                 and v.get("confirma_cartelera", True)]
     d = {"de": me, "tipo": tipo, "asunto": asunto, "cuerpo": cuerpo, "ref": ref,
          "requiere": req, "formato_respuesta": formato_respuesta,
          "dirigido_a": dirigidos, "confirmaciones": {}, "estado": "activo"}
@@ -526,7 +792,8 @@ def cartel_estado(ref: str) -> str:
     for c in _rows("cartel", 300):
         if _norm_ref(c.get("ref")) == ref:
             conf = c.get("confirmaciones", {})
-            pend = [p for p in c.get("dirigido_a", []) if p not in conf]
+            pend = [p for p in c.get("dirigido_a", []) if p not in conf
+                    and (PARTICIPANTES.get(p) or {}).get("confirma_cartelera", True)]
             return _jd({"ref": ref, "tipo": c.get("tipo"), "requiere": c.get("requiere"),
                         "estado": c.get("estado"), "confirmados": conf, "pendientes": pend})
     return f"ERROR: no existe el cartel {ref}."
@@ -950,6 +1217,257 @@ def alta_invitar(nota: str = "", id_sugerido: str = "") -> str:
                 "aviso": "el codigo se muestra UNA sola vez y caduca en 7 dias",
                 "texto_para_el_cowork": _texto_invitacion(codigo, sug)})
 
+# ───────────── SEGUNDO SECRETO PARA EL CICLO DE VIDA DE CREDENCIALES ─────────────
+# Poner alta/baja/rotacion en la consola cambia lo que consigue quien robe el token
+# de la autoridad: antes leer y escribir; ahora ACUNAR Y REVOCAR IDENTIDADES. Esa
+# escalada se paga con un segundo factor.
+#
+# La frase NO se puede fijar por la API, a proposito: un secreto que protege una
+# operacion no puede establecerse con la credencial que esa operacion protege. Se
+# pone a mano en /etc/evastate.env, y solo su SHA-256:
+#
+#     EVASTATE_FRASE_SHA256=$(printf %s 'tu frase' | sha256sum | cut -d" " -f1)
+#
+# Si no esta definida, las operaciones protegidas se NIEGAN. No se degradan a
+# "solo autoridad" en silencio: una proteccion que desaparece sola cuando falta su
+# configuracion es peor que no tenerla, porque nadie se entera.
+FRASE_SHA = (os.environ.get("EVASTATE_FRASE_SHA256") or "").strip().lower()
+
+def _frase_ok(frase):
+    """Devuelve (True, '') o (False, motivo). Comparacion en tiempo constante."""
+    if not FRASE_SHA:
+        return False, ("ERROR: esta instalacion no tiene frase de seguridad configurada, asi que "
+                       "las operaciones sobre credenciales estan cerradas.\n"
+                       "Definela en /etc/evastate.env y reinicia el servicio:\n"
+                       "  EVASTATE_FRASE_SHA256=$(printf %s 'tu frase' | sha256sum | cut -d' ' -f1)\n"
+                       "Se pone a mano y por SSH a proposito: si se pudiera fijar desde aqui, no "
+                       "protegeria de nada.")
+    if not frase:
+        return False, ("ERROR: esta operacion crea o revoca credenciales y necesita la frase de "
+                       "seguridad. Pasala en el parametro `frase`.")
+    if not secrets.compare_digest(_sha(frase), FRASE_SHA):
+        _append("intento_frase", {"quien": ident(), "cuando": now()})
+        return False, ("ERROR: frase incorrecta. El intento queda registrado. Si no has sido tu, "
+                       "alguien tiene tu token: rota YA y revisa intentos_frase().")
+    return True, ""
+
+@mcp.tool()
+def intentos_frase(limite: int = 20) -> str:
+    """(SOLO autoridad) Intentos fallidos con la frase de seguridad. Un fallo que no
+    reconozcas significa que alguien tiene un token de autoridad que no deberia."""
+    if not es_autoridad(ident()):
+        return "ERROR: intentos_frase es de la autoridad."
+    return _jd(_rows("intento_frase", max(1, min(int(limite), 200)), order="DESC"))
+
+@mcp.tool()
+def participante_baja(id: str, frase: str = "", motivo: str = "") -> str:
+    """(AUTORIDAD + frase) Da de baja logica a un participante: su token deja de
+    abrir y su historial se conserva. Antes esto solo se podia hacer por SSH."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: participante_baja es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
+    pid = id.strip().lower()
+    if pid == me: return "ERROR: no puedes darte de baja a ti mismo desde el canal."
+    p = PARTICIPANTES.get(pid)
+    if not p: return f"ERROR: '{pid}' no existe."
+    if not p.get("activo", True): return f"ERROR: '{pid}' ya estaba de baja."
+    p["activo"] = False; p["baja_por"] = me; p["baja_fecha"] = now()
+    if motivo: p["baja_motivo"] = motivo
+    _guardar_participantes(); _recargar_participantes()
+    _append("decision", {"de": me, "titulo": f"baja de '{pid}'", "proyecto": "state",
+                         "decision": f"'{pid}' dado de baja desde la consola.",
+                         "motivo": motivo or "(sin motivo declarado)", "fecha": now()})
+    return _jd({"accion": "baja", "id": pid,
+                "aviso": "queda registrado como decision del canal; su token ya no abre"})
+
+@mcp.tool()
+def participante_cartelera(id: str, confirma: bool, frase: str = "") -> str:
+    """(AUTORIDAD + frase) Marca si un participante confirma carteles. Ponlo en false
+    para servicios y para la autoridad de la que emanan las reglas."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: participante_cartelera es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
+    pid = id.strip().lower()
+    if pid not in PARTICIPANTES: return f"ERROR: '{pid}' no existe."
+    PARTICIPANTES[pid]["confirma_cartelera"] = bool(confirma)
+    _guardar_participantes(); _recargar_participantes()
+    return _jd({"accion": "actualizado", "id": pid, "confirma_cartelera": bool(confirma)})
+
+@mcp.tool()
+def rotacion_anular(id: str, frase: str = "") -> str:
+    """(AUTORIDAD + frase) Anula el codigo de rotacion vivo de un participante para
+    poder emitir otro. Existe porque el codigo se muestra UNA vez: perderlo dejaba
+    bloqueado a ese participante hasta que caducara. Lo descubri perdiendo uno.
+    Anular NO toca ningun token: solo invalida un permiso que aun no se ha usado."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: rotacion_anular es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
+    pid = id.strip().lower()
+    n = 0
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='rot_invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("para") == pid and d.get("estado") == "emitida":
+                d["estado"] = "anulada"; d["anulada_por"] = me; d["anulada"] = now()
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                n += 1
+    if not n: return f"ERROR: '{pid}' no tiene ningun codigo vivo que anular."
+    return _jd({"accion": "anulados", "codigos": n, "para": pid,
+                "nota": "ningun token se ha tocado; ya puedes emitir otro"})
+
+@mcp.tool()
+def rotacion_cerrar(id: str = "", frase: str = "", forzar: bool = False) -> str:
+    """(AUTORIDAD + frase) Retira los tokens antiguos. Sin `id`, cierra todas las
+    rotaciones abiertas. Se NIEGA mientras alguien no haya confirmado: cerrar sobre
+    quien no ha confirmado lo deja fuera del canal, y sin canal no puede avisar de
+    que esta fuera. `forzar` existe, pero hay que escribirlo."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: rotacion_cerrar es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
+    pid = id.strip().lower()
+    objetivo = ([pid] if pid else
+                [q for q, v in PARTICIPANTES.items() if v.get("token_anterior_sha256")])
+    if not objetivo: return "ERROR: no hay ninguna rotacion abierta."
+    faltan = []
+    for q in objetivo:
+        v = PARTICIPANTES.get(q) or {}
+        if not v.get("token_anterior_sha256"): continue
+        if not _confirmo_esta_rotacion(q): faltan.append(q)
+    if faltan and not forzar:
+        det = {q: (_actividad(q).get(q) or {}).get("ultima_conexion") for q in faltan}
+        return _jd({"error": "NO cierro nada: estos no han confirmado su token nuevo",
+                    "faltan": faltan, "ultima_conexion_de_cada_uno": det,
+                    "antes_de_forzar": ("mira la ultima conexion: quien lleva dias sin aparecer no "
+                                        "te ignora, no ha vuelto. Forzar lo deja fuera y sin forma "
+                                        "de avisarte."),
+                    "como_forzar": "rotacion_cerrar(..., forzar=True) — deliberado, no por descuido"})
+    cerrados = []
+    for q in objetivo:
+        v = PARTICIPANTES.get(q) or {}
+        if not v.pop("token_anterior_sha256", None): continue
+        v.pop("rota_hasta", None); v.pop("rot_id", None); cerrados.append(q)
+    _guardar_participantes(); _recargar_participantes()
+    return _jd({"accion": "rotacion cerrada", "participantes": cerrados,
+                "forzado": bool(forzar and faltan),
+                **({"quedaron_fuera": faltan} if (forzar and faltan) else {})})
+
+@mcp.tool()
+def rotacion_invitar(id: str, dias: int = 7, frase: str = "") -> str:
+    """(SOLO autoridad) Emite un codigo de UN SOLO USO para que un participante
+    cambie su token. El codigo NO es la credencial: es el permiso para proponer una.
+    El propio cliente genera su token nuevo y lo envia por POST /rotacion; el
+    servidor no emite ni transmite tokens jamas. Por eso el codigo se puede pasar
+    por una via debil sin comprometer nada, y ningun token acaba en un fichero
+    compartido ni en una URL — que es como acabaron en los registros el 2-sep."""
+    me = ident()
+    if not es_autoridad(me): return "ERROR: rotacion_invitar es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
+    pid = id.strip().lower()
+    p = PARTICIPANTES.get(pid)
+    if not p or not p.get("activo", True): return f"ERROR: '{pid}' no existe o no esta activo."
+    if p.get("token_anterior_sha256") and _confirmo_esta_rotacion(pid):
+        return (f"ERROR: '{pid}' ya rota y YA HA CONFIRMADO su token nuevo. Cierra esa "
+                "rotacion antes de abrir otra, o quedarian tres tokens vivos.")
+    # Si rota pero AUN NO ha confirmado, se permite emitir otro codigo: el token
+    # nuevo no lo esta usando nadie todavia. Es la unica salida cuando ese token se
+    # pierde entre el canje y el disco, que es justo lo que paso el 2-sep.
+    for r in _rows("rot_invitacion", 500, order="DESC"):
+        if r.get("para") == pid and r.get("estado") == "emitida":
+            return (f"ERROR: ya hay un codigo vivo para '{pid}'. Dos codigos a la vez es una "
+                    "copia mas del permiso que puede perderse.\n"
+                    f"Si lo has perdido: rotacion_anular('{pid}') y vuelve a emitir.")
+    codigo = secrets.token_urlsafe(18)
+    _append("rot_invitacion", {"codigo_sha256": _sha(codigo), "para": pid, "estado": "emitida",
+                               "emitida_por": me, "emitida": now(), "dias": int(dias)})
+    return _jd({"codigo": codigo, "para": pid,
+                "aviso": f"se muestra UNA vez y caduca en {int(dias)} dias",
+                "instrucciones": _texto_rotacion(codigo, pid)})
+
+def _texto_rotacion(codigo, pid):
+    return (
+        f"Cambio de token de '{pid}'. Genera TU el nuevo; el canal no te lo manda.\n\n"
+        "python -c \"import secrets,json,urllib.request;"
+        "t=secrets.token_urlsafe(36);"
+        f"d=json.dumps({{'codigo':'{codigo}','token_propuesto':t}}).encode();"
+        "r=urllib.request.Request('https://" + PUBLIC_HOST + "/rotacion',d,"
+        "{'Content-Type':'application/json','User-Agent':'eva-rotacion/1.0'});"
+        "print(urllib.request.urlopen(r,timeout=30).read().decode());"
+        "open(RUTA,'w').write(t)\"\n\n"
+        "Cambia RUTA por el fichero donde lees tu token (esta en infra_list como "
+        f"token-{pid}). Tu token ANTIGUO sigue valiendo hasta que confirmes: reinicia "
+        "tu cliente y llama a token_confirmar().")
+
+async def rotacion_post(request):
+    """Canje del codigo de rotacion. El cliente propone su token; aqui no se emite
+    ninguno. El antiguo NO se retira: pasa a token_anterior_sha256 y sigue abriendo
+    la puerta hasta que su dueno confirme con el nuevo."""
+    try:
+        body = json.loads(await request.body())
+    except Exception:
+        return JSONResponse({"error": "JSON invalido"}, status_code=400)
+    codigo = str(body.get("codigo", "")); tok = str(body.get("token_propuesto", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", tok):
+        return JSONResponse({"error": "token_propuesto: 32-128 caracteres url-safe, generado por ti"},
+                            status_code=400)
+    h_nuevo = _sha(tok)
+    if h_nuevo in TOKEN_INDEX:
+        return JSONResponse({"error": "ese token ya esta en uso; genera otro"}, status_code=409)
+    h = _sha(codigo)
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='rot_invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("codigo_sha256") != h or d.get("estado") != "emitida":
+                continue
+            try:
+                ed = datetime.datetime.fromisoformat(d.get("emitida"))
+                caducado = (datetime.datetime.now(datetime.timezone.utc) - ed).days >= int(d.get("dias", 7))
+            except Exception:
+                caducado = False
+            if caducado:
+                d["estado"] = "caducada"
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                return JSONResponse({"error": "codigo caducado; pide otro a la autoridad"}, status_code=410)
+            pid = d.get("para")
+            p = PARTICIPANTES.get(pid)
+            if not p or not p.get("activo", True):
+                return JSONResponse({"error": "participante no activo"}, status_code=409)
+            # El "anterior" es SIEMPRE el ultimo token que se sabe que funciona. Si ya
+            # habia una rotacion abierta, ese sigue siendo el de antes de empezar: el
+            # token intermedio pudo perderse y guardarlo aqui dejaria al participante
+            # sin ninguno valido.
+            viejo = (p.get("token_anterior_sha256")
+                     or p.get("token_sha256")
+                     or (_sha(p["token"]) if p.get("token") else None))
+            if not viejo:
+                return JSONResponse({"error": "el participante no tiene token vigente"}, status_code=409)
+            reintento = bool(p.get("token_anterior_sha256"))
+            p.pop("token", None)
+            p["token_anterior_sha256"] = viejo
+            p["token_sha256"] = h_nuevo
+            # Identificador de ESTA rotacion. Sin el, una confirmacion de una rotacion
+            # ANTERIOR contaba como valida para la siguiente y rotacion_cerrar retiraba
+            # el token de alguien que nunca confirmo el nuevo -- dejandolo fuera del
+            # canal, que es exactamente lo que todo este mecanismo existe para evitar.
+            # Encontrado el 2-sep-2026 probandolo dos veces seguidas sobre el mismo id.
+            p["rot_id"] = secrets.token_hex(8)
+            p["rota_hasta"] = (datetime.date.today() +
+                               datetime.timedelta(days=int(d.get("dias", 7)))).isoformat()
+            _guardar_participantes(); _recargar_participantes()
+            d["estado"] = "canjeada"; d["canjeada"] = now()
+            con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                        (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+            return JSONResponse({"ok": True, "id": pid, "reintento": reintento,
+                "aviso": ("tu token ANTIGUO sigue valiendo. Reinicia tu cliente con el nuevo y "
+                          "llama a token_confirmar() para que la autoridad pueda cerrar la rotacion")})
+    return JSONResponse({"error": "codigo no valido"}, status_code=403)
+
 @mcp.tool()
 def altas_pendientes() -> str:
     """(SOLO autoridad) Solicitudes de alta esperando aprobación."""
@@ -962,11 +1480,13 @@ def altas_pendientes() -> str:
     return _jd(out)
 
 @mcp.tool()
-def alta_aprobar(id: str, nota: str = "") -> str:
+def alta_aprobar(id: str, nota: str = "", frase: str = "") -> str:
     """(SOLO autoridad) Aprueba una solicitud de alta: activa la identidad con el
     token que el candidato propuso (aquí solo vive su hash)."""
     me = ident()
     if not es_autoridad(me): return "ERROR: alta_aprobar es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
     pid = id.strip().lower()
     with db() as con:
         for r in con.execute("SELECT id,data FROM items WHERE kind='invitacion'").fetchall():
@@ -1639,6 +2159,7 @@ def _saludo(pid):
               and m.get("estado") not in ("atendido", "respondida", "descartada")]
     carteles = [c for c in _rows("cartel", 300, order="DESC")
                 if c.get("estado") == "activo" and pid in c.get("dirigido_a", [])
+                and (PARTICIPANTES.get(pid) or {}).get("confirma_cartelera", True)
                 and pid not in c.get("confirmaciones", {})
                 and c.get("requiere") in ("confirmacion", "respuesta")]
     if carteles:
@@ -1651,6 +2172,7 @@ def _saludo(pid):
             lineas.append("PETICIONES DE LA AUTORIDAD SIN RESPONDER (en privado a quien la emitio): " +
                           ", ".join(f"{c['ref']} {c['asunto']}" for c in peticiones[:5]))
     if privados:
+        _entregar(pid, privados)   # nombrarselos ES entregarselos: queda la hora
         lineas.append(f"MENSAJES PRIVADOS PARA TI: {len(privados)} — " +
                       "; ".join(f"{m['de']}: {m['asunto'][:60]}" for m in privados[:4]))
     if avisos:
@@ -1678,7 +2200,24 @@ def _saludo(pid):
     abiertas = [m for m in msgs if m.get("de") == pid and m.get("tipo") == "solicitud"
                 and m.get("estado") == "abierta"]
     if abiertas:
-        lineas.append(f"TUS SOLICITUDES ABIERTAS: " + ", ".join(m.get("ref", "?") for m in abiertas[:6]))
+        det = []
+        for m in abiertas[:6]:
+            r_, q_ = m.get("ref", "?"), m.get("para")
+            det.append(f"{r_} ({q_} LA LEYO y no ha respondido)" if m.get("visto")
+                       else f"{r_} ({q_} aun no la ha abierto)")
+        lineas.append("TUS SOLICITUDES ABIERTAS: " + ", ".join(det) +
+                      " — si ya no necesitas nada del otro, cierralas TU con sol_cerrar")
+    try:
+        if CON_TOKEN_VIEJO.get():
+            hasta = (PARTICIPANTES.get(pid) or {}).get("rota_hasta") or "(sin fecha)"
+            lineas.insert(0,
+                "ESTAS ENTRANDO CON TU TOKEN ANTIGUO. Hay uno nuevo esperandote y el viejo se "
+                f"retira cuando TODOS hayan confirmado (previsto: {hasta}). Cambialo en tu "
+                "configuracion y llama a token_confirmar() para que conste. Mientras no lo hagas, "
+                "la rotacion no avanza y estas bloqueando al resto — nadie te va a cortar sin "
+                "que hayas confirmado tu, pero nadie puede confirmarlo por ti.")
+    except Exception:
+        pass
     if not lineas:
         return f"Canal state. Identidad: {pid}. No tienes nada pendiente."
     return (f"Canal state. Identidad: {pid}. Atiende esto antes de trabajar:\n- " +
@@ -1726,6 +2265,12 @@ async def app(scope, receive, send):
             return await PlainTextResponse("demasiadas peticiones", status_code=429)(scope, receive, send)
         resp = await wake_get(partes[2], arrancar=(scope["method"] == "POST"))
         return await resp(scope, receive, send)
+    if len(partes) >= 2 and partes[1] == "rotacion" and scope.get("method") == "POST":
+        if not _rate_ok("__rotacion__", 30):
+            return await JSONResponse({"error": "demasiadas solicitudes"}, status_code=429)(scope, receive, send)
+        from starlette.requests import Request
+        resp = await rotacion_post(Request(scope, receive))
+        return await resp(scope, receive, send)
     if len(partes) >= 2 and partes[1] == "registro" and scope.get("method") == "POST":
         if not _rate_ok("__registro__", 30):
             return await JSONResponse({"error": "demasiadas solicitudes"}, status_code=429)(scope, receive, send)
@@ -1741,6 +2286,8 @@ async def app(scope, receive, send):
             return await JSONResponse({"error": f"limite de tasa: {RATE_MAX} peticiones por {RATE_WINDOW}s"},
                                       status_code=429)(scope, receive, send)
         tokvar = CURRENT.set(pid)
+        vjvar = CON_TOKEN_VIEJO.set(_sha(partes[1]) in TOKEN_VIEJOS)
+        _tocar(pid)   # unico punto por el que pasa toda peticion: la huella no se puede olvidar
         try:
             resto = "/" + "/".join(partes[2:])
             if partes[2] == "mcp":
@@ -1763,9 +2310,40 @@ async def app(scope, receive, send):
         return await PlainTextResponse("ruta no reconocida bajo tu token", status_code=404)(scope, receive, send)
     return await base(scope, receive, send)
 
+class _CensurarToken(logging.Filter):
+    """El token viaja EN LA RUTA, asi que la linea de acceso de uvicorn escribe una
+    credencial en claro en journald, y de ahi a syslog y a cualquier copia de logs.
+    Detectado el 2-sep-2026 con 847 peticiones ya registradas asi, entre Caddy y el
+    propio servidor. Aqui se sustituye el token por el nombre de su dueno ANTES de
+    que se escriba: se conserva la utilidad de la linea y se pierde el secreto.
+    Va como filtro dentro del log_config que se le pasa a uvicorn, no anadido al
+    logger a mano: dictConfig reconstruye los loggers que declara y se llevaria por
+    delante un filtro puesto antes."""
+    _RE = re.compile(r"/([A-Za-z0-9_-]{20,})(?=/|$)")
+
+    def filter(self, record):
+        try:
+            a = list(record.args or ())
+            if len(a) >= 3 and isinstance(a[2], str) and "/" in a[2]:
+                def _sub(m):
+                    return "/[" + (TOKEN_INDEX.get(_sha(m.group(1))) or "token-invalido") + "]"
+                a[2] = self._RE.sub(_sub, a[2])
+                record.args = tuple(a)
+        except Exception:
+            pass   # censurar nunca puede tumbar el servicio; si falla, no se registra peor
+        return True
+
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn, copy
     extra = {}
     if TLS_CERT and TLS_KEY:
         extra = {"ssl_certfile": TLS_CERT, "ssl_keyfile": TLS_KEY}
+    try:
+        cfg = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+        cfg.setdefault("filters", {})["censura"] = {"()": _CensurarToken}
+        cfg["loggers"]["uvicorn.access"]["filters"] = ["censura"]
+        cfg["handlers"]["access"]["filters"] = ["censura"]
+        extra["log_config"] = cfg
+    except Exception as e:
+        print(f"AVISO: no pude censurar el log de acceso ({e}); arranco SIN el.", file=sys.stderr)
     uvicorn.run(app, host=BIND, port=int(os.environ.get("EVASTATE_PORT", "8787")), **extra)

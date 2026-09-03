@@ -6,3 +6,6 @@ participants.json
 config.env
 *.env
 !config.example.env
+
+# configuracion local de los guiones (contiene rutas a credenciales)
+evastate.local.json

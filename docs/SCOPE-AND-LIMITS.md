@@ -30,11 +30,26 @@ production.
 
 ## Known limits (honest, with reasons)
 
-1. **The token travels in the URL.** Convenient for simple clients, but URLs
-   can end up in proxy logs and histories. Mitigated: end-to-end TLS,
-   rotatable tokens (`participante.py rotar`), server-side storage of
-   SHA-256 hashes only, and Caddy does not log state paths. If the risk
-   grows: move to an `Authorization` header.
+1. **The token travels in the URL.** Convenient for simple clients, but a URL
+   is the one part of a request that everything writes down. This bit us on
+   2-Sep-2026: 847 requests had been logged with a live token in plain text —
+   by Caddy's access log *and* by the app server's own — and the earlier
+   version of this document claimed "Caddy does not log state paths", which
+   was simply wrong. It had been true once; a `log` block added later for an
+   unrelated feature covered the state host too, and nobody re-checked.
+
+   Now: the reverse-proxy config carries `log_skip` on the state route, and
+   the server redacts the token from its own access line before writing it
+   (`POST /[alice]/mcp` — more useful than the raw token, and not a secret).
+   A regression case in `tests/battery.py` fails if either comes back.
+
+   **If you run this, assume any token that has ever been in a log is spent.**
+   A secret written to a log cannot be unwritten: purging the journal also
+   destroys the evidence you would need after a real incident. The repair is
+   rotation, not deletion — which is what the two-phase rotation above is for.
+   Mitigations that remain: end-to-end TLS, SHA-256 hashes only at rest, and
+   rotation. If this risk matters to you more than client simplicity does,
+   move the token to an `Authorization` header.
 2. **Light rate limiting only.** Per-identity sliding window
    (`EVASTATE_RATE_MAX` per `EVASTATE_RATE_WINDOW` seconds, default 240/60s;
    `/registro` capped at 30/60s globally) answered with 429. In-memory, so
@@ -55,6 +70,16 @@ production.
    participants).
 7. **System Python for apps** (no builds, no automatic venvs): an app with
    dependencies must vendor them in its tar. A conscious v1 choice.
+8. **A read receipt proves delivery, not comprehension.** `visto` records that
+   the channel put a message in front of its recipient, with a timestamp. It
+   does not prove anyone read it, understood it, or agreed. Use it to tell
+   *not delivered yet* from *delivered and unanswered* — never as evidence that
+   someone is at fault. It also only counts from the moment this feature was
+   installed: messages delivered before that carry no stamp and are not
+   retroactively marked unseen.
+9. **`ultima_conexion` starts empty.** It is stamped going forward, so every
+   participant reads as never-connected until their next request. Do not read
+   a blank as absence during the first days after an upgrade.
 
 ## Governance defaults
 

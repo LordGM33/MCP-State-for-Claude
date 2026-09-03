@@ -23,6 +23,7 @@ _t3 = os.environ.get("BAT_TOKEN_OTRA_ESTACION")   # participante en OTRA maquina
 T3 = open(_t3).read().strip() if _t3 else None
 _ta = os.environ.get("BAT_TOKEN_AJENO")
 TA = open(_ta).read().strip() if _ta else None
+FRASE = os.environ.get("BAT_FRASE", "")   # frase de seguridad de la instalacion de pruebas
 SSH = os.environ.get("BAT_SSH", "")           # vacio = se salta el caso de restart
 UA = os.environ.get("BAT_UA", "estado-mcp-bateria/1.0")
 
@@ -143,10 +144,31 @@ def puerta_A():
         caso("A", "modo autonomo: no se puede salir del directorio del sitio", _a_sitios_fuga)
     else:
         salto("A", "sitios servidos por el propio canal", "sin BAT_SITIO (instalacion con proxy delante)")
-    n_tools = int(os.environ.get("BAT_TOOLS", "53"))
-    caso("A", f"tools/list expone las {n_tools} herramientas",
-         lambda: assert_(len(rpc(T1, "tools/list")["result"]["tools"]) == n_tools,
-                         f"hay {len(rpc(T1,'tools/list')['result']['tools'])}"))
+    caso("A", "el inventario de herramientas es coherente y estan las imprescindibles",
+         _a_inventario_tools)
+
+# Antes esto comparaba contra un numero escrito a mano (BAT_TOOLS=53). Se ponia en
+# rojo cada vez que se anadia una herramienta legitima, sin haber detectado nunca
+# nada: un caso que solo sabe gritar cuando el cambio es correcto ensena a ignorarlo.
+# Ahora comprueba dos cosas que si importan y se mantienen solas: que las dos vias
+# por las que el canal se describe (tools/list y parametros) digan LO MISMO -- si una
+# tool deja de declarar sus parametros, se ve -- y que no falte ninguna pieza sin la
+# que el canal no es el canal.
+IMPRESCINDIBLES = ("whoami", "state_overview", "parametros", "msg_send", "msg_inbox",
+                   "msg_hilo", "sol_cerrar", "cartel_publicar", "cartel_confirmar",
+                   "puerto_reservar", "fecha_comprometer", "decision_log", "search")
+
+def _a_inventario_tools():
+    lista = {t["name"] for t in rpc(T1, "tools/list")["result"]["tools"]}
+    decl = call(T1, "parametros")
+    declaradas = set(decl["herramientas"])
+    assert lista == declaradas, ("tools/list y parametros no coinciden: solo en lista="
+                                 + str(sorted(lista - declaradas)) + " solo en parametros="
+                                 + str(sorted(declaradas - lista)))
+    assert decl["total"] == len(lista), f"parametros dice {decl['total']} y hay {len(lista)}"
+    faltan = [t for t in IMPRESCINDIBLES if t not in lista]
+    assert not faltan, "faltan herramientas basicas: " + ", ".join(faltan)
+    assert len(lista) >= 40, f"solo {len(lista)} herramientas: parece que se perdio media API"
 
 def assert_(cond, msg=""):
     assert cond, msg
@@ -220,6 +242,8 @@ def puerta_B():
          lambda: assert_("error" in rpc(T1, "metodo/inexistente"), "no devolvió error JSON-RPC"))
     caso("B", "un parametro que no existe se RECHAZA, no se ignora", _b_extra_rechazado)
     caso("B", "el catalogo declara additionalProperties:false", _b_esquema_declara_estricto)
+    caso("B", "un rechazo llega con isError=True, no solo con el texto", _b_rechazo_va_marcado)
+    caso("B", "una llamada valida NO llega marcada como error", _b_lo_correcto_no_va_marcado)
     caso("B", "parametros() publica lo que acepta cada herramienta", _b_parametros_se_publican)
     caso("B", "cuerpo no-JSON → rechazo controlado",
          lambda: assert_(status_de(lambda: http("POST", f"{BASE}/{T1}/mcp", b"esto no es json",
@@ -231,6 +255,39 @@ def puerta_B():
         caso("B", "User-Agent de librería → 403 del CDN (OP-085 sigue vigente)",
              lambda: assert_(status_de(lambda: rpc(T1, "tools/list", ua="Python-urllib/3.10")) == 403,
                     "el CDN dejó pasar el UA de urllib"))
+
+def _b_rechazo_va_marcado():
+    """Un rechazo tiene que llegar MARCADO como rechazo, no solo escrito.
+
+    Hasta el 3-sep-2026 las validaciones devolvian "ERROR: ..." con isError=False:
+    un cliente que hacia LO CORRECTO —fiarse de isError— se tragaba el rechazo como
+    si fuera un envio realizado, y el que leia el texto a mano se salvaba por
+    accidente. Lo encontro editorial revisando su cliente por CART-014.
+
+    Se prueban varias familias de validacion, no una, porque el arreglo envuelve el
+    decorador y tiene que valer para todas."""
+    casos = [
+        ("cartel_publicar", {"tipo": "inventado", "asunto": "x", "cuerpo": "y"}),
+        ("sol_cerrar",      {"ref": "SOL-999999"}),
+        ("msg_send",        {"para": "no-existe-nadie", "asunto": "x", "cuerpo": "y"}),
+        ("puerto_liberar",  {"puerto": 65530}),
+    ]
+    malos = []
+    for nombre, args in casos:
+        r = rpc(T1, "tools/call", {"name": nombre, "arguments": args})
+        res = r.get("result", {})
+        txt = "\n".join(c.get("text", "") for c in res.get("content", []))
+        if not res.get("isError"):
+            malos.append(f"{nombre} rechaza pero isError={res.get('isError')}: {txt[:60]}")
+    assert not malos, "; ".join(malos)
+
+def _b_lo_correcto_no_va_marcado():
+    """Y al reves: una llamada buena NO puede llegar marcada como error, o el
+    cliente que se fie de isError descartara resultados validos."""
+    for nombre in ("whoami", "parametros", "participantes"):
+        r = rpc(T1, "tools/call", {"name": nombre, "arguments": {}})
+        res = r.get("result", {})
+        assert not res.get("isError"), f"{nombre} es valida y llega con isError=True"
 
 def _b_extra_rechazado():
     """Un parametro que no existe debe RECHAZARSE. Si se ignora, quien llama cree
@@ -292,6 +349,13 @@ def puerta_C():
         caso("C", "el servidor NO guarda tokens en texto plano (solo hashes)", _c_sin_texto_plano)
     else:
         salto("C", "tokens sin texto plano", "sin BAT_SSH")
+    if SSH:
+        caso("C", "el token no queda escrito en claro en el log del servicio", _c_token_no_aparece_en_logs)
+    else:
+        salto("C", "token fuera de los logs", "sin BAT_SSH")
+    caso("C", "rotacion por codigo: el cliente propone su token y los rechazos aguantan", _c_rotacion_por_codigo)
+    caso("C", "la frase de seguridad protege alta/baja/rotacion y registra los fallos", _c_frase_protege_credenciales)
+    caso("C", "una confirmacion vieja NO cuenta para la rotacion siguiente", _c_confirmar_no_vale_para_siempre)
     caso("C", "alta remota: invitación de un solo uso + aprobación de la autoridad", _c_alta_remota)
     caso("C", "la invitación trae un texto listo para pegar, con script válido", _c_texto_invitacion)
     caso("C", "subdominio de un no-autoridad queda PENDIENTE y no puede desplegar", _c_sub_pendiente)
@@ -388,6 +452,88 @@ def _c_sin_texto_plano():
                        capture_output=True, text=True, timeout=30)
     assert r.stdout.strip() in ("0", ""), f"el token de T1 aparece en {pf}"
 
+def _c_token_no_aparece_en_logs():
+    """El token viaja en la ruta, asi que cada linea de acceso es una credencial
+    escrita en journald. El 2-sep-2026 habia 847 peticiones registradas asi, entre
+    Caddy y el propio servidor. Un secreto en un log no se puede desescribir: la
+    unica reparacion posible es rotar, asi que este caso existe para que no vuelva
+    a ocurrir en silencio."""
+    call(T1, "whoami")                       # deja una linea de acceso recien hecha
+    unidad = os.environ.get("BAT_SERVICIO", "evastate-test")
+    r = subprocess.run(SSH.split() + [
+        f"sudo journalctl -u {unidad} --since '2 min ago' --no-pager -o cat | "
+        f"grep -cF {T1} || true"], capture_output=True, text=True, timeout=40)
+    assert r.stdout.strip() in ("0", ""), \
+        f"el token de T1 aparece EN CLARO en el log de {unidad}"
+    r2 = subprocess.run(SSH.split() + [
+        f"sudo journalctl -u {unidad} --since '2 min ago' --no-pager -o cat | "
+        f"grep -c '/\\[{ID1}\\]/' || true"], capture_output=True, text=True, timeout=40)
+    assert r2.stdout.strip() not in ("0", ""), \
+        "no se registra ni la version censurada: se perdio la linea de acceso entera"
+
+def _c_rotacion_por_codigo():
+    """El canje de rotacion: el CLIENTE genera su token y lo propone; el servidor no
+    emite ni transmite ninguno. Asi es como se evita que una credencial acabe en una
+    URL, en un log o en un fichero compartido — que es como acabaron el 2-sep-2026.
+    Aqui se comprueban los rechazos, que son la parte que protege; el canje bueno
+    cambia credenciales vivas y se prueba a mano contra el sandbox."""
+    import urllib.request, urllib.error
+    def post(cuerpo):
+        req = urllib.request.Request(BASE + "/rotacion", json.dumps(cuerpo).encode(),
+              {"Content-Type": "application/json", "User-Agent": UA})
+        try:
+            return 200, urllib.request.urlopen(req, timeout=20).read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+    c, _ = post({"codigo": "x", "token_propuesto": "corto"})
+    assert c == 400, f"acepta un token propuesto invalido ({c})"
+    c, _ = post({"codigo": "noexisteestecodigo", "token_propuesto": "a" * 40})
+    assert c == 403, f"un codigo inventado no da 403 sino {c}"
+    c, _ = post({"codigo": "noexisteestecodigo", "token_propuesto": T1})
+    assert c in (403, 409), f"deja proponer un token YA EN USO ({c})"
+    try:
+        r = call(T2, "rotacion_invitar", {"id": ID2})
+        raise AssertionError(f"un participante sin autoridad emite codigos: {str(r)[:80]}")
+    except Rechazo as e:
+        assert "autoridad" in str(e), f"rechazo por otro motivo: {e}"
+
+def _c_frase_protege_credenciales():
+    """Poner el ciclo de vida de credenciales en la consola sube lo que consigue quien
+    robe el token de autoridad: de leer/escribir a ACUNAR Y REVOCAR IDENTIDADES. El
+    segundo factor es lo que paga esa escalada, y estos son sus tres modos."""
+    for herr, args in (("participante_baja", {"id": ID2}),
+                       ("rotacion_invitar", {"id": ID2}),
+                       ("rotacion_cerrar", {})):
+        try:
+            r = call(T1, herr, args)
+            raise AssertionError(f"{herr} paso SIN frase: {str(r)[:90]}")
+        except Rechazo as e:
+            assert "frase" in str(e).lower(), f"{herr} rechaza por otro motivo: {e}"
+    try:
+        call(T1, "participante_baja", {"id": ID2, "frase": "esta-no-es-la-frase"})
+        raise AssertionError("acepta una frase incorrecta")
+    except Rechazo as e:
+        assert "incorrecta" in str(e), f"rechazo raro con frase mala: {e}"
+    if os.environ.get("BAT_FRASE"):
+        n = call(T1, "intentos_frase", {"limite": 5})
+        assert isinstance(n, list) and n, "el intento fallido no queda registrado"
+
+def _c_confirmar_no_vale_para_siempre():
+    """Una confirmacion lleva el identificador de LA rotacion que confirmaba. Sin eso,
+    haber confirmado una vez contaba para todas las siguientes y rotacion_cerrar
+    retiraba el token de quien nunca confirmo el nuevo — dejandolo fuera del canal,
+    que es justo lo que este mecanismo entero existe para impedir. Encontrado el
+    2-sep-2026 rotando dos veces seguidas el mismo id."""
+    r = call(T1, "token_confirmar")
+    assert isinstance(r, dict) and r.get("estado") == "sin_rotacion_en_curso", \
+        f"confirma sin rotacion abierta: {r}"
+    est = call(T1, "rotacion_estado")
+    assert isinstance(est, dict) and "participantes" in est, f"rotacion_estado roto: {str(est)[:90]}"
+    for f in est["participantes"]:
+        if not f["en_rotacion"]:
+            assert not f.get("confirmacion_vieja_ignorada") or f["confirmado"] is None, \
+                f"{f['id']} no rota y aun asi figura confirmado"
+
 def _c_texto_invitacion():
     """El texto debe servir sin editar nada: con el codigo dentro, el host real
     y un script que al menos sea Python valido (si no, el cowork se atasca)."""
@@ -432,13 +578,13 @@ def _c_alta_remota():
     except Exception:
         pass
     try:
-        call(T2, "alta_aprobar", {"id": pid})
+        call(T2, "alta_aprobar", {"id": pid, "frase": FRASE})
         assert False, "un no-autoridad pudo aprobar altas"
     except Rechazo:
         pass
     pend = call(T1, "altas_pendientes")
     assert any(i.get("id") == pid for i in pend), f"{pid} no esta en pendientes"
-    ok = call(T1, "alta_aprobar", {"id": pid})
+    ok = call(T1, "alta_aprobar", {"id": pid, "frase": FRASE})
     assert ok.get("accion") == "aprobada", ok
     w = call(tok_nuevo, "whoami")
     assert w["id"] == pid and w.get("alta_via") == "registro", w
@@ -450,6 +596,9 @@ def puerta_D():
     caso("D", "aviso llega a la bandeja del destinatario y msg_ack lo atiende", _d_ciclo_msg)
     caso("D", "solicitud recibe ref SOL-N; ref explícita única; duplicada se rechaza; contador salta", _d_refs)
     caso("D", "respuesta enlaza con responde_a y msg_hilo la reconstruye", _d_hilo)
+    caso("D", "las lecturas no recortan en silencio con la base crecida", _d_lectura_no_recorta)
+    caso("C", "rotacion: no se confirma sin rotacion abierta y el estado es solo de la autoridad", _c_rotacion_no_deja_a_nadie_fuera)
+    caso("D", "cartelera: quien esta exento no figura como pendiente", _d_cartelera_respeta_quien_no_confirma)
     caso("D", "fact_set/fact_get conservan acentos y eñes (UTF-8 íntegro)", _d_utf8)
     caso("D", "decision_log queda y decision_list la devuelve", _d_decision)
     caso("D", "search encuentra lo escrito", _d_search)
@@ -470,6 +619,62 @@ def puerta_D():
     caso("D", "fechas: mover exige motivo y bloquear exige causa", _d_fecha_exige_motivo)
     caso("D", "fechas: una vencida aparece sola en el overview", _d_fecha_en_overview)
     caso("D", "overview: esperando_respuesta lista mis solicitudes abiertas (D9)", _d_esperando)
+    caso("D", "D11: el emisor ve si el otro YA LEYO su solicitud, y el sello no se reescribe", _d11_acuse_lectura)
+    caso("D", "D11: el permiso de cierre viaja con la solicitud y se cumple", _d11_permiso_viaja_con_el_objeto)
+    caso("D", "D11: una escritura que no es mensaje cuenta como senal de vida", _d11_actividad_no_epistolar)
+
+# ── D11 · el desencuentro produccion/voicetf del 30-ago no puede repetirse ──
+# Los tres casos siguientes son la traduccion literal de aquel dia: cada uno fija
+# una de las tres cosas que el canal permitia creer y no permitia comprobar.
+
+def _d11_acuse_lectura():
+    """Antes: el emisor no podia distinguir 'no la ha abierto' de 'la vio y no
+    contesta'. Produccion espero por la primera creyendo la segunda."""
+    a = "acuse d11 " + RUN
+    r = call(T1, "msg_send", {"para": ID2, "tipo": "solicitud", "asunto": a, "cuerpo": "x"})
+    ref = r["ref"]
+    def _mia():
+        ov = call(T1, "state_overview")
+        m = [x for x in ov.get("esperando_respuesta", []) if x.get("ref") == ref]
+        assert m, f"{ref} no figura en esperando_respuesta"
+        return m[0]
+    antes = _mia()
+    assert "AUN NO LA HA ABIERTO" in antes["lectura"], antes
+    call(T2, "msg_inbox")                     # el destinatario la tiene delante
+    despues = _mia()
+    assert "LA LEYO" in despues["lectura"], despues
+    # y el sello no se mueve al releer: es la PRIMERA vez, no la ultima
+    call(T2, "msg_inbox")
+    assert _mia()["lectura"] == despues["lectura"], "el acuse se reescribe al releer"
+
+def _d11_permiso_viaja_con_el_objeto():
+    """Antes: voicetf afirmo que el emisor no podia cerrar su propia solicitud.
+    Era falso, produccion le creyo, y la solicitud quedo abierta de adorno."""
+    a = "permiso d11 " + RUN
+    ref = call(T1, "msg_send", {"para": ID2, "tipo": "solicitud", "asunto": a, "cuerpo": "x"})["ref"]
+    m = [x for x in call(T1, "state_overview").get("esperando_respuesta", []) if x["ref"] == ref]
+    assert m and m[0].get("puedes_cerrarla_tu") is True, "el overview no dice que puedo cerrarla"
+    assert "sol_cerrar" in m[0].get("como", ""), "no dice COMO cerrarla"
+    r = call(T1, "sol_cerrar", {"ref": ref})   # y lo que promete, se cumple
+    assert r.get("accion") == "respondida", f"prometio que podia y no pude: {r}"
+
+def _d11_actividad_no_epistolar():
+    """Antes: produccion dedujo de su bandeja que voicetf llevaba dias callado,
+    cuando voicetf habia reservado tres puertos y respondido un cartel ese dia.
+    Una escritura que no es un mensaje tiene que contar como senal de vida."""
+    import random
+    pto = random.randint(21000, 21999)
+    call(T2, "puerto_reservar", {"puerto": pto, "servicio": "senal-vida-" + RUN})
+    act = call(T1, "state_overview").get("actividad_de_todos", {})
+    assert ID2 in act, "el overview no informa de la actividad de los demas"
+    e = act[ID2].get("ultima_escritura")
+    assert e, f"una reserva de puerto no cuenta como escritura: {act[ID2]}"
+    assert act[ID2].get("ultimo_escrito") == "puerto", act[ID2]
+    assert act[ID2].get("ultima_conexion"), "conectarse no deja huella"
+    ps = call(T1, "participantes")
+    yo2 = [p for p in ps if p.get("id") == ID2]
+    assert yo2 and yo2[0].get("ultima_escritura") == e, "participantes() no lleva la huella"
+    call(T2, "puerto_liberar", {"puerto": pto})
 
 def _d_ciclo_msg():
     call(T1, "msg_send", {"para": ID2, "asunto": "ciclo completo",
@@ -481,6 +686,59 @@ def _d_ciclo_msg():
     m2 = [x for x in call(T2, "msg_inbox") if x["asunto"] == "ciclo completo"
           and x["_id"] == m[-1]["_id"]]
     assert not m2, "sigue pendiente tras el ack"
+
+def _d_lectura_no_recorta():
+    """Con ORDER BY id ASC + LIMIT N, pasado el mensaje N las lecturas devuelven los
+    N mas VIEJOS y tiran los recientes SIN AVISAR. Solo muerde en una base ya crecida
+    -- que es exactamente cuando importa -- asi que en una instalacion nueva este caso
+    pasa de forma trivial. Se deja igual: el dia que la base crezca, avisa."""
+    a = "no recorta " + RUN
+    r = call(T1, "msg_send", {"para": ID2, "tipo": "solicitud", "asunto": a, "cuerpo": "x"})
+    ref = r["ref"]
+    call(T2, "msg_send", {"para": ID1, "tipo": "respuesta", "responde_a": ref,
+                          "asunto": "re " + a, "cuerpo": "y"})
+    hilo = call(T1, "msg_hilo", {"ref": ref})
+    assert len(hilo) == 2, f"msg_hilo devolvio {len(hilo)} de 2 (recorte silencioso)"
+    hoy = call(T1, "msg_desde", {"fecha_iso": r["_creado"][:10] if "_creado" in r else "2000-01-01"})
+    assert any(m.get("asunto") == a for m in hoy), "msg_desde no trae lo recien escrito"
+
+def _c_rotacion_no_deja_a_nadie_fuera():
+    """La parte que se puede comprobar sin ser root: que token_confirmar NO se deja
+    confirmar por quien no esta rotando, y que rotacion_estado es solo de la autoridad.
+    El ciclo completo (rotar / confirmar / cerrar) exige el guion de admin y se prueba
+    a mano; queda anotado en PROTOCOLO-PRUEBAS.md por honestidad."""
+    r = call(T1, "token_confirmar")
+    assert isinstance(r, dict) and r.get("estado") == "sin_rotacion_en_curso", \
+        f"confirma una rotacion que no existe: {r}"
+    # T2 es el que NO tiene autoridad. Lo compruebo en vez de darlo por hecho: la
+    # primera version de este caso uso T1 y salio en rojo porque T1 SI la tiene en
+    # esta instalacion. El caso estaba mal, no el servidor.
+    yo2 = call(T2, "whoami")
+    if yo2.get("autoridad"):
+        return   # instalacion donde ambos son autoridad: nada que comprobar aqui
+    try:
+        r2 = call(T2, "rotacion_estado")
+        raise AssertionError(f"un participante sin autoridad ve la rotacion: {str(r2)[:120]}")
+    except Rechazo as e:
+        assert "solo la autoridad" in str(e), f"rechazo por otro motivo: {e}"
+    r3 = call(T1, "rotacion_estado")
+    assert isinstance(r3, dict) and "participantes" in r3, \
+        f"la autoridad NO puede consultarlo: {str(r3)[:120]}"
+
+def _d_cartelera_respeta_quien_no_confirma():
+    """Un participante marcado con confirma_cartelera=false no debe figurar como
+    pendiente: su nombre ahi hace parecer incompleta una cartelera que si lo esta,
+    y eso ensena a ignorar la lista de pendientes."""
+    r = call(T1, "participantes")
+    exentos = [p["id"] for p in r if p.get("confirma_cartelera") is False]
+    if not exentos:
+        return   # instalacion sin nadie exento: nada que comprobar
+    for c in call(T1, "cartelera"):
+        e = call(T1, "cartel_estado", {"ref": c["ref"]})
+        if isinstance(e, dict):
+            for x in exentos:
+                assert x not in (e.get("pendientes") or []), \
+                    f"{x} esta exento y sigue como pendiente en {c['ref']}"
 
 def _d_refs():
     r1 = call(T1, "msg_send", {"para": ID2, "asunto": "sol auto",

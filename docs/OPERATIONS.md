@@ -108,6 +108,91 @@ extra service. To enable it on a fresh install:
    authority (approve/veto registrations, publish on the bulletin board)
    only appear for identities flagged with `participante.py autoridad`.
 
+## The security phrase (second factor for credentials)
+
+Putting the participant lifecycle in the console changes what stealing the
+authority's token buys: from read/write on the channel to **minting and revoking
+identities**. A second factor pays for that escalation.
+
+```
+# once, by hand, over SSH — never through the API:
+EVASTATE_FRASE_SHA256=$(printf %s 'your phrase' | sha256sum | cut -d' ' -f1)
+```
+
+Put it in `/etc/evastate.env` and restart. It gates `alta_aprobar`,
+`participante_baja`, `participante_cartelera`, `rotacion_invitar`,
+`rotacion_anular` and `rotacion_cerrar`; each takes a `frase` argument.
+
+Three properties worth stating:
+
+- **It cannot be set through the API**, deliberately. A secret that protects an
+  operation must not be settable with the credential that operation protects.
+- **If it is missing, those operations are refused, not relaxed.** A protection
+  that silently disappears when its configuration is absent is worse than none,
+  because nobody notices.
+- **Wrong attempts are recorded** and readable with `intentos_frase()`. A failure
+  you do not recognise means someone holds an authority token they should not.
+
+The phrase travels in the request body, never in the URL — see the token-in-logs
+limit in SCOPE-AND-LIMITS.md for why that distinction matters here.
+
+## Rotating tokens without cutting anyone off
+
+Replacing a token in one step locks the participant out at the exact moment
+they most need the channel: to report that they cannot get in. The report would
+have to travel over the channel they were just removed from. So rotation is two
+phases, and the gate is the participant's own hands.
+
+From the console (no SSH, no shell):
+
+```
+rotacion_invitar(id, frase)   -> a single-use code, shown once
+   the client redeems it at POST /rotacion with a token IT generated
+rotacion_estado()             -> who has confirmed, next to their last connection
+rotacion_cerrar(frase)        -> retires the old tokens
+rotacion_anular(id, frase)    -> voids a code you lost, so you can issue another
+```
+
+**The server never mints or transmits a token.** The client generates its own and
+proposes it; only the SHA-256 is stored. That is what keeps credentials out of
+URLs, logs and shared files. The one-time code is a permission, not a credential,
+so it is safe to hand over through a weaker channel.
+
+`rotacion_anular` exists because the code is shown once: losing it used to block
+that participant until expiry. Found by losing one.
+
+A confirmation carries the id of **the rotation it confirmed**. Without that,
+having confirmed once counted for every later rotation, and closing would retire
+the token of someone who never confirmed the new one — cutting them out of the
+channel, which is the exact failure this whole mechanism exists to prevent.
+
+`sudo participante.py rotar` still exists for installations without a console.
+
+- `rotar` keeps the previous token's hash as `token_anterior_sha256`. Both open
+  the door. Entering with the old one is answered with a loud line at the top of
+  the connection greeting, and `whoami` says which token was used.
+- `token_confirmar()` only counts when the call **arrives with the new token**.
+  Nobody can confirm by mistake, or in good faith, without having actually
+  tested it.
+- `cerrar-rotacion` **refuses** while anyone is unconfirmed, and prints who.
+  `--forzar` exists but has to be typed deliberately.
+- `rotacion_estado()` (authority only) shows, next to each confirmation, that
+  participant's last connection — so "they are ignoring me" can be told apart
+  from "they have not come back yet" before anyone is cut off.
+
+Deliver the new token out of band. A token sent as a channel message is stored
+in the database and in every daily backup, which defeats the point of rotating.
+
+## Participants who do not confirm the bulletin board
+
+`sudo participante.py cartelera <id> no` sets `confirma_cartelera: false`. That
+identity stops being added to `dirigido_a` on new notices and stops counting as
+outstanding on existing ones. It is meant for the authority the rules come from:
+asking them to acknowledge their own rule is noise, and their name sitting in
+`pendientes` makes a complete board look incomplete — which teaches everyone to
+ignore the pending list. It is an attribute rather than a special case on an id,
+so it applies to whoever needs it.
+
 ### Remembering the token on a device (PIN)
 
 Pasting a full token on every visit pushes people towards worse habits, so the

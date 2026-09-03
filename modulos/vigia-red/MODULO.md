@@ -5,18 +5,27 @@ changes. It learns the host's own normal level from its history instead of using
 a threshold someone guessed, so it works on a busy server and on an idle one
 without being told which is which.
 
-It speaks up on two conditions:
+It speaks up on two independent conditions:
 
-- **Packets an order of magnitude above the median** of what this host usually
-  sees.
-- **Outbound traffic starting to track inbound.** This is the one that matters.
-  Scanning that a firewall drops arrives and gets no answer, so bytes in stay
-  high while bytes out stay flat. The moment out starts following in, the server
-  is *answering* — which is either real traffic or something that should not be
-  reachable.
+- **Packets an order of magnitude above the median for that hour of day.**
+  Comparing against one median for all hours makes the watcher deaf at night.
+  Measured on a real host over 60 samples: ~1395 packets/min by day, ~170 at
+  night — eight times less. Against the global median of 1221, an attack pushing
+  1200 packets/min at 3am is seven times that hour's normal and still lands
+  *below* the threshold. The baseline is therefore taken from the same hour ±1,
+  falling back to the global median until that hour has five samples.
+- **Outbound traffic starting to track inbound.** This is the one that matters,
+  and it is deliberately **not** gated behind a volume threshold. Scanning that
+  a firewall drops arrives and gets no answer, so bytes in stay high while bytes
+  out stay flat. The moment out starts following in, the server is *answering*.
+  A competent intruder is quiet — low volume, high response ratio — which is
+  exactly the case a volume gate hides. The ratio is compared against this
+  host's own normal ratio, above a small floor so near-idle traffic does not
+  produce noise.
 
 A watcher that reports every day gets ignored by the third one. This one is
-designed to be silent for weeks.
+designed to be silent for weeks — but silence has to come from nothing
+happening, not from a threshold nothing can reach.
 
 ## What it requires
 
@@ -55,8 +64,21 @@ minutes each hour, so a burst that starts and ends between samples is invisible.
 That is a deliberate trade: continuous capture costs CPU and creates a log worth
 attacking.
 
-**The first runs are quiet by design.** It needs five samples before it has any
-idea what normal looks like, and will not raise anything until then.
+**The first runs are quiet by design.** It needs five samples in an hour band
+before it will judge volume, and ten before it will judge the response ratio.
+Until then it only accumulates. Expect roughly a day of silence on a fresh
+install, and a week before the hour-of-day baselines are worth much.
+
+**Upgrading from the first version discards the history once.** v1 stored a bare
+packet count per sample with no hour and no byte figures, which cannot support
+either of the tests above. Those samples are dropped on first run of v2 and the
+watcher rebuilds from scratch. It happens once, not on every run.
+
+**Thresholds are judgment, not proof.** Ten times the hourly normal, and three
+times the usual response ratio, are choices — a spike at seven times the night
+baseline stays silent. They are set to buy weeks of silence at the cost of
+missing the subtlest cases. If this host ever sees a real incident, re-derive
+them from what it actually looked like rather than from taste.
 
 ## Install
 

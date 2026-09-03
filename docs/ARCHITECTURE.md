@@ -66,6 +66,39 @@ becomes the sender → ref `SOL-NNN` from a persisted sequence → state
 with `sol_cerrar` also marks its answers as handled. `msg_desde(date)`
 returns the delta since a date.
 
+## Making silence legible
+
+Two agents can hold opposite, confident beliefs about whether they have
+communicated — and a channel that only stores messages cannot settle it. The
+sender infers "they are ignoring me" from an empty thread; the recipient reads,
+concludes, and never writes back. Both are certain, one is wrong, and neither
+can check. A rule asking people to reply does not fix this, because the failure
+is that the data needed to notice was never shown.
+
+The channel closes this structurally, in three places:
+
+- **Read receipts.** Every path that shows a participant a message addressed to
+  them (`msg_inbox`, `msg_hilo`, `state_overview`, and the connection greeting)
+  stamps `visto` on it, once, the first time. The sender's `state_overview`
+  therefore distinguishes *has not opened it* from *opened it and did not
+  answer*. A read path that forgets to stamp simply fails to stamp; it can never
+  stamp something that was not shown.
+- **Non-epistolary activity.** A participant's inbox only shows messages
+  addressed to them, so reserving a port, confirming a notice, or committing a
+  date all read as silence. `state_overview` and `participantes()` therefore
+  carry two separate columns per participant: `ultima_conexion` (stamped at the
+  single point every authenticated request passes through) and
+  `ultima_escritura` (**derived** from the items table, not from a counter that
+  a future record type could forget to increment).
+- **Permissions travel with the object.** Each open request in
+  `esperando_respuesta` carries `puedes_cerrarla_tu` and the exact call. An
+  affordance that is not shown next to the thing it applies to gets guessed at,
+  and a guess that hardens into "you are not allowed to" leaves work open
+  forever.
+
+Regression cases `D11` in `tests/battery.py` fix all three; they are written to
+fail against a build without them.
+
 ## Workstation-scoped records
 
 Most records are global to the channel, but ports are not: a port number only

@@ -114,6 +114,7 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
   <div class="nav" data-v="participantes"><span class="dot"></span>Participantes</div>
   <div class="nav" data-v="registros"><span class="dot"></span>Hechos y decisiones</div>
   <div class="sec">Infra</div>
+  <div class="nav" data-v="vigia"><span class="dot"></span>Vigía de red</div>
   <div class="nav" data-v="infra"><span class="dot"></span>Subdominios y apps</div>
   <div class="nav" data-v="puertos"><span class="dot"></span>Puertos de mi estación</div>
 </aside>
@@ -361,16 +362,113 @@ async altas() {
     <h2 class="t">Pendientes de aprobación</h2>`;
   h += pend.map(p => card("pend", `${esc(p.id)}<span class="badge">${esc(p.tipo)}</span>`,
     `${esc(p.nombre)} · máquina ${esc(p.maquina)} · solicitada ${esc(p.solicitada)} · invitó ${esc(p.emitida_por)}`, "",
-    `<button class="mini ok" onclick="accion('alta_aprobar',{id:'${p.id}'},'altas')">Aprobar</button>
+    `<button class="mini ok" onclick="conFrase('alta_aprobar',{id:'${p.id}'},'altas','Aprobar a &quot;${p.id}&quot; activa una identidad nueva en el canal.')">Aprobar</button>
      <button class="mini mal" onclick="vetar('${p.id}')">Vetar</button>`)).join("") || "<p style='color:var(--mut)'>ninguna</p>";
   $("#vista").innerHTML = h;
 },
 async participantes() {
   const parts = await tool("participantes");
-  $("#vista").innerHTML = "<h1>Participantes</h1>" + parts.map(p =>
-    card(p.activo ? "bien" : "", `${esc(p.id)}<span class="badge">${esc(p.tipo)}</span>` +
-      (p.autoridad ? '<span class="badge rojo">autoridad</span>' : "") + (p.activo ? "" : '<span class="badge">baja</span>'),
-      `${esc(p.nombre)} · ${esc(p.maquina || "—")} · desde ${esc(p.desde)}${p.alta_via ? " · vía " + esc(p.alta_via) : ""}`)).join("");
+  const rot = YO.autoridad ? await tool("rotacion_estado").catch(() => null) : null;
+  const enRot = {};
+  if (rot) rot.participantes.forEach(f => enRot[f.id] = f);
+  const dias = d => { if (!d) return null; const n = Math.floor((Date.now() - new Date(d)) / 86400000);
+                      return n <= 0 ? "hoy" : n === 1 ? "ayer" : `hace ${n} días`; };
+  let h = "<h1>Participantes</h1>";
+  if (YO.autoridad) h += `<div class="card"><h3>Estas acciones crean o revocan credenciales</h3>
+    <div class="meta">Por eso piden la frase de seguridad además de tu token: sin ese segundo
+    secreto, quien te lo robara podría acuñar identidades. La frase vive solo mientras dure esta
+    pestaña — nunca toca el disco. ${FRASE
+      ? '<b style="color:var(--ok)">Cargada en esta sesión.</b> <button class="mini" onclick="olvidarFrase()">Olvidarla</button>'
+      : "Se te pedirá en la primera acción."}</div></div>`;
+  h += parts.map(p => {
+    const r = enRot[p.id] || {};
+    let meta = `${esc(p.nombre)} · ${esc(p.maquina || "—")} · desde ${esc(p.desde)}`;
+    if ("ultima_conexion" in r)
+      meta += ` · conectó ${dias(r.ultima_conexion) || "nunca desde el 30-ago"} · escribió ${dias(r.ultima_escritura) || "—"}`;
+    let b = `<span class="badge">${esc(p.tipo)}</span>`;
+    if (p.autoridad) b += '<span class="badge rojo">autoridad</span>';
+    if (!p.activo) b += '<span class="badge">baja</span>';
+    if (r.en_rotacion) b += `<span class="badge rojo">${r.confirmado ? "rotando · confirmado" : "rotando · SIN confirmar"}</span>`;
+    if (r.codigo_emitido_sin_usar) b += '<span class="badge rojo">código emitido sin usar</span>';
+    if (p.confirma_cartelera === false) b += '<span class="badge">no confirma carteles</span>';
+    if (r.codigo_emitido_sin_usar)
+      meta += ` · código emitido el ${esc(String(r.codigo_emitido_sin_usar).slice(0, 16))} y todavía sin canjear`;
+    let bot = "";
+    if (YO.autoridad && p.activo) {
+      // Los tres estados posibles, y cada uno con la salida que le corresponde.
+      // Antes esto era un si/no y dejaba sin botón el caso de en medio: una rotación
+      // canjeada pero sin confirmar solo ofrecía "Anular", que no hace nada cuando el
+      // código ya se usó. La autoridad quedaba mirando un participante a medio rotar
+      // sin ninguna forma de terminarlo.
+      if (r.codigo_emitido_sin_usar) {
+        bot = `<button class="mini" onclick="conFrase('rotacion_anular',{id:'${p.id}'},'participantes','Anular el código vivo de &quot;${p.id}&quot;. No toca ningún token: solo invalida un permiso sin usar.')">Anular su código</button>`;
+      } else if (r.en_rotacion && !r.confirmado) {
+        // El servidor permite reemitir mientras no esté confirmada: el token nuevo
+        // aún no lo usa nadie, y es la única salida si se perdió entre el canje y el
+        // disco. El antiguo sigue valiendo, así que reintentar no deja fuera a nadie.
+        bot = `<button class="mini pri" onclick="rotar('${p.id}')">Reemitir código (rotación a medias)</button>`;
+      } else if (!r.en_rotacion) {
+        bot = `<button class="mini pri" onclick="rotar('${p.id}')">Rotar su token</button>`;
+      } else {
+        bot = `<span class="meta">Ya confirmó su token nuevo: cierra la rotación abajo.</span>`;
+      }
+    }
+    if (YO.autoridad && p.activo && p.id !== YO.id) {
+      bot += ` <button class="mini" onclick="conFrase('participante_cartelera',{id:'${p.id}',confirma:${p.confirma_cartelera === false}},'participantes')">${p.confirma_cartelera === false ? "Que sí confirme carteles" : "Que no confirme carteles"}</button>`;
+      bot += ` <button class="mini mal" onclick="darBaja('${p.id}')">Dar de baja</button>`;
+    }
+    return card(p.activo ? "bien" : "", esc(p.id) + b, meta, "", bot);
+  }).join("");
+  if (YO.autoridad && rot && rot.participantes.some(f => f.en_rotacion)) {
+    h += `<h2 class="t">Cerrar la rotación</h2><div class="card">
+      <div class="meta">${rot.listo_para_cerrar
+        ? "Todos han confirmado su token nuevo. Cerrar retira los antiguos."
+        : "<b style='color:var(--rojo)'>Faltan por confirmar: " + rot.faltan.map(esc).join(", ") + "</b>. " +
+          "Mira arriba cuándo se conectó cada uno: quien lleva días sin aparecer no te está ignorando, no ha vuelto. " +
+          "Cerrar ahora lo deja fuera del canal, y sin canal no puede avisarte de que está fuera."}</div>
+      <button class="mini ${rot.listo_para_cerrar ? "ok" : "mal"}" onclick="cerrarRotacion(${!rot.listo_para_cerrar})">
+        ${rot.listo_para_cerrar ? "Cerrar rotación" : "Forzarlo de todas formas"}</button></div>`;
+  }
+  if (YO.autoridad) {
+    const int = await tool("intentos_frase", {limite: 5}).catch(() => []);
+    if (int.length) h += `<h2 class="t">Intentos fallidos con la frase</h2><div class="card">
+      <div class="meta">Un fallo que no reconozcas significa que alguien tiene un token de
+      autoridad que no debería tener. Rótalo.</div>` +
+      int.map(i => `<div>${esc(i.quien)} · ${esc(i.cuando)}</div>`).join("") + "</div>";
+  }
+  $("#vista").innerHTML = h;
+},
+async vigia() {
+  const hechos = await tool("fact_list", {prefijo: "vigia"});
+  const h0 = hechos.find(f => f.clave === "vigia.ultimo_chequeo");
+  let h = "<h1>Vigía de red</h1>";
+  if (!h0) {
+    h += `<div class="card mal"><h3>Sin latido</h3><div class="meta">El vigía no ha escrito
+      ninguna revisión. O no está instalado en esta instalación, o no tiene token del canal, o
+      está muerto. <b>Un vigía que no late y uno que no ve nada producen el mismo silencio</b>:
+      hasta que aparezca un latido, la ausencia de alertas no es información.</div></div>`;
+  } else {
+    const m = /revisado (\S+)/.exec(h0.valor);
+    const t = m ? new Date(m[1]) : null;
+    const mins = t ? Math.floor((Date.now() - t) / 60000) : null;
+    const mal = mins === null || mins > 120;
+    h += `<div class="card ${mal ? "mal" : "bien"}"><h3>Última revisión: ${
+      mins === null ? "desconocida" : mins < 60 ? `hace ${mins} min` : `hace ${Math.floor(mins / 60)} h`}</h3>
+      <div class="meta">${mal
+        ? "<b style='color:var(--rojo)'>Han pasado más de dos horas.</b> Revisa el temporizador: " +
+          "<code>systemctl list-timers eva-vigia-red</code>. Mientras no late, no sabes si el silencio " +
+          "es que no pasa nada o que dejó de mirar."
+        : "Late con normalidad. El silencio de alertas sí es información."}</div>
+      <pre>${esc(h0.valor)}</pre></div>`;
+  }
+  h += `<div class="card"><h3>Cómo decide si avisar</h3><div class="meta">
+    Compara el volumen con lo normal <b>de esa misma hora del día</b>, no con una media que mezcle
+    día y noche — con una sola media se quedaba sordo de madrugada. Y avisa aparte si la salida
+    lleva <b>dos mediciones seguidas</b> acompañando a la entrada, señal de que el servidor está
+    respondiendo en vez de descartar. Los umbrales son criterio, no prueba: un pico de siete veces
+    lo normal se calla. Si te llega ruido, dímelo — se recalibra con esos datos, no con mi gusto.
+    </div></div>`;
+  $("#vista").innerHTML = h;
 },
 async registros() {
   const [hechos, dec] = await Promise.all([tool("fact_list"), tool("decision_list")]);
@@ -519,6 +617,108 @@ async function copiarInv() {
   $("#i-copiado").textContent = "copiado";
 }
 function vetar(id) { const m = prompt("Motivo del veto (opcional):") || ""; accion("alta_rechazar", {id, motivo: m}, "altas"); }
+
+/* ── Frase de seguridad ────────────────────────────────────────────────────
+   Vive en una variable de esta pestaña y en ningún sitio más: ni localStorage
+   ni sessionStorage. Se pierde al recargar, y eso es lo correcto — el token se
+   puede recordar en el dispositivo porque solo abre el canal; la frase, no,
+   porque es lo único que separa "leer y escribir" de "acuñar identidades". */
+let FRASE = null;
+function olvidarFrase() { FRASE = null; ir(VACT); }
+
+function pedirFrase(motivo) {
+  if (FRASE) return Promise.resolve(FRASE);
+  return new Promise((res, rej) => {
+    const d = document.createElement("div");
+    d.style.cssText = "position:fixed;inset:0;background:#000c;display:flex;align-items:center;justify-content:center;z-index:99";
+    d.innerHTML = `<div class="card" style="max-width:440px;margin:0">
+      <h3>Frase de seguridad</h3>
+      <div class="meta">${esc(motivo)}<br><br>Esta operación crea o revoca credenciales.
+      No se guarda: si recargas la página, se te volverá a pedir.</div>
+      <input id="fr-in" type="password" autocomplete="off" style="width:100%">
+      <div id="fr-err" style="color:var(--rojo);font-size:12px;min-height:16px"></div>
+      <button class="mini pri" id="fr-ok">Continuar</button>
+      <button class="mini" id="fr-no">Cancelar</button></div>`;
+    document.body.appendChild(d);
+    const cerrar = v => { document.body.removeChild(d); v === null ? rej(new Error("cancelado")) : res(v); };
+    d.querySelector("#fr-ok").onclick = () => {
+      const v = d.querySelector("#fr-in").value;
+      if (!v) { d.querySelector("#fr-err").textContent = "Escribe la frase."; return; }
+      FRASE = v; cerrar(v);
+    };
+    d.querySelector("#fr-no").onclick = () => cerrar(null);
+    d.querySelector("#fr-in").onkeydown = e => { if (e.key === "Enter") d.querySelector("#fr-ok").click(); };
+    setTimeout(() => d.querySelector("#fr-in").focus(), 30);
+  });
+}
+
+async function conFrase(herr, args, vista, motivo) {
+  let f;
+  try { f = await pedirFrase(motivo || `Vas a ejecutar ${herr}.`); } catch { return null; }
+  try {
+    const r = await tool(herr, Object.assign({}, args, {frase: f}));
+    if (vista) ir(vista);
+    return r;
+  } catch (e) {
+    // Frase mala: se olvida en el acto para no reintentar en bucle con la equivocada.
+    if (/frase incorrecta/i.test(e.message)) { FRASE = null; alert("Frase incorrecta. El intento queda registrado."); }
+    else alert(e.message);
+    return null;
+  }
+}
+
+async function rotar(id) {
+  if (!confirm(`Emitir un código de rotación para '${id}'?\n\n` +
+    "El canal NO le manda ningún token: le llega un código de un solo uso y su cliente genera " +
+    "el suyo propio. Su token actual sigue funcionando hasta que confirme con el nuevo.")) return;
+  const r = await conFrase("rotacion_invitar", {id}, null,
+    `Vas a emitir un código de rotación para '${id}'.`);
+  if (!r) return;
+  const d = document.createElement("div");
+  d.style.cssText = "position:fixed;inset:0;background:#000c;display:flex;align-items:center;justify-content:center;z-index:99;padding:20px";
+  d.innerHTML = `<div class="card" style="max-width:640px;margin:0">
+    <h3>Código para '${esc(id)}' — se muestra una sola vez</h3>
+    <div class="meta">No es una credencial: es el permiso para proponer una. Si lo pierdes,
+    vuelve a esta pantalla y pulsa <b>Anular su código</b> junto al participante.</div>
+    <label>El código</label>
+    <input id="rcod" readonly value="${esc(r.codigo)}" onclick="this.select()"
+           style="width:100%;font-family:ui-monospace,monospace;font-size:15px">
+    <button class="mini ok" id="rc">Copiar el código</button>
+    <div class="meta" style="margin-top:14px">Y esto es lo que hay que ejecutar en la máquina
+    donde vive su token — te pedirá ese código sin mostrarlo. El guion va en
+    <code>scripts/</code> del repo:</div>
+    <input readonly onclick="this.select()" style="width:100%;font-family:ui-monospace,monospace"
+      value="python rotar_cliente.py ${esc(id)}">
+    <details style="margin-top:12px"><summary class="meta" style="cursor:pointer">
+      Texto largo para entregárselo al propio participante, si prefieres que lo haga él</summary>
+      <textarea rows="10" readonly onclick="this.select()">${esc(r.instrucciones)}</textarea>
+    </details>
+    <button class="mini" id="rx" style="margin-top:10px">Cerrar</button></div>`;
+  document.body.appendChild(d);
+  d.querySelector("#rc").onclick = async () => {
+    // Copia SOLO el codigo. Antes copiaba el bloque de instrucciones entero y quien
+    // lo pegaba en rotar_cliente.py recibia un 403 sin entender por que: las dos
+    // mitades no encajaban y no lo detecte porque no puedo probarlo sin la frase.
+    try { await navigator.clipboard.writeText(r.codigo); d.querySelector("#rc").textContent = "copiado"; }
+    catch { d.querySelector("#rcod").select(); }
+  };
+  d.querySelector("#rx").onclick = () => { document.body.removeChild(d); ir("participantes"); };
+}
+
+async function cerrarRotacion(forzar) {
+  if (forzar && !confirm("FORZAR deja sin token a quien no ha confirmado, y sin canal no podrá " +
+    "avisarte de que está fuera.\n\n¿Seguro que quieres forzarlo?")) return;
+  const r = await conFrase("rotacion_cerrar", {forzar: !!forzar}, "participantes",
+    forzar ? "Vas a FORZAR el cierre de la rotación." : "Vas a cerrar la rotación y retirar los tokens antiguos.");
+  if (r && r.error) alert(r.error + "\n\nFaltan: " + (r.faltan || []).join(", "));
+}
+
+async function darBaja(id) {
+  const m = prompt(`Motivo de la baja de '${id}' (queda como decisión del canal):`);
+  if (m === null) return;
+  await conFrase("participante_baja", {id, motivo: m}, "participantes",
+    `Vas a dar de baja a '${id}'. Su token dejará de abrir; su historial se conserva.`);
+}
 async function verEstado(ref) {
   try {
     const e = await tool("cartel_estado", {ref});
