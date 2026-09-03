@@ -29,6 +29,7 @@ UA = os.environ.get("BAT_UA", "estado-mcp-bateria/1.0")
 
 # Los ids no se asumen: se preguntan al servidor. Antes estaban escritos en el
 # codigo y la bateria solo servia en la instalacion de quien la escribio.
+PANEL = os.environ.get("BAT_PANEL", "")   # ruta local a panel.html, si se quiere comprobar
 SIN_CDN = os.environ.get("BAT_SIN_CDN") == "1"   # instalacion sin CDN delante
 SIN_RESPALDO = os.environ.get("BAT_SIN_RESPALDO") == "1"  # aun no hay respaldo generado
 SITIO_PRUEBA = os.environ.get("BAT_SITIO", "")   # nombre de un sitio ya desplegado (modo autonomo)
@@ -146,6 +147,10 @@ def puerta_A():
         salto("A", "sitios servidos por el propio canal", "sin BAT_SITIO (instalacion con proxy delante)")
     caso("A", "el inventario de herramientas es coherente y estan las imprescindibles",
          _a_inventario_tools)
+    if PANEL:
+        caso("A", "ninguna herramienta se queda fuera de la consola sin decidirlo", _a_consola_conoce_las_tools)
+    else:
+        salto("A", "cobertura de la consola", "sin BAT_PANEL")
 
 # Antes esto comparaba contra un numero escrito a mano (BAT_TOOLS=53). Se ponia en
 # rojo cada vez que se anadia una herramienta legitima, sin haber detectado nunca
@@ -169,6 +174,49 @@ def _a_inventario_tools():
     faltan = [t for t in IMPRESCINDIBLES if t not in lista]
     assert not faltan, "faltan herramientas basicas: " + ", ".join(faltan)
     assert len(lista) >= 40, f"solo {len(lista)} herramientas: parece que se perdio media API"
+
+# Herramientas que a proposito NO estan en la consola. Se listan una a una para
+# que anadir una nueva sea una decision escrita y no un olvido.
+FUERA_DE_CONSOLA = {
+    "recurso_declarar",   # la autoridad la usa al montar la estacion, no a diario
+    "recurso_medir",      # la reporta un guion desde la maquina, no una persona
+    "token_confirmar",    # lo llama el cliente al rotar, no se pulsa
+    "rotacion_cerrar", "rotacion_anular", "rotacion_invitar",  # via botones propios
+    "participante_baja", "participante_cartelera", "intentos_frase", "rotacion_estado",
+    "msg_desde", "msg_hilo", "msg_ack", "sol_cerrar", "cartel_cerrar", "cartel_estado",
+    "fecha_hilo", "fecha_quien", "fecha_mover", "fecha_estado", "fecha_comprometer",
+    "puerto_quien", "puerto_liberar", "puerto_reservar", "recurso_tomar", "recurso_soltar",
+    "decision_log", "fact_set", "fact_get", "infra_put", "alta_invitar", "alta_aprobar",
+    "alta_rechazar", "altas_pendientes", "subdomain_claim", "subdomain_release",
+    "subdomain_aprobar", "subdomain_rechazar", "subdomain_pendientes", "app_dormir",
+    "app_eliminar", "app_status", "app_logs", "app_restart", "app_stop", "app_start",
+    "deploy_info", "msg_send", "cartel_publicar", "cartel_confirmar", "whoami",
+    "parametros", "state_overview", "participantes", "msg_inbox", "msg_historial",
+    "search", "cartelera", "fecha_list", "decision_list", "fact_list", "infra_list",
+    "app_list", "subdomain_list", "puerto_list", "recurso_estado",
+}
+
+def _a_consola_conoce_las_tools():
+    """Cada vez que se anade una herramienta nueva hay que decidir si va a la consola.
+    Olvidarlo no rompe nada: simplemente la funcion no existe para quien usa el panel
+    y nadie se entera. Paso CUATRO veces el 3-sep, incluida una con el punto abierto
+    en el orden del dia de la sesion sobre este mismo problema.
+
+    Esto no prueba que la consola funcione — eso solo lo prueba usarla. Prueba que
+    ninguna herramienta se ha quedado fuera sin que alguien lo decidiera."""
+    if not PANEL:
+        return
+    try:
+        html = open(PANEL, encoding="utf-8").read()
+    except OSError as e:
+        salto("A", "cobertura de la consola", f"no pude leer {PANEL}: {e}")
+        return
+    catalogo = set(call(T1, "parametros")["herramientas"])
+    huerfanas = [t for t in sorted(catalogo)
+                 if f'"{t}"' not in html and f"'{t}'" not in html
+                 and t not in FUERA_DE_CONSOLA]
+    assert not huerfanas, ("herramientas que no aparecen en la consola ni estan declaradas "
+                           "como exentas: " + ", ".join(huerfanas))
 
 def assert_(cond, msg=""):
     assert cond, msg

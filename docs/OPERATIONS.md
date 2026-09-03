@@ -108,6 +108,25 @@ extra service. To enable it on a fresh install:
    authority (approve/veto registrations, publish on the bulletin board)
    only appear for identities flagged with `participante.py autoridad`.
 
+## Declaring what a workstation shares
+
+```
+recurso_declarar(id, capacidad, unidad, base)   # authority, once per resource
+recurso_tomar(recurso, cuanto, para, minutos)   # `cuanto` is your PEAK
+recurso_soltar(recurso)
+recurso_estado()                                 # who holds what, and what is free
+recurso_medir(recurso, usado, fuente)            # a real reading from this machine
+```
+
+`capacidad` is the physical figure; `base` is what something outside the registry
+always consumes (a desktop compositor, a browser). Keep them apart: readings are
+absolute and include the base, so subtracting it from capacity compares different
+magnitudes and makes an idle machine look wrong.
+
+Report measurements from the machine that owns the hardware. Writing that into a
+remote watcher looks tidy and cannot work — and it fails silently, which is worse
+than not doing it.
+
 ## The security phrase (second factor for credentials)
 
 Putting the participant lifecycle in the console changes what stealing the

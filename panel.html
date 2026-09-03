@@ -117,6 +117,7 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
   <div class="nav" data-v="vigia"><span class="dot"></span>Vigía de red</div>
   <div class="nav" data-v="infra"><span class="dot"></span>Subdominios y apps</div>
   <div class="nav" data-v="puertos"><span class="dot"></span>Puertos de mi estación</div>
+  <div class="nav" data-v="recursos"><span class="dot"></span>GPU y recursos</div>
 </aside>
 <div id="zona">
 <header>
@@ -486,6 +487,57 @@ async registros() {
     `de ${esc(d.de)} · ${esc(d._creado)} · #${d._id}`, esc(d.decision) + "\n\nMotivo: " + esc(d.motivo || ""))).join("");
   $("#vista").innerHTML = h;
 },
+async recursos() {
+  const d = await tool("recurso_estado");
+  let h = `<h1>Recursos de mi estación</h1>`;
+  if (!d.recursos || !d.recursos.length) {
+    h += `<div class="card"><div class="meta">No hay ningún recurso declarado en
+      ${esc(d.maquina || "esta estación")}. Los declara la autoridad con
+      <code>recurso_declarar</code>: una GPU y su VRAM, la RAM, lo que se comparta.</div></div>`;
+    $("#vista").innerHTML = h; return;
+  }
+  h += `<div class="card"><div class="meta">Esto anota lo que cada uno <b>declara</b> que ocupa.
+    No mide la tarjeta ni impide nada: es un acuerdo entre vosotros hecho legible. Reserva por tu
+    <b>pico previsto</b>, no por lo que ocupas en reposo — quien tome el resto contando con tu
+    cifra se quedará sin memoria a mitad de su trabajo, y el registro le habrá dicho que cabía.</div></div>`;
+  h += d.recursos.map(r => {
+    const u = esc(r.unidad || "MB");
+    const pct = r.repartible ? Math.round(100 * (r.declarado || 0) / r.repartible) : 0;
+    let b = `<span class="badge">${r.declarado} / ${r.repartible} ${u} reservados</span>`;
+    if (r.medido !== null && r.medido !== undefined)
+      b += `<span class="badge">medido ${r.medido} ${u}</span>`;
+    let meta = `capacidad física ${r.capacidad} ${u}`;
+    if (r.base_fuera_del_registro)
+      meta += ` · ${r.base_fuera_del_registro} ${u} de base (escritorio y sistema, fuera del registro)`;
+    meta += ` · <b>libre ${r.libre_segun_lo_declarado} ${u}</b> (${pct}% reservado)`;
+    if (r.medido_hace_minutos !== undefined)
+      meta += ` · última lectura real hace ${r.medido_hace_minutos} min${r.medido_por ? ", de " + esc(r.medido_por) : ""}`;
+    let cuerpo = (r.tomado_por || []).map(t =>
+      `${esc(t.dueno)}: ${t.cuanto} ${u} — ${esc(t.para || "")}` +
+      (t.lleva_minutos !== undefined ? ` (lleva ${t.lleva_minutos} min)` : "") +
+      (t.SE_PASO ? `\n    ⚠ ${esc(t.SE_PASO)}` : "")).join("\n")
+      || "nadie lo tiene tomado ahora mismo";
+    // Los avisos van ARRIBA y con su texto entero: son el motivo por el que esta
+    // pantalla existe, y verlos como un número más fue el defecto que tuvo el día
+    // que se construyó.
+    for (const k of ["SOBREPASADO", "MAS_USO_DEL_CONTABILIZADO", "SIN_MEDIR", "MEDICION_VIEJA"])
+      if (r[k]) cuerpo = `⚠ ${k.replace(/_/g, " ")}: ${esc(r[k])}\n\n` + cuerpo;
+    const mal = r.SOBREPASADO || r.MAS_USO_DEL_CONTABILIZADO;
+    const bot = (r.tomado_por || []).some(t => t.dueno === YO.id)
+      ? `<button class="mini mal" onclick="accion('recurso_soltar',{recurso:'${r.recurso}'},'recursos')">Soltar lo mío</button>` : "";
+    return card(mal ? "pend" : "bien", esc(r.recurso) + b, meta, cuerpo, bot);
+  }).join("");
+  h += `<div class="card"><h3>Tomar parte de un recurso</h3>
+    <div class="fila">
+      <div><label>Recurso</label><select id="r-id">${d.recursos.map(r =>
+        `<option value="${esc(r.recurso)}">${esc(r.recurso)}</option>`).join("")}</select></div>
+      <div style="max-width:130px"><label>Pico previsto</label><input id="r-cuanto" inputmode="numeric"></div>
+      <div style="max-width:130px"><label>Minutos previstos</label><input id="r-min" inputmode="numeric"></div>
+      <div style="flex:2"><label>Para qué</label><input id="r-para" placeholder="lo que evita que alguien lo mate"></div>
+    </div>
+    <button class="pri mini" onclick="tomarRecurso()">Tomar</button></div>`;
+  $("#vista").innerHTML = h;
+},
 async puertos() {
   const d = await tool("puerto_list");
   let h = `<h1>Puertos de mi estación</h1>
@@ -665,6 +717,23 @@ async function conFrase(herr, args, vista, motivo) {
     else alert(e.message);
     return null;
   }
+}
+
+async function tomarRecurso() {
+  const cuanto = parseInt($("#r-cuanto").value, 10);
+  const min = parseInt($("#r-min").value, 10) || 0;
+  if (!cuanto || cuanto <= 0) { alert("Di cuánto vas a ocupar (tu pico previsto)."); return; }
+  if (!$("#r-para").value.trim()) { alert("Di para qué: es lo que evita que alguien mate tu proceso."); return; }
+  try {
+    const r = await tool("recurso_tomar", {recurso: $("#r-id").value, cuanto,
+                                           minutos: min, para: $("#r-para").value});
+    // El AVISO de que pides más de lo que queda NO puede perderse al recargar la
+    // vista: es lo único que esta llamada tenía que decirte.
+    if (r.AVISO) alert("Registrado, pero atención:\n\n" + r.AVISO +
+      "\n\nAhora mismo lo tienen: " +
+      (r.quien_mas || []).map(q => `${q.dueno} (${q.cuanto}, ${q.para})`).join("; "));
+    ir("recursos");
+  } catch (e) { alert(e.message); }
 }
 
 async function rotar(id) {

@@ -109,6 +109,48 @@ in use on two workstations at once without conflict, and an agent running on a
 client's box cannot enumerate anyone else's. Scope by identity, not by
 convention: the server enforces it the same way it seals a message's sender.
 
+## Shared resources: the card, not the port
+
+The port registry answered the wrong question. On a workstation with two GPUs,
+three services on distinct ports coexisted with a 12 GB model: the ports no
+longer collided and the VRAM did, and nothing said so. One agent had written it
+plainly a week earlier — *sharing the instance does not help, the problem is the
+unload, not the port* — and it went unrecorded.
+
+`recurso_declarar` / `recurso_tomar` / `recurso_soltar` / `recurso_estado`,
+scoped to the caller's workstation exactly as ports are. Four properties are
+deliberate refusals rather than missing features:
+
+- **It warns, it does not block.** The channel cannot stop anyone from using the
+  card. Pretending otherwise teaches people not to consult it, and then it loses
+  the information too.
+- **It never releases on a timer.** Expiring a legitimate batch that ran long
+  would repeat the underlying mistake: deciding for someone who knows more than
+  the server does. It surfaces *held 6h, expected 30min* and lets a human ask.
+- **Reservations declare the peak, not the resting size.** Declaring at rest is
+  the dangerous half: whoever takes the remainder runs out mid-work *and the
+  registry told them it fit*. Over-reserving wastes a little card; under-reserving
+  breaks someone else.
+- **Capacity and base are separate numbers.** A desktop consumes VRAM belonging
+  to no participant. Folding that into capacity made an idle card report a false
+  divergence — and a red that is always on informs nobody.
+
+### Declared versus measured
+
+A registry of declarations drifts from reality exactly like the announcement
+convention it replaces: it changes the syntax, not the nature. The agent who
+proposed this proved it on themselves, having published for days a figure that
+was the model's file size rather than the VRAM it occupied. Nobody lied; nobody
+measured.
+
+So any station may report a real reading with `recurso_medir`, and the state puts
+declared and measured side by side. The server reads no machine: each station
+reports its own. Under-use is normal and unmarked — reservations are peaks, and
+flagging every gap would leave a light permanently on. What is flagged is
+*measured exceeding what anyone accounted for*, which is the only case where
+someone is using the resource without saying so. When nobody has measured at all,
+the state says so rather than presenting declarations as fact.
+
 ## Participants
 
 `/etc/evastate/participants.json` (root:evastate 640) is the source of truth
