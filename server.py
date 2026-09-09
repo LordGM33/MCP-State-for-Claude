@@ -281,12 +281,35 @@ def _norm_ref(s):
 
 def _jd(x): return json.dumps(x, ensure_ascii=False, indent=2)
 
+# Como se escribe "no trabaja en ninguna estacion". Ricardo figura con "-", y ese
+# guion es una cadena NO VACIA: cualquier `if not maq` lo da por bueno y filtra
+# por una maquina llamada "-", que no existe. El resultado no es un error, es una
+# lista vacia — y una lista vacia se lee como "no hay nada", no como "esta
+# pregunta no se te puede contestar asi". Le paso el 3-sep con las herramientas
+# compartidas: el unico que puede autorizar una parada veia la vista en blanco.
+SIN_ESTACION = {"", "-", "--", "n/a", "na", "ninguna", "none", "—"}
+
 def estacion(pid=None):
-    """Maquina del participante, sellada por el servidor (no es un parametro)."""
-    return (PARTICIPANTES.get(pid or ident(), {}).get("maquina") or "").strip()
+    """Maquina del participante, sellada por el servidor (no es un parametro).
+
+    Devuelve "" para quien no tiene ninguna, ESCRITA COMO SEA. Normalizar aqui y
+    no en cada vista es deliberado: una convencion que hay que recordar en once
+    sitios se olvida en el doce."""
+    m = (PARTICIPANTES.get(pid or ident(), {}).get("maquina") or "").strip()
+    return "" if m.lower() in SIN_ESTACION else m
 
 def _solapa(a1, a2, b1, b2):
     return a1 <= b2 and b1 <= a2
+
+def estacion_de(pid):
+    """La estacion normalizada de CUALQUIER participante, no solo la del que llama.
+
+    `estacion()` sirve para 'lo mio'; para acotar un cartel hace falta preguntar
+    por otro. Comparte la normalizacion: el "-" de un humano sin maquina NO es
+    una estacion, aunque como cadena sea verdadero."""
+    m = (PARTICIPANTES.get(pid, {}).get("maquina") or "").strip()
+    return "" if m.lower() in SIN_ESTACION else m
+
 
 def es_autoridad(pid):
     return bool(PARTICIPANTES.get(pid, {}).get("autoridad"))
@@ -562,18 +585,26 @@ def recurso_soltar(recurso: str) -> str:
 def recurso_estado(recurso: str = "") -> str:
     """Quien tiene que, cuanto queda, y desde cuando. Sin `recurso`, todos los de
     tu estacion. Las reservas que pasan de lo previsto salen marcadas: casi siempre
-    es alguien que se olvido de soltar, y verlo es lo unico que lo arregla."""
+    es alguien que se olvido de soltar, y verlo es lo unico que lo arregla.
+
+    QUIEN NO TIENE ESTACION LOS VE TODOS, por lo mismo que en herramienta_estado:
+    Ricardo supervisa, no trabaja en una maquina, y devolverle una lista vacia le
+    dejaba la vista de GPU en blanco sin decir por que."""
     maq = estacion()
-    if not maq:
-        return "ERROR: tu identidad no tiene estacion asignada."
-    pedidos = [recurso.strip().lower()] if recurso.strip() else \
-              sorted(x["recurso"] for x in _rows("recurso", 200) if x.get("maquina") == maq)
-    if not pedidos:
-        return _jd({"maquina": maq, "recursos": [],
-                    "nota": "no hay ningun recurso declarado en esta estacion"})
+    decl = _rows("recurso", 200)
+    if maq:
+        decl = [x for x in decl if x.get("maquina") == maq]
+    if recurso.strip():
+        decl = [x for x in decl if x.get("recurso") == recurso.strip().lower()]
+    if not decl:
+        return _jd({"maquina": maq or "(sin estacion: ves los de todas)", "recursos": [],
+                    "nota": ("no hay ningun recurso declarado en esta estacion" if maq else
+                             "no hay ningun recurso declarado en NINGUNA estacion. Tu "
+                             "identidad no tiene estacion, asi que esto no es un filtro.")})
     ahora = datetime.datetime.now(datetime.timezone.utc)
     salida = []
-    for rid in pedidos:
+    for _d in sorted(decl, key=lambda x: (x.get("maquina", ""), x.get("recurso", ""))):
+        rid, maq = _d.get("recurso"), _d.get("maquina")
         r = _recurso_de(maq, rid)
         if not r:
             salida.append({"recurso": rid, "error": "no declarado en esta estacion"}); continue
@@ -599,7 +630,7 @@ def recurso_estado(recurso: str = "") -> str:
         base = int(r.get("base", 0))
         repartible = int(r["capacidad"]) - base
         libre = repartible - usado
-        fila = {"recurso": rid, "capacidad": r["capacidad"],
+        fila = {"recurso": rid, "maquina": maq, "capacidad": r["capacidad"],
                 "base_fuera_del_registro": base, "repartible": repartible,
                 "unidad": r.get("unidad", "MB"), "declarado": usado,
                 "libre_segun_lo_declarado": libre, "notas": r.get("notas", ""),
@@ -645,6 +676,277 @@ def recurso_estado(recurso: str = "") -> str:
                 "quedar sin memoria a media faena. Hablalo antes de arrancar.")
         salida.append(fila)
     return _jd({"maquina": maq, "recursos": salida})
+
+# ───────────── HERRAMIENTAS COMPARTIDAS: arrancar es libre, parar no ─────────────
+# El registro de recursos contesta "cuanta VRAM queda". No contesta "este proceso
+# tiene dueno y esta trabajando", y esa es otra pregunta. Produccion la separo bien
+# el 3-sep, con marcas de tiempo, despues de que les mataran ComfyUI TENIENDO el
+# recurso tomado: el registro funciono y aun asi perdieron el proceso.
+#
+# El mecanismo no era una rutina descuidada. Estaba dentro de los lanzadores, en
+# tres sitios, etiquetado como "higiene previa":
+#     Get-Process llama-server | Stop-Process -Force
+# Quien arranca un cerebro mata los de todos. Con un cerebro permanente y
+# compartido eso deja de ser higiene y pasa a ser destruir trabajo ajeno.
+#
+# LA ASIMETRIA, que es la decision de Ricardo del 3-sep y toda la idea:
+#   arrancar  -> libre. Cualquiera. No hace falta pedir turno ni avisar.
+#   parar     -> exige confirmacion HUMANA de que nadie mas lo esta usando.
+#   sin esa confirmacion, la herramienta SIGUE VIVA esperando indicaciones.
+# El estado por omision es "sigue encendida". Eso no es un detalle de redaccion:
+# es lo que hace que el olvido sea inofensivo. Si el valor por defecto fuese
+# apagar, cada despiste costaria el trabajo de otro.
+#
+# QUIEN autoriza se comprueba por `tipo == "humano"` en participants.json, NO por
+# `autoridad`. Yo mismo (statemcp) soy autoridad y soy un cowork: si el permiso
+# colgara de la autoridad podria autorizar mi propia parada, que es exactamente lo
+# que la regla prohibe. Un cowork no puede autorizar por ESTRUCTURA, no por acuerdo.
+#
+# Y LO QUE ESTO NO HACE, dicho aqui para que no se venda como lo que no es: el
+# canal NO puede impedir un Stop-Process. Vive en el VPS; la orden se ejecuta en
+# PC1. Presentarlo como proteccion seria confianza sin respaldo, que es peor que
+# no tener nada. Lo que hace es dar a las rutinas de limpieza un sitio donde
+# mirar ANTES de barrer (modulos/rejilla/puedo_matar.py, que corre en la estacion).
+
+def _es_humano(pid):
+    return (PARTICIPANTES.get(pid, {}).get("tipo") or "").strip().lower() == "humano"
+
+
+def _autorizacion_viva(peticion):
+    """Devuelve (vale, motivo). Una autorizacion caduca y va atada a la peticion
+    que respondia. Esto es la leccion D12 aplicada a otra cosa: alli una
+    confirmacion vieja contaba para una rotacion nueva. Un `si` de hace tres dias
+    a una parada distinta no puede volverse permiso permanente."""
+    a = peticion.get("autorizacion")
+    if not a:
+        return False, "nadie ha autorizado esta parada"
+    try:
+        desde = datetime.datetime.fromisoformat(a["cuando"])
+    except Exception:
+        return False, "la autorizacion tiene una fecha ilegible; no cuenta"
+    mins = int(a.get("minutos") or 0)
+    edad = (datetime.datetime.now(datetime.timezone.utc) - desde).total_seconds() / 60
+    if mins and edad > mins:
+        return False, (f"la autorizacion de {a['por']} caduco: se dio hace {int(edad)} min "
+                       f"y valia {mins}. Pidela otra vez si sigue haciendo falta.")
+    return True, f"autorizada por {a['por']} hace {int(edad)} min"
+
+
+@mcp.tool()
+def herramienta_declarar(id: str, puerto: int, arranque: str = "", notas: str = "") -> str:
+    """(SOLO autoridad) Declara un proceso de larga vida COMPARTIDO en tu estacion.
+
+    Una herramienta no es un recurso. El recurso se reparte (VRAM); la herramienta
+    se usa a la vez sin repartir nada: un servidor atiende a quien llegue. Por eso
+    aqui no hay `capacidad` ni turnos de acceso. Lo unico que se regula es quien
+    puede APAGARLA, porque eso si es exclusivo e irreversible para los demas.
+
+    `arranque` es el comando que la levanta, para que quien la encuentre caida
+    sepa como devolverla sin buscar en tres carpetas."""
+    me = ident()
+    if not es_autoridad(me):
+        return "ERROR: declarar herramientas es de la autoridad."
+    maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    hid = id.strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,31}", hid):
+        return "ERROR: id invalido (minusculas, 2-32, letras/numeros/.-_). Ej: cerebro"
+    try:
+        p = _n(puerto, "puerto")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if not 1 <= p <= 65535:
+        return "ERROR: el puerto tiene que estar entre 1 y 65535."
+    res = _put("herramienta", f"{maq}:{hid}", {
+        "maquina": maq, "herramienta": hid, "puerto": p,
+        "arranque": arranque.strip(), "notas": notas.strip(), "declarada_por": me})
+    return _jd({**res, "maquina": maq, "herramienta": hid, "puerto": p,
+                "arrancarla": "libre, cualquiera, sin pedir permiso",
+                "pararla": "requiere confirmacion de un participante de tipo humano"})
+
+
+@mcp.tool()
+def herramienta_parada_pedir(id: str, motivo: str) -> str:
+    """Pide permiso para APAGAR una herramienta compartida. NO la apaga.
+
+    Abre una peticion que un humano tiene que confirmar. Mientras no la confirme,
+    la herramienta SIGUE ENCENDIDA esperando indicaciones — de otro cowork o de
+    Ricardo por la interfaz ECO. El silencio no autoriza nada.
+
+    Arrancarla no necesita esto: arrancar es libre."""
+    me = ident(); maq = estacion()
+    if not maq:
+        return "ERROR: tu identidad no tiene estacion asignada."
+    hid = id.strip().lower()
+    _, h = _get("herramienta", f"{maq}:{hid}")
+    if not h:
+        hay = sorted(x["herramienta"] for x in _rows("herramienta", 200)
+                     if x.get("maquina") == maq)
+        return (f"ERROR: en {maq} no hay declarada ninguna herramienta '{hid}'."
+                + (f" Declaradas: {', '.join(hay)}." if hay else ""))
+    if not motivo.strip():
+        return ("ERROR: di POR QUE hay que pararla. Es lo que el humano tiene que "
+                "poder juzgar, y sin eso solo puede decir que si a ciegas.")
+    # Una peticion abierta y sin responder no se duplica: dos peticiones vivas
+    # sobre lo mismo hacen que una autorizacion parezca darse a la otra.
+    for x in _rows("parada", 300, order="DESC"):
+        if x.get("maquina") == maq and x.get("herramienta") == hid \
+                and x.get("estado") == "pedida":
+            vale, _por = _autorizacion_viva(x)
+            return _jd({"ya_habia_una": x["_id"], "pedida_por": x.get("de"),
+                        "motivo": x.get("motivo"), "desde": x.get("cuando"),
+                        "autorizada": vale,
+                        "que_hacer": ("ya esta autorizada: puedes pararla" if vale else
+                                      "sigue esperando confirmacion humana; NO la pares")})
+    res = _append("parada", {"maquina": maq, "herramienta": hid, "de": me,
+                             "motivo": motivo.strip(), "estado": "pedida",
+                             "cuando": now(), "puerto": h.get("puerto")})
+    humanos = sorted(p for p in PARTICIPANTES if _es_humano(p)
+                     and PARTICIPANTES[p].get("activo", True))
+    return _jd({**res, "peticion": res["id"], "herramienta": hid, "maquina": maq,
+                "estado": "PEDIDA, no autorizada",
+                "mientras_tanto": "la herramienta sigue encendida. NO la pares.",
+                "quien_puede_autorizar": humanos,
+                "como": f"herramienta_parada_autorizar(peticion={res['id']})"})
+
+
+@mcp.tool()
+def herramienta_parada_autorizar(peticion: int, minutos: int = 30) -> str:
+    """(SOLO humanos) Confirma que nadie mas la esta usando y se puede apagar.
+
+    Un cowork no puede llamar a esto aunque sea autoridad. La comprobacion es
+    `tipo == "humano"` en participants.json, sellada por el servidor igual que la
+    identidad: no es una regla que se pueda saltar de buena fe.
+
+    La autorizacion CADUCA (`minutos`) y va atada a ESTA peticion. Un `si` no se
+    hereda a la siguiente parada de la misma herramienta."""
+    me = ident()
+    if not _es_humano(me):
+        return ("ERROR: solo un participante de tipo 'humano' puede autorizar una parada. "
+                "Tu eres '" + (PARTICIPANTES.get(me, {}).get("tipo") or "?") + "'. "
+                "Esto no es una formalidad: la regla es que nadie apaga una herramienta "
+                "compartida sin que una persona confirme que nadie mas la usa. Pidelo con "
+                "herramienta_parada_pedir y espera; mientras tanto sigue encendida.")
+    try:
+        pid_pet = int(peticion)
+    except (TypeError, ValueError):
+        return "ERROR: `peticion` es el numero que devolvio herramienta_parada_pedir."
+    with db() as con:
+        r = con.execute("SELECT data FROM items WHERE id=? AND kind='parada'",
+                        (pid_pet,)).fetchone()
+    if not r:
+        return (f"ERROR: no existe la peticion de parada {pid_pet}. "
+                "Mirala en herramienta_estado().")
+    d = json.loads(r["data"])
+    if d.get("estado") != "pedida":
+        return (f"ERROR: esa peticion ya esta '{d.get('estado')}', no se puede autorizar. "
+                "Si hace falta pararla otra vez, que se pida de nuevo.")
+    try:
+        mins = _n(minutos, "minutos")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if mins <= 0:
+        return "ERROR: `minutos` tiene que ser mayor que cero; una autorizacion sin caducidad se olvida encendida."
+    d["autorizacion"] = {"por": me, "cuando": now(), "minutos": mins}
+    with db() as con:
+        con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                    (json.dumps(d, ensure_ascii=False), now(), pid_pet))
+    return _jd({"peticion": pid_pet, "herramienta": d.get("herramienta"),
+                "maquina": d.get("maquina"), "autorizada_por": me,
+                "vale_minutos": mins, "la_pidio": d.get("de"), "motivo": d.get("motivo"),
+                "ahora_si": "se puede parar. Cierra con herramienta_parada_cerrar cuando lo hagas."})
+
+
+@mcp.tool()
+def herramienta_parada_cerrar(peticion: int, resultado: str = "") -> str:
+    """Cierra una peticion de parada: se hizo, o se descarto. Cualquiera puede.
+
+    Cerrar es seguro por definicion — deja la herramienta protegida otra vez — asi
+    que no se pide permiso para cerrar. Lo que necesita permiso es apagar."""
+    me = ident()
+    try:
+        pid_pet = int(peticion)
+    except (TypeError, ValueError):
+        return "ERROR: `peticion` es el numero de la peticion."
+    with db() as con:
+        r = con.execute("SELECT data FROM items WHERE id=? AND kind='parada'",
+                        (pid_pet,)).fetchone()
+    if not r:
+        return f"ERROR: no existe la peticion de parada {pid_pet}."
+    d = json.loads(r["data"])
+    if d.get("estado") != "pedida":
+        return f"ERROR: la peticion {pid_pet} ya estaba '{d.get('estado')}'."
+    d["estado"] = "cerrada"; d["cerrada_por"] = me; d["cerrada"] = now()
+    d["resultado"] = resultado.strip()
+    with db() as con:
+        con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                    (json.dumps(d, ensure_ascii=False), now(), pid_pet))
+    return _jd({"peticion": pid_pet, "herramienta": d.get("herramienta"),
+                "estado": "cerrada", "resultado": d["resultado"],
+                "nota": "la herramienta vuelve a estar protegida: pararla exige otra confirmacion."})
+
+
+@mcp.tool()
+def herramienta_estado(id: str = "") -> str:
+    """Que herramientas compartidas hay en tu estacion y si alguna puede pararse.
+
+    Lo importante que ensena esto es lo que NO se puede hacer: para cada
+    herramienta dice explicitamente si la parada esta autorizada. Sin autorizacion
+    viva la respuesta es que debe seguir encendida — y sale escrito, no se deduce
+    de una ausencia. Una ausencia se lee como permiso; una frase, no.
+
+    QUIEN NO TIENE ESTACION LAS VE TODAS. Ricardo figura con maquina "-": no
+    trabaja en una estacion, las supervisa. Filtrar por estacion le dejaba la
+    vista VACIA con el texto "no hay ninguna herramienta declarada en -", que se
+    lee como "no existen" y no como "esta pregunta no se te puede contestar asi".
+    Y precisamente el es el unico que puede autorizar una parada: la persona que
+    tiene que decidir era la unica que no podia ver sobre que. El fallo estaba en
+    la consola del 3-sep, con la herramienta recien construida y el defecto ya
+    identificado en la parte de autorizar; se arreglo ahi y se olvido aqui."""
+    maq = estacion()
+    todo = not maq          # sin estacion asignada: supervisa, no trabaja en una
+    decl = _rows("herramienta", 300)
+    if not todo:
+        decl = [x for x in decl if x.get("maquina") == maq]
+    filtro = id.strip().lower()
+    if filtro:
+        decl = [x for x in decl if x.get("herramienta") == filtro]
+    if not decl:
+        return _jd({"maquina": maq or "(sin estacion: ves todas)",
+                    "herramientas": [],
+                    "nota": (f"no hay ninguna herramienta compartida declarada en {maq}"
+                             if maq else
+                             "no hay ninguna herramienta compartida declarada en NINGUNA "
+                             "estacion. Tu identidad no tiene estacion asignada, asi que "
+                             "esto no es un filtro: es que no existe ninguna.")})
+    paradas = _rows("parada", 500, order="DESC")
+    salida = []
+    for h in sorted(decl, key=lambda x: (x.get("maquina", ""), x.get("herramienta", ""))):
+        hid, hmaq = h.get("herramienta"), h.get("maquina")
+        fila = {"herramienta": hid, "maquina": hmaq, "puerto": h.get("puerto"),
+                "arranque": h.get("arranque", ""), "notas": h.get("notas", ""),
+                "arrancarla": "LIBRE: cualquiera, sin permiso ni turno"}
+        abierta = next((x for x in paradas if x.get("herramienta") == hid
+                        and x.get("maquina") == hmaq
+                        and x.get("estado") == "pedida"), None)
+        if not abierta:
+            fila["pararla"] = ("NO AUTORIZADA. Debe seguir encendida. Si necesitas apagarla, "
+                               "pidelo con herramienta_parada_pedir y espera a que un humano "
+                               "confirme que nadie mas la usa.")
+        else:
+            vale, porque = _autorizacion_viva(abierta)
+            fila["peticion_abierta"] = {"id": abierta["_id"], "la_pidio": abierta.get("de"),
+                                        "motivo": abierta.get("motivo"),
+                                        "desde": abierta.get("cuando")}
+            fila["pararla"] = ("AUTORIZADA: " + porque) if vale else \
+                              ("NO AUTORIZADA todavia (" + porque + "). Sigue encendida.")
+        salida.append(fila)
+    return _jd({"maquina": maq or "(sin estacion: ves las de todas)",
+                "herramientas": salida,
+                "regla": ("arrancar es libre; parar exige que un participante de tipo humano "
+                          "confirme que nadie mas la usa. Sin esa confirmacion la herramienta "
+                          "queda activa esperando indicaciones.")})
 
 # ───────────── ROTACION DE TOKENS (nadie se queda fuera) ─────────────
 def _confirmo_esta_rotacion(pid):
@@ -765,12 +1067,86 @@ def participantes() -> str:
     dirigidos a uno, y por eso el 30-ago se leyo como abandono lo que era trabajo
     en registros que la bandeja no muestra."""
     act = _actividad()
-    return _jd([{**p, **act.get(p.get("id"), {})} for p in _rows("participant")])
+    return _jd([{**p, **act.get(p.get("id"), {})} for p in _rows("participant", None)])
 
 # ───────────── ARRANQUE ─────────────
+
+def _titular(m, entradilla=200):
+    """Un mensaje reducido a lo justo para decidir si abrirlo.
+
+    Se conserva el asunto (sin el, el ahorro se paga con ceguera), el _id (sin el
+    el cuerpo seria inalcanzable) y una entradilla en una sola linea. `bytes` dice
+    lo que cuesta pedirlo entero, para que la decision sea informada."""
+    c = m.get("cuerpo") or ""
+    t = {k: m[k] for k in ("_id", "de", "para", "tipo", "ref", "responde_a",
+                           "asunto", "estado", "_creado", "visto")
+         if m.get(k) not in (None, "")}
+    t["bytes"] = len(c)
+    plano = " ".join(c.split())
+    if plano:
+        t["entradilla"] = plano[:entradilla] + ("…" if len(plano) > entradilla else "")
+    return t
+
+
+def _puedo_ver(m, me):
+    """El mismo criterio que la bandeja, ni mas ni menos. Va aparte para que sea
+    UN sitio: dos copias de una regla de acceso acaban divergiendo."""
+    return m.get("para") in (me, "todos") or m.get("de") == me
+
+
 @mcp.tool()
-def state_overview() -> str:
-    """Foto del estado compartido para MI identidad. Llamar al iniciar sesión."""
+def msg_leer(ids: str) -> str:
+    """Lee UNO o VARIOS mensajes enteros por su numero (`ids`: "573" o "573,574").
+
+    El saludo trae titulares; esto trae el cuerpo del que interese. Solo devuelve
+    lo que ya podrias ver en tu bandeja: los numeros son consecutivos y sin ese
+    filtro se llegaria a correo ajeno probando cifras."""
+    me = ident()
+    pedidos = []
+    for trozo in str(ids).replace(";", ",").split(","):
+        trozo = trozo.strip()
+        if not trozo:
+            continue
+        if not trozo.isdigit():
+            return f"ERROR: '{trozo}' no es un numero de mensaje. Los numeros salen en state_overview."
+        pedidos.append(int(trozo))
+    if not pedidos:
+        return "ERROR: indica al menos un numero, por ejemplo ids=\"573\"."
+    if len(pedidos) > 25:
+        return f"ERROR: {len(pedidos)} mensajes de golpe. Pide 25 como mucho, o usa msg_inbox."
+    out, negados, ausentes = [], [], []
+    with db() as con:
+        for i in pedidos:
+            r = con.execute("SELECT id,data,created FROM items WHERE id=? AND kind='msg'",
+                            (i,)).fetchone()
+            if not r:
+                ausentes.append(i)
+                continue
+            d = json.loads(r["data"])
+            d["_id"] = r["id"]
+            d["_creado"] = r["created"]
+            if not _puedo_ver(d, me):
+                # No se dice si existe o no: distinguir "no existe" de "no es tuyo"
+                # ya cuenta quien le escribe a quien.
+                negados.append(i)
+                continue
+            out.append(d)
+    _entregar(me, out)
+    if negados or ausentes:
+        return _jd({"mensajes": out,
+                    "no_disponibles": sorted(negados + ausentes),
+                    "nota": "no existen o no van dirigidos a ti"})
+    return _jd(out)
+
+
+@mcp.tool()
+def state_overview(completo: bool = False) -> str:
+    """Foto del estado compartido para MI identidad. Llamar al iniciar sesión.
+
+    Trae TITULARES de los mensajes pendientes, no los cuerpos: el saludo pesaba
+    185 KB (~46.000 tokens) y el 61% eran cuerpos que casi nunca se leian todos.
+    Para leer uno: `msg_leer(ids="573")`. Para el saludo de antes, entero:
+    `state_overview(completo=True)`."""
     me = ident()
     pend = [m for m in _rows("msg", 500, order="DESC")
             if m.get("para") in (me, "todos") and m.get("de") != me
@@ -788,13 +1164,29 @@ def state_overview() -> str:
                               "asunto": c["asunto"], "requiere": c["requiere"]})
     por_aprobar = {}
     if es_autoridad(me):
-        subs = [r["nombre"] for r in _rows("subdomain", 300) if r.get("estado") == "solicitado"]
+        subs = [r["nombre"] for r in _rows("subdomain", None) if r.get("estado") == "solicitado"]
         altas = [i.get("id") for i in _rows("invitacion", 200) if i.get("estado") == "solicitada"]
         if subs: por_aprobar["subdominios"] = subs
         if altas: por_aprobar["altas"] = altas
+    # Lo temporal que se paso de fecha, a la vista de TODOS y no solo de la
+    # autoridad: el que lo puso ahi suele ser quien sabe si ya cumplio. Va en el
+    # overview y no solo en subdomain_list porque un dato que hay que ir a buscar
+    # es un dato que nadie mira -- que es exactamente como el muestrario se
+    # quedo en linea despues de cumplir su cometido.
+    vencidos = []
+    for r in _rows("subdomain", None):
+        if r.get("estado") not in ("ocupado", "solicitado"):
+            continue
+        aviso, dias = _estado_temporal(r)
+        if aviso and aviso.startswith("VENCIDO"):
+            vencidos.append({"nombre": r.get("nombre"), "dueno": r.get("dueno"),
+                             "caducaba": r.get("caduca"), "hace_dias": dias,
+                             "notas": r.get("notas", ""),
+                             "que_hacer": "si ya cumplio: app_eliminar + subdomain_release. "
+                                          "Si sigue haciendo falta: subdomain_tipo con fecha nueva."})
     maq = estacion(me)
     puertos = [{k: v for k, v in r.items() if k in ("puerto", "hasta", "servicio", "dueno", "notas")}
-               for r in _rows("puerto", 500, order="DESC")
+               for r in _rows("puerto", None, order="DESC")
                if r.get("maquina") == maq and r.get("estado") == "ocupado"] if maq else []
     puertos.sort(key=lambda r: int(r["puerto"]))
     hoy_ = _hoy()
@@ -820,15 +1212,33 @@ def state_overview() -> str:
         **({"del_resto_esta_semana": del_resto} if del_resto else {}),
         "puertos_de_mi_estacion": puertos,
         **({"por_aprobar": por_aprobar} if por_aprobar else {}),
+        **({"subdominios_vencidos": vencidos} if vencidos else {}),
         "cartelera_pendiente": cart_pend,
         "esperando_respuesta": mias,
         "actividad_de_todos": _actividad(),
-        "mensajes_pendientes": pend,
-        "decisiones_recientes": _rows("decision", 8, order="DESC"),
-        "hechos": _rows("fact", 100),
-        "infraestructura": _rows("infra", 100),
-        "subdominios": _rows("subdomain", 200),
-        "apps": _rows("app", 100),
+        # OJO: _entregar(me, pend) ya se llamo arriba sobre la lista COMPLETA.
+        # El sellado de entrega no depende de lo que se devuelva -- si dependiera,
+        # adelgazar el saludo habria apagado en silencio los acuses de D11.
+        "mensajes_pendientes": pend if completo else [_titular(m) for m in pend],
+        "decisiones_recientes": (_rows("decision", 8, order="DESC") if completo else
+                                 [{k: d[k] for k in ("_id", "de", "titulo", "proyecto", "_creado")
+                                   if d.get(k) not in (None, "")}
+                                  for d in _rows("decision", 8, order="DESC")]),
+        "hechos": (_rows("fact", 100) if completo else
+                   [{"clave": f.get("_key") or f.get("clave"),
+                     "resumen": " ".join(str(f.get("valor") or "").split())[:120] +
+                                ("…" if len(str(f.get("valor") or "")) > 120 else "")}
+                    for f in _rows("fact", 100)]),
+        **({} if completo else {"como_leer_lo_demas": {
+            "un mensaje entero": "msg_leer(ids=\"573\") — el numero sale en mensajes_pendientes",
+            "un hecho entero": "fact_get(clave)",
+            "una decision entera": "decision_list()",
+            "el saludo de antes, completo": "state_overview(completo=True)",
+            "por que": "este saludo pesaba 185 KB (~46.000 tokens) en cada sesion de cada cowork",
+        }}),
+        "infraestructura": _rows("infra", None),
+        "subdominios": _rows("subdomain", None),
+        "apps": _rows("app", None),
         "nota": "Sin secretos ni datos personales. Coordinación, nunca inferencia (R-007).",
     })
 
@@ -844,10 +1254,25 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
     me = ident()
     tipo = tipo.strip().lower()
     if tipo not in ("aviso", "solicitud", "respuesta", "bitacora", "alerta"):
-        return "ERROR: tipo debe ser aviso|solicitud|respuesta|bitacora|alerta"
+        return ("ERROR: `tipo` debe ser uno de: aviso, solicitud, respuesta, bitacora, alerta. "
+                "Ej. tipo='aviso' para contar algo; tipo='solicitud' si esperas respuesta.")
     para = para.strip().lower()
     if para != "todos" and para not in PARTICIPANTES:
-        return f"ERROR: destinatario '{para}' no existe. Ver participantes()."
+        return (f"ERROR: destinatario '{para}' no existe. Usa un id de participantes() "
+                f"o 'todos' (ej. para='produccion').")
+    # UNA `ref` FUERA DE UNA SOLICITUD SE RECHAZA, NO SE TIRA. Todo lo que
+    # interpreta `ref` vive dentro del bloque de abajo, asi que hasta hoy en un
+    # aviso el parametro se aceptaba, no se comparaba con nada y no se guardaba:
+    # la respuesta decia "creado" y la ref desaparecia. editorial dio por abierta
+    # una SOL-052 que no existia y se lo dijo a Ricardo (msg 575).
+    # Se rechaza en vez de avisar porque un aviso hay que acordar leerlo y un
+    # rechazo no se puede ignorar -- el criterio de Ricardo del 2-sep: que el
+    # fallo sea imposible por estructura, no por acuerdo.
+    if ref and tipo != "solicitud":
+        return (f"ERROR: un mensaje de tipo '{tipo}' no lleva `ref`: solo la llevan las "
+                f"solicitudes. Si querias abrir una solicitud, manda tipo='solicitud' "
+                f"(la ref se asigna sola). Si querias APUNTAR a una existente, usa "
+                f"tipo='respuesta' con responde_a='{ref}'.")
     d = {"de": me, "para": para, "asunto": asunto, "cuerpo": cuerpo, "tipo": tipo}
     if tipo == "solicitud":
         if ref:
@@ -883,6 +1308,10 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
     else:
         d["estado"] = "pendiente"
     res = _append("msg", d)
+    # LA REF EFECTIVA, SIEMPRE. Sin este dato un cliente no puede contrastar lo
+    # que pidio con lo que paso, que es exactamente lo que editorial no pudo
+    # hacer. `ref: null` DICHO es distinto de no decir nada.
+    res = {**res, "ref": d.get("ref")}
     if tipo == "respuesta" and str(d.get("responde_a", "")).startswith("CART-"):
         with db() as con:
             for r in con.execute("SELECT id,data FROM items WHERE kind='cartel'").fetchall():
@@ -1007,7 +1436,8 @@ def sol_cerrar(ref: str, estado: str = "respondida", nota: str = "") -> str:
 
 # ───────────── CARTELERA (divulgación de la autoridad) e HISTORIAL ─────────────
 @mcp.tool()
-def cartel_publicar(tipo: str, asunto: str, cuerpo: str, requiere: str = "", formato_respuesta: str = "") -> str:
+def cartel_publicar(tipo: str, asunto: str, cuerpo: str, requiere: str = "",
+                    formato_respuesta: str = "", estacion: str = "") -> str:
     """Publica en la cartelera (SOLO autoridad). tipo: regla|condicion|peticion|aviso.
     `requiere` (default por tipo): confirmacion — cada participante confirma que la
     integró a su regencia local; respuesta — respuesta PRIVADA a la autoridad en
@@ -1033,8 +1463,21 @@ def cartel_publicar(tipo: str, asunto: str, cuerpo: str, requiere: str = "", for
     dirigidos = [p for p, v in PARTICIPANTES.items()
                  if v.get("activo", True) and p != me
                  and v.get("confirma_cartelera", True)]
+    # UNA NORMA DE UNA MAQUINA NO SE LE PIDE A QUIEN NO ESTA EN ELLA. CART-021
+    # avala el lanzador comun DE PC1 y se dirigio tambien a quien vive en otra
+    # maquina, porque un cartel no podia decir de donde era. Firmar una norma que
+    # no te alcanza ensena a firmar sin integrar, y ademas bloquea lo que espera
+    # esas firmas. Vacio = de todos, que es lo que son casi todas.
+    est = (estacion or "").strip()
+    if est:
+        dirigidos = [p for p in dirigidos if estacion_de(p).lower() == est.lower()]
+        if not dirigidos:
+            return (f"ERROR: no hay ningun participante en la estacion '{est}'. "
+                    "Comprueba el nombre con participantes(); si esta mal escrito, "
+                    "el cartel no llegaria a nadie y pareceria publicado.")
     d = {"de": me, "tipo": tipo, "asunto": asunto, "cuerpo": cuerpo, "ref": ref,
          "requiere": req, "formato_respuesta": formato_respuesta,
+         **({"estacion": est} if est else {}),
          "dirigido_a": dirigidos, "confirmaciones": {}, "estado": "activo"}
     res = _append("cartel", d)
     return _jd({**res, "ref": ref, "dirigido_a": dirigidos})
@@ -1092,7 +1535,15 @@ def cartel_estado(ref: str) -> str:
             pend = [p for p in c.get("dirigido_a", []) if p not in conf
                     and (PARTICIPANTES.get(p) or {}).get("confirma_cartelera", True)]
             return _jd({"ref": ref, "tipo": c.get("tipo"), "requiere": c.get("requiere"),
-                        "estado": c.get("estado"), "confirmados": conf, "pendientes": pend})
+                        "estado": c.get("estado"),
+                        # A QUIEN SE LE PIDIO, y DE QUE MAQUINA es la norma. Sin
+                        # esto, `pendientes` se vacia conforme confirman y no
+                        # queda rastro del alcance: no se puede comprobar si una
+                        # norma de PC1 se le pidio a quien no esta en PC1, que es
+                        # exactamente lo que paso con CART-021.
+                        "dirigido_a": c.get("dirigido_a", []),
+                        **({"estacion": c["estacion"]} if c.get("estacion") else {}),
+                        "confirmados": conf, "pendientes": pend})
     return f"ERROR: no existe el cartel {ref}."
 
 @mcp.tool()
@@ -1579,6 +2030,39 @@ def participante_baja(id: str, frase: str = "", motivo: str = "") -> str:
                 "aviso": "queda registrado como decision del canal; su token ya no abre"})
 
 @mcp.tool()
+def participante_estacion(id: str, maquina: str, frase: str = "") -> str:
+    """(AUTORIDAD + frase) Corrige en que MAQUINA esta un participante.
+
+    La estacion se declara en el alta con lo que traiga el cliente y hasta hoy
+    no habia forma de enmendarla. `reviewauto` entro como "claude" -- el nombre
+    por defecto de su cliente -- cuando aqui esa maquina se llama L1.
+
+    No es una etiqueta: `estacion()` decide que puertos y que recursos ve cada
+    uno, y desde hoy tambien a que carteles le alcanzan. Con la estacion mal se
+    mira la vista de otra maquina, y dos servicios pueden pelearse un puerto sin
+    que nadie lo vea. Por eso va con frase, como la baja y la rotacion: mueve lo
+    que otro VE, no solo como se le llama.
+
+    Dejar `maquina` vacia deja al participante SIN estacion, que es lo correcto
+    para un humano o un servicio que no vive en ninguna."""
+    me = ident()
+    if not es_autoridad(me):
+        return "ERROR: participante_estacion es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok:
+        return err
+    pid = id.strip().lower()
+    if pid not in PARTICIPANTES:
+        return f"ERROR: '{pid}' no existe. Ver participantes()."
+    antes = PARTICIPANTES[pid].get("maquina") or ""
+    PARTICIPANTES[pid]["maquina"] = maquina.strip()
+    _guardar_participantes(); _recargar_participantes()
+    return _jd({"accion": "actualizado", "id": pid,
+                "maquina": PARTICIPANTES[pid].get("maquina", ""), "antes": antes,
+                "nota": "cambia lo que ese participante ve de puertos, recursos y carteles"})
+
+
+@mcp.tool()
 def participante_cartelera(id: str, confirma: bool, frase: str = "") -> str:
     """(AUTORIDAD + frase) Marca si un participante confirma carteles. Ponlo en false
     para servicios y para la autoridad de la que emanan las reglas."""
@@ -1884,7 +2368,7 @@ def puerto_reservar(puerto: int, servicio: str, notas: str = "", hasta: int = 0)
         return "ERROR: rango invalido (1-65535, y hasta >= puerto)."
     if not servicio.strip():
         return "ERROR: di que servicio ocupa el puerto (es el dato que evita que alguien lo mate)."
-    for r in _rows("puerto", 500, order="DESC"):
+    for r in _rows("puerto", None, order="DESC"):
         if r.get("maquina") != maq or r.get("estado") != "ocupado": continue
         if _solapa(p1, p2, int(r["puerto"]), int(r.get("hasta") or r["puerto"])):
             if r.get("dueno") != me:
@@ -1908,7 +2392,7 @@ def puerto_list(maquina: str = "", incluir_libres: bool = False) -> str:
         tipo = PARTICIPANTES.get(me, {}).get("tipo")
         if tipo == "agente" and not es_autoridad(me):
             return "ERROR: un agente solo consulta los puertos de su propia estacion."
-    out = [r for r in _rows("puerto", 500, order="DESC")
+    out = [r for r in _rows("puerto", None, order="DESC")
            if r.get("maquina") == pedida and (incluir_libres or r.get("estado") == "ocupado")]
     out.sort(key=lambda r: int(r["puerto"]))
     return _jd({"estacion": pedida, "total": len(out), "puertos": out})
@@ -1921,7 +2405,7 @@ def puerto_quien(puerto: int) -> str:
     if not maq: return "ERROR: tu identidad no tiene estacion asignada."
     try: p = int(puerto)
     except (TypeError, ValueError): return "ERROR: puerto debe ser un numero."
-    for r in _rows("puerto", 500, order="DESC"):
+    for r in _rows("puerto", None, order="DESC"):
         if r.get("maquina") == maq and r.get("estado") == "ocupado" \
                 and _solapa(p, p, int(r["puerto"]), int(r.get("hasta") or r["puerto"])):
             return _jd({"encontrado": True, "estacion": maq, "puerto": p,
@@ -2007,7 +2491,7 @@ def infra_put(id: str, tipo: str, descripcion: str, detalles: str = "{}") -> str
 @mcp.tool()
 def infra_list() -> str:
     """Servidores y servicios registrados."""
-    return _jd(_rows("infra"))
+    return _jd(_rows("infra", None))
 
 @mcp.tool()
 def search(texto: str, limite: int = 30) -> str:
@@ -2024,35 +2508,257 @@ def search(texto: str, limite: int = 30) -> str:
     return _jd(out)
 
 # ───────────── SUBDOMINIOS Y DESPLIEGUE ─────────────
+# QUE ES CADA SUBDOMINIO, Y HASTA CUANDO (9-sep-2026)
+#
+# Llamabamos "demo" a todo lo que se despliega en un subdominio, y son cosas
+# distintas con necesidades opuestas. Lo corrigio Ricardo con los tres casos
+# reales que teniamos delante:
+#
+#   evacompanion  preview de producto. Tiene que estar PUBLICO para que
+#                 Overwolf y Riot autoricen sus API. Ponerle puerta lo rompe.
+#   muestrario    recolector temporal. Abierto a proposito: una puerta habria
+#                 estorbado su cometido. Cumplio, y se quedo en linea.
+#   voicetf       la unica que de verdad necesita acceso controlado.
+#
+# El muestrario es el que enseña el agujero. Ricardo: "olvide indicarle a
+# produccion que lo eliminara cuando cumplio su cometido". El registro sabia
+# QUIEN lo pidio y no sabia QUE ERA ni HASTA CUANDO, asi que el olvido no dejaba
+# rastro en ningun sitio.
+#
+# NADA SE APAGA SOLO. Cerrar un subdominio vencido seria decidir por quien sabe
+# si esa recogida sigue en marcha. Lo que cambia es que lo vencido SE VE, aqui y
+# en el overview. Un olvido visible deja de ser un olvido.
+#
+# Y LO QUE NO SE DECLARA NO SE ADIVINA: sin tipo se marca SIN_DECLARAR, no
+# "publico". Suponer lo mas abierto en silencio es el fallo de siempre.
+TIPOS_SUB = {
+    "publico":     "abierto a cualquiera a proposito (preview de producto, sitio)",
+    "temporal":    "abierto pero con fecha: recolectores, pruebas, campañas",
+    "restringido": "requiere identidad o invitacion para entrar",
+}
+
+
+def _estado_temporal(d):
+    """Devuelve (aviso, dias) para un subdominio con fecha. ("" , None) si no aplica."""
+    if d.get("tipo") != "temporal" or not d.get("caduca"):
+        return "", None
+    try:
+        f = datetime.date.fromisoformat(str(d["caduca"])[:10])
+    except ValueError:
+        return ("la fecha de caducidad no se entiende (%r); ponla como AAAA-MM-DD"
+                % d.get("caduca")), None
+    dias = (datetime.date.today() - f).days
+    if dias > 0:
+        return ("VENCIDO hace %d dia(s) (caducaba el %s). No se apaga solo: mira si "
+                "ya cumplio y retiralo con app_eliminar + subdomain_release, o "
+                "amplia la fecha si sigue haciendo falta." % (dias, f.isoformat())), dias
+    if dias > -3:
+        return "caduca en %d dia(s) (%s)" % (-dias, f.isoformat()), dias
+    return "", dias
+
+
+def _adornar_sub(d):
+    """Anade a un subdominio lo que hay que ver sin tener que deducirlo."""
+    d = dict(d)
+    if not d.get("tipo"):
+        d["SIN_DECLARAR"] = ("no dice QUE es. No se supone que sea publico: se supone que "
+                             "nadie lo ha dicho. Declaralo con subdomain_tipo(nombre, tipo) — "
+                             "opciones: " + ", ".join(sorted(TIPOS_SUB)))
+    aviso, _ = _estado_temporal(d)
+    if aviso:
+        d["VENCIDO" if aviso.startswith("VENCIDO") else "CADUCA_PRONTO"] = aviso
+    return d
+
+
+def _validar_tipo(tipo, caduca):
+    tipo = (tipo or "").strip().lower()
+    if not tipo:
+        return "", "", None
+    if tipo not in TIPOS_SUB:
+        return None, None, ("ERROR: tipo '%s' no existe. Opciones: %s" % (
+            tipo, ", ".join("%s (%s)" % (k, v) for k, v in sorted(TIPOS_SUB.items()))))
+    caduca = (caduca or "").strip()
+    if tipo == "temporal":
+        if not caduca:
+            return None, None, ("ERROR: un subdominio 'temporal' tiene que decir cuando "
+                                "caduca (AAAA-MM-DD). Es justo lo que fallo con el "
+                                "muestrario: temporal sin fecha es permanente sin quererlo.")
+        try:
+            datetime.date.fromisoformat(caduca[:10])
+        except ValueError:
+            return None, None, "ERROR: 'caduca' tiene que ser una fecha AAAA-MM-DD."
+    elif caduca:
+        return None, None, ("ERROR: solo los 'temporal' llevan fecha de caducidad; "
+                            "'%s' no la necesita." % tipo)
+    return tipo, caduca, None
+
+
 @mcp.tool()
-def subdomain_claim(nombre: str, notas: str = "") -> str:
+def subdomain_claim(nombre: str, notas: str = "", tipo: str = "", caduca: str = "") -> str:
     """Reserva un subdominio para MI identidad. El despliegue es por HTTPS con tu
-    token (ver deploy_info()), no hace falta SSH."""
+    token (ver deploy_info()), no hace falta SSH.
+
+    `tipo`: publico | temporal | restringido. Si es temporal, `caduca` (AAAA-MM-DD)
+    es obligatorio. No declararlo se acepta, pero queda marcado: nadie adivina por
+    ti que es lo que has puesto ahi."""
     me = ident()
     nombre = nombre.strip().lower()
     if not NOMBRE_RE.match(nombre): return "ERROR: solo minúsculas, números y guiones (max 31)."
     if nombre in RESERVADOS: return f"ERROR: '{nombre}' está reservado."
+    tipo, caduca, err = _validar_tipo(tipo, caduca)
+    if err: return err
     _, d = _get("subdomain", nombre)
     if d and d.get("estado") in ("ocupado", "solicitado") and d.get("dueno") != me:
         return f"ERROR: '{nombre}' ya es de '{d.get('dueno')}' (estado {d.get('estado')})."
+    extra = {}
+    if tipo: extra["tipo"] = tipo
+    if caduca: extra["caduca"] = caduca
     if es_autoridad(me):
         res = _put("subdomain", nombre, {"nombre": nombre, "dueno": me, "estado": "ocupado",
                                          "url": f"https://{nombre}.{DOMAIN}", "notas": notas,
-                                         "aprobado_por": me, "aprobado": now()})
-        return _jd({**res, "estado": "ocupado", "url": f"https://{nombre}.{DOMAIN}",
-                    "siguiente_paso": "PUT del tar.gz a /<TU_TOKEN>/deploy/" + nombre + " (estatico) o /<TU_TOKEN>/app/" + nombre + " (dinamico)"})
+                                         "aprobado_por": me, "aprobado": now(), **extra})
+        salida = {**res, "estado": "ocupado", "url": f"https://{nombre}.{DOMAIN}",
+                  "siguiente_paso": "PUT del tar.gz a /<TU_TOKEN>/deploy/" + nombre + " (estatico) o /<TU_TOKEN>/app/" + nombre + " (dinamico)"}
+        if not tipo:
+            salida["AVISO"] = ("no has dicho QUE es. Declaralo con subdomain_tipo(): "
+                               + ", ".join(sorted(TIPOS_SUB)))
+        return _jd(salida)
     res = _put("subdomain", nombre, {"nombre": nombre, "dueno": me, "estado": "solicitado",
                                      "url": f"https://{nombre}.{DOMAIN}", "notas": notas,
-                                     "solicitado": now()})
+                                     "solicitado": now(), **extra})
     return _jd({**res, "estado": "solicitado",
                 "siguiente_paso": "pendiente de aprobacion de la autoridad; hasta entonces no se puede desplegar ni se emite certificado TLS"})
 
+
+@mcp.tool()
+def subdomain_tipo(nombre: str, tipo: str, caduca: str = "") -> str:
+    """Declara QUE es un subdominio ya reservado, y hasta cuando si es temporal.
+
+    Existe aparte de subdomain_claim para poder declarar los que ya estaban antes
+    de que esto existiera, sin volver a reservarlos."""
+    me = ident()
+    nombre = nombre.strip().lower()
+    _, d = _get("subdomain", nombre)
+    if not d: return f"ERROR: '{nombre}' no está registrado."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{nombre}' es de '{d.get('dueno')}'; solo su dueno o la autoridad."
+    tipo, caduca, err = _validar_tipo(tipo, caduca)
+    if err: return err
+    if not tipo:
+        return "ERROR: di el tipo. Opciones: " + ", ".join(sorted(TIPOS_SUB))
+    d["tipo"] = tipo
+    d.pop("caduca", None)
+    if caduca: d["caduca"] = caduca
+    d["tipo_declarado_por"] = me
+    _put("subdomain", nombre, d)
+    return _jd(_adornar_sub(d))
+
+
+# ───────────── PASES: dejar entrar a UNA demo, y poder quitarlo ─────────────
+# NO se llaman "invitaciones" a proposito. Una invitacion en este canal es para
+# ENTRAR AL CANAL como participante (alta_invitar). Un pase es para VER UNA
+# DEMO y nada mas. Compartir la palabra invitaria a confundir dos cosas que dan
+# permisos muy distintos -- y hoy mismo aprendimos lo que cuesta llamar igual a
+# cosas distintas: "demo" significaba tres cosas.
+@mcp.tool()
+def pase_crear(subdominio: str, para: str, dias: int = 7, puede_lanzar: bool = False) -> str:
+    """Crea un pase para que alguien de fuera entre a UN subdominio restringido.
+
+    `para` es para quien es, en tus palabras: queda en el registro para que
+    cuando esa persona haga algo se sepa de quien era el pase, en vez de
+    'anonimo'. No es un dato de la persona: es tu etiqueta.
+
+    `puede_lanzar` es FALSO por omision (decision de Ricardo, 9-sep): un
+    invitado SOLO MIRA salvo que se marque expresamente. Un pase repartido de
+    mas no debe costar GPU.
+
+    Caduca a los `dias` (7 por omision) y se puede anular en cualquier momento."""
+    me = ident()
+    sub = subdominio.strip().lower()
+    _, d = _get("subdomain", sub)
+    if not d:
+        return f"ERROR: el subdominio '{sub}' no esta registrado."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{sub}' es de '{d.get('dueno')}'; solo su dueno o la autoridad."
+    if d.get("tipo") != "restringido":
+        return (f"ERROR: '{sub}' es '{d.get('tipo') or 'sin declarar'}', no restringido. "
+                "Un pase no sirve de nada donde no hay puerta: declaralo primero con "
+                "subdomain_tipo(nombre, 'restringido').")
+    if not para.strip():
+        return ("ERROR: di para quien es. Sin eso, cuando esa persona haga algo el "
+                "registro dira 'anonimo' y no habra forma de saber que pase revocar.")
+    try:
+        n = _n(dias, "dias")
+    except ValueError as e:
+        return f"ERROR: {e}"
+    if not 1 <= n <= 90:
+        return "ERROR: los dias tienen que estar entre 1 y 90. Un pase sin fin es una puerta abierta que nadie recuerda haber dejado."
+    codigo = secrets.token_urlsafe(18)
+    expira = (datetime.datetime.now(datetime.timezone.utc)
+              + datetime.timedelta(days=n)).isoformat(timespec="seconds")
+    _put("pase", codigo, {"id": codigo, "subdominio": sub, "para": para.strip(),
+                          "de": me, "creado": now(), "expira": expira,
+                          "puede_lanzar": bool(puede_lanzar), "estado": "vivo", "usos": 0})
+    return _jd({"pase": codigo, "subdominio": sub, "para": para.strip(),
+                "caduca": expira, "puede_lanzar": bool(puede_lanzar),
+                "enlace": f"https://{sub}.{DOMAIN}/_pase/{codigo}",
+                "como_anularlo": f"pase_anular('{codigo}')",
+                "aviso": ("quien tenga este enlace entra. Mandalo por un canal privado y "
+                          "anulalo cuando ya no haga falta.")})
+
+
+@mcp.tool()
+def pase_anular(pase: str) -> str:
+    """Revoca un pase. Efecto inmediato: la siguiente peticion ya no pasa."""
+    me = ident()
+    _, p = _get("pase", pase.strip())
+    if not p:
+        return "ERROR: no existe ese pase."
+    _, d = _get("subdomain", p.get("subdominio", ""))
+    if p.get("de") != me and (d or {}).get("dueno") != me and not es_autoridad(me):
+        return "ERROR: solo quien lo creo, el dueno del subdominio o la autoridad."
+    if p.get("estado") != "vivo":
+        return _jd({"pase": p["id"], "estado": p["estado"], "nota": "ya no estaba vivo"})
+    p["estado"] = "anulado"; p["anulado_por"] = me; p["anulado"] = now()
+    _put("pase", p["id"], p)
+    return _jd({"pase": p["id"], "estado": "anulado", "subdominio": p.get("subdominio"),
+                "para": p.get("para"), "usos_que_tuvo": p.get("usos", 0)})
+
+
+@mcp.tool()
+def pase_list(subdominio: str = "") -> str:
+    """Pases emitidos, con su estado real. Los caducados salen marcados: un pase
+    que ya no vale y uno que si tienen que distinguirse de un vistazo."""
+    me = ident()
+    ahora = datetime.datetime.now(datetime.timezone.utc)
+    out = []
+    for p in _rows("pase", 500, order="DESC"):
+        if subdominio and p.get("subdominio") != subdominio.strip().lower():
+            continue
+        _, d = _get("subdomain", p.get("subdominio", ""))
+        if p.get("de") != me and (d or {}).get("dueno") != me and not es_autoridad(me):
+            continue
+        fila = {k: p.get(k) for k in ("id", "subdominio", "para", "de", "creado",
+                                      "expira", "puede_lanzar", "estado", "usos",
+                                      "ultimo_uso")}
+        if p.get("estado") == "vivo":
+            try:
+                if datetime.datetime.fromisoformat(p["expira"]) < ahora:
+                    fila["CADUCADO"] = ("dice 'vivo' pero la fecha ya paso: no deja entrar. "
+                                        "Anulalo para quitarlo de en medio.")
+            except Exception:
+                fila["FECHA_ILEGIBLE"] = "no se entiende su fecha; no deja entrar"
+        out.append(fila)
+    return _jd(out)
+
+
 @mcp.tool()
 def subdomain_list(solo_ocupados: bool = False) -> str:
-    """Subdominios registrados."""
-    rows = _rows("subdomain")
+    """Subdominios registrados, con lo que hay que ver: que es cada uno y si
+    alguno se paso de fecha."""
+    rows = _rows("subdomain", None)
     if solo_ocupados: rows = [r for r in rows if r.get("estado") == "ocupado"]
-    return _jd(rows)
+    return _jd([_adornar_sub(r) for r in rows])
 
 @mcp.tool()
 def subdomain_release(nombre: str) -> str:
@@ -2070,7 +2776,7 @@ def subdomain_release(nombre: str) -> str:
 def subdomain_pendientes() -> str:
     """(SOLO autoridad) Subdominios solicitados esperando aprobación."""
     if not es_autoridad(ident()): return "ERROR: subdomain_pendientes es de la autoridad."
-    return _jd([r for r in _rows("subdomain", 300) if r.get("estado") == "solicitado"])
+    return _jd([r for r in _rows("subdomain", None) if r.get("estado") == "solicitado"])
 
 @mcp.tool()
 def subdomain_aprobar(nombre: str, nota: str = "") -> str:
@@ -2202,7 +2908,7 @@ def _app_owned(nombre):
 @mcp.tool()
 def app_list() -> str:
     """Apps dinámicas registradas y su estado."""
-    rows = _rows("app")
+    rows = _rows("app", None)
     for r in rows:
         rc, out = _sudo_ctl("status", r["_key"])
         r["_estado_systemd"] = out.splitlines()[0] if out else "?"
@@ -2339,7 +3045,7 @@ async def deploy_app(request, pid):
     if ad and ad.get("puerto"):
         puerto = ad["puerto"]
     else:
-        usados = {a.get("puerto") for a in _rows("app")}
+        usados = {a.get("puerto") for a in _rows("app", None)}
         puerto = next(p for p in range(9100, 9900) if p not in usados)
     rc, out = _sudo_ctl("install", nombre, str(puerto))
     if rc != 0:
@@ -2446,7 +3152,233 @@ async def sitio_get(request):
     from starlette.responses import FileResponse
     return FileResponse(destino)
 
-_rutas = [Route("/health", health), Route("/tls-check", tls_check), Route("/panel", panel_get)]
+# ═══════════════ PUERTA DE LOS SUBDOMINIOS RESTRINGIDOS (SOL-035) ═══════════════
+#
+# QUE PROBLEMA RESUELVE. Las demos no tenian puerta: quien daba con la direccion
+# entraba. Con la de voicetf a punto de aceptar ENCARGOS, cualquiera que diera
+# con el subdominio podria poner a trabajar la GPU de PC1 -- y sabemos que hay
+# escaneres barriendo los subdominios a diario.
+#
+# LO QUE PIDIO VOICETF, y es la parte importante del diseño: que ELLOS NO TOQUEN
+# CREDENCIALES. La autenticacion termina aqui y su app recibe la peticion ya
+# resuelta en cabeceras. Si mañana cambia el mecanismo, su app no se entera.
+# Es el mismo principio que sellar el remitente de un mensaje: la identidad la
+# pone el servidor, nunca el que llama.
+#
+# DOS IDENTIDADES DISTINTAS, y la diferencia es lo que hace esto seguro:
+#   dueño     entra con SU token del canal. Su cookie vale para todo el dominio.
+#   invitado  canja un pase. Su cookie vale SOLO para ese host, caduca y se
+#             revoca. Un pase de voicetf no abre ninguna otra demo.
+#
+# EL INVITADO SOLO MIRA (decision de Ricardo, 9-sep). Lanzar trabajo es una
+# marca explicita del pase, no lo que pasa por omision: una invitacion repartida
+# de mas no debe costar GPU.
+#
+# EL AGUJERO QUE HAY QUE CERRAR EN CADDY, y sin el nada de esto sirve: Caddy
+# tiene que BORRAR toda cabecera X-State-* que venga del cliente antes de poner
+# las suyas. Si no, cualquiera manda "X-State-Rol: dueno" y entra como Ricardo.
+
+import base64          # el modulo no lo tenia: la firma de la cookie lo necesita
+import hmac as _hmac
+from starlette.responses import RedirectResponse
+
+# DOS NameError EN ESTA MISMA PIEZA, el 9-sep: base64 y RedirectResponse. Los dos
+# vivian en un camino concreto -- uno solo en el de error, otro solo en el de
+# exito -- y `ast.parse` no ve ninguno: comprobar que un fichero es Python valido
+# no comprueba que los nombres existan. Lo unico que los caza es EJECUTAR cada
+# camino, y por eso la bateria ejercita ahora tambien el canje.
+
+_CLAVE_COOKIE_F = os.environ.get("EVASTATE_COOKIE_KEY",
+                                 os.path.join(os.path.dirname(DB_PATH), "cookie.key"))
+
+def _clave_cookie():
+    """Secreto para firmar la cookie. Se genera solo la primera vez y se queda."""
+    try:
+        with open(_CLAVE_COOKIE_F, "rb") as f:
+            k = f.read().strip()
+            if len(k) >= 32:
+                return k
+    except OSError:
+        pass
+    k = base64.urlsafe_b64encode(os.urandom(48))
+    tmp = _CLAVE_COOKIE_F + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(k)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, _CLAVE_COOKIE_F)
+    return k
+
+
+def _firmar(datos: dict) -> str:
+    crudo = json.dumps(datos, separators=(",", ":"), sort_keys=True).encode()
+    cuerpo = base64.urlsafe_b64encode(crudo).decode().rstrip("=")
+    firma = _hmac.new(_clave_cookie(), cuerpo.encode(), hashlib.sha256).hexdigest()[:32]
+    return cuerpo + "." + firma
+
+
+def _abrir_firmado(valor: str):
+    """Devuelve el contenido o None. Nunca 'medio valido': o la firma cuadra o no."""
+    try:
+        cuerpo, firma = valor.rsplit(".", 1)
+    except (ValueError, AttributeError):
+        return None
+    esperada = _hmac.new(_clave_cookie(), cuerpo.encode(), hashlib.sha256).hexdigest()[:32]
+    if not secrets.compare_digest(firma, esperada):
+        return None
+    try:
+        relleno = "=" * (-len(cuerpo) % 4)
+        d = json.loads(base64.urlsafe_b64decode(cuerpo + relleno))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("exp", 0) < time.time():
+        return None
+    return d
+
+
+def _sub_de_host(host: str) -> str:
+    h = (host or "").split(":")[0].lower()
+    if h.endswith("." + DOMAIN):
+        return h[: -(len(DOMAIN) + 1)]
+    return ""
+
+
+def _tipo_de_sub(nombre: str) -> str:
+    _, d = _get("subdomain", nombre)
+    return (d or {}).get("tipo", "") if d else ""
+
+
+def _pase_vivo(pid: str):
+    _, p = _get("pase", pid)
+    if not p or p.get("estado") != "vivo":
+        return None
+    try:
+        if datetime.datetime.fromisoformat(p["expira"]) < datetime.datetime.now(datetime.timezone.utc):
+            return None
+    except Exception:
+        return None
+    return p
+
+
+def _cookie_nombre(host):
+    return "eva_pase"
+
+
+# Lo que ve quien llega a una demo restringida sin pase. forward_auth devuelve
+# esta respuesta TAL CUAL al visitante, asi que es la cara del sitio: tiene que
+# decir donde esta y que hacer, sin revelar que hay detras ni quien puede entrar.
+_PAGINA_SIN_PASE = """<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>Acceso restringido</title>
+<style>
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      background:#15161a;color:#e8e8ea;font:16px/1.6 system-ui,sans-serif;padding:24px}
+ main{max-width:29rem} h1{font-size:1.4rem;margin:0 0 .8rem;font-weight:600}
+ p{margin:.6rem 0;color:#b8b9c0} code{background:#22242b;padding:.15em .4em;border-radius:4px;
+      font-size:.9em;color:#d8d9e0}
+</style></head><body><main>
+<h1>Esto no es publico</h1>
+<p>Para entrar hace falta un enlace de invitacion. Si te han pasado uno,
+   abrelo: termina en <code>/_pase/&hellip;</code> y te deja dentro sin
+   contrasena.</p>
+<p>Si tu enlace ya no funciona, puede haber caducado o haberse retirado.
+   Pideselo de nuevo a quien te invito.</p>
+<p>Si esto es tuyo, entra con tu identidad de siempre.</p>
+</main></body></html>"""
+
+
+async def auth_get(request):
+    """Lo llama Caddy por cada peticion a un subdominio restringido (forward_auth).
+
+    200 -> deja pasar, y las cabeceras que devuelve son las que ve la app.
+    401 -> no hay identidad: se manda a la pagina de entrada.
+    403 -> hay identidad pero no para este subdominio."""
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    sub = _sub_de_host(host)
+    if not sub:
+        return PlainTextResponse("host desconocido", status_code=403)
+    tipo = _tipo_de_sub(sub)
+    # Un subdominio que NO es restringido pasa siempre. Asi este endpoint es
+    # inofensivo si alguien lo enchufa donde no toca, y declarar 'restringido'
+    # es lo unico que enciende la puerta.
+    if tipo != "restringido":
+        return PlainTextResponse("", status_code=200, headers={
+            "X-State-Identidad": "", "X-State-Rol": "publico", "X-State-Invitacion": ""})
+    ses = _abrir_firmado(request.cookies.get(_cookie_nombre(host), ""))
+    if not ses:
+        # forward_auth devuelve al visitante ESTA respuesta tal cual, asi que es
+        # la cara del sitio para quien llega sin pase. Un "sin identidad" a secas
+        # deja a alguien mirando una pantalla que no le dice que hacer.
+        return HTMLResponse(_PAGINA_SIN_PASE, status_code=401,
+                            headers={"Cache-Control": "no-store"})
+    if ses.get("rol") == "dueno":
+        return PlainTextResponse("", status_code=200, headers={
+            "X-State-Identidad": ses.get("id", ""), "X-State-Rol": "dueno",
+            "X-State-Invitacion": "", "X-State-Puede-Lanzar": "si"})
+    # Invitado: su pase tiene que ser de ESTE subdominio y seguir vivo.
+    if ses.get("sub") != sub:
+        return PlainTextResponse("ese pase no es de este sitio", status_code=403)
+    p = _pase_vivo(ses.get("pase", ""))
+    if not p:
+        return PlainTextResponse("pase caducado o anulado", status_code=403)
+    return PlainTextResponse("", status_code=200, headers={
+        "X-State-Identidad": "invitado:" + p.get("para", "")[:40],
+        "X-State-Rol": "invitado",
+        "X-State-Invitacion": p.get("id", ""),
+        # Decision de Ricardo (9-sep): el invitado SOLO MIRA salvo marca expresa.
+        "X-State-Puede-Lanzar": "si" if p.get("puede_lanzar") else "no"})
+
+
+async def entrar_post(request):
+    """El dueño entra con su token del canal. Sin cuenta nueva ni otra contraseña."""
+    try:
+        datos = json.loads(await request.body() or b"{}")
+    except Exception:
+        datos = {}
+    tok = (datos.get("token") or "").strip()
+    pid = TOKEN_INDEX.get(_sha(tok)) if tok else None
+    if not pid:
+        _dormir_antifuerza()
+        return JSONResponse({"ok": False, "error": "token no valido"}, status_code=401)
+    exp = time.time() + 12 * 3600
+    galleta = _firmar({"id": pid, "rol": "dueno", "sub": "*", "exp": exp})
+    r = JSONResponse({"ok": True, "id": pid, "rol": "dueno", "horas": 12})
+    # Para TODO el dominio: el dueño entra a cualquier subdominio suyo.
+    r.set_cookie(_cookie_nombre(""), galleta, max_age=12 * 3600, httponly=True,
+                 secure=True, samesite="lax", domain="." + DOMAIN, path="/")
+    return r
+
+
+async def pase_canjear(request):
+    """Un invitado canjea su codigo. La cookie que recibe vale SOLO para este host."""
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    sub = _sub_de_host(host)
+    codigo = request.path_params.get("codigo", "")
+    _, p = _get("pase", codigo)
+    # Mismo mensaje para "no existe", "anulado" y "de otro sitio": distinguirlos
+    # convierte esto en un oraculo para adivinar codigos ajenos.
+    if not p or not _pase_vivo(codigo) or p.get("subdominio") != sub:
+        return HTMLResponse("<h1>Este pase no vale aqui</h1><p>Puede estar caducado, "
+                            "anulado, o ser de otro sitio. Pidele uno nuevo a quien "
+                            "te invito.</p>", status_code=403,
+                            headers={"Cache-Control": "no-store"})
+    exp = min(time.time() + 12 * 3600,
+              datetime.datetime.fromisoformat(p["expira"]).timestamp())
+    galleta = _firmar({"id": "invitado", "rol": "invitado", "pase": codigo,
+                       "sub": sub, "exp": exp})
+    p["ultimo_uso"] = now()
+    p["usos"] = int(p.get("usos", 0)) + 1
+    _put("pase", codigo, p)
+    r = RedirectResponse("/", status_code=302)
+    # SIN domain=: la cookie queda atada a ESTE host. Un pase de una demo no
+    # puede reutilizarse en otra ni aunque alguien lo intente a mano.
+    r.set_cookie(_cookie_nombre(host), galleta, max_age=int(exp - time.time()),
+                 httponly=True, secure=True, samesite="lax", path="/")
+    return r
+
+
+_rutas = [Route("/health", health), Route("/tls-check", tls_check), Route("/panel", panel_get),
+          Route("/_auth", auth_get), Route("/_entrar", entrar_post, methods=["POST"]),
+          Route("/_pase/{codigo}", pase_canjear)]
 if SERVE_SITES:
     _rutas += [Route("/s/{nombre}/{resto:path}", sitio_get), Route("/s/{nombre}", sitio_get)]
 
