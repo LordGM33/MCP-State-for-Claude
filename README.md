@@ -171,3 +171,15 @@ creates participants. Details: `docs/SCOPE-AND-LIMITS.md`.
 
 MIT — free use, modification and redistribution, as long as the copyright
 notice (credit) is preserved. See `LICENSE`.
+
+## Tool reference
+
+[`docs/TOOLS.md`](docs/TOOLS.md) lists all 77 tools with their signatures,
+grouped by area. It is **generated** from `server.py` by
+`scripts/tools_reference.py`, which exits non-zero when a tool has no
+description — so a new capability cannot ship undocumented.
+
+That check exists because it happened: 19 of 77 tools were described
+nowhere, including the whole access-pass mechanism. Nothing had gone
+wrong. Hand-written docs drift, and a stale document is confidently
+wrong where a missing one is visibly missing.
