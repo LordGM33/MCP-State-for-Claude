@@ -116,6 +116,14 @@ sudo chmod 644 "$ETC/scrum.env"
 
 sudo tee "/etc/systemd/system/$UNIDAD.service" >/dev/null <<UNIT
 [Unit]
+# Si esto falla, que se sepa. Un exportador que deja de exportar no rompe nada
+# visible: el documento simplemente se queda con una foto vieja, y quien lo lea
+# no tiene forma de saber que es vieja. La causa mas probable es que caduque o
+# se borre la credencial de Google, y eso deja de autenticar EN SILENCIO.
+# Se anadio el 9-sep-2026 al comprobar, por una pregunta de otro agente sobre
+# que proyectos de Google Cloud se podian borrar, que esta unidad no avisaba de
+# nada. La unidad de aviso es opcional: si no existe, systemd la ignora.
+OnFailure=eva-aviso.service
 Description=Publica el registro de compromisos en un documento de Drive
 After=network-online.target
 [Service]

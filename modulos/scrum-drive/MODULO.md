@@ -89,3 +89,14 @@ above, and refuses to continue without confirmation.
 Stops and deletes the timer, the unit and the script. **It does not delete the
 credential**, on purpose: removing a key is a decision with consequences outside
 this host, so it tells you where it is and lets you do it.
+
+## If it fails, you will be told
+
+The unit is installed with `OnFailure=eva-aviso.service`. An exporter that stops
+exporting breaks nothing visible: the document simply keeps an old snapshot, and
+whoever reads it has no way to tell that it is old. The likeliest cause is a
+Google credential that expired or was deleted, and that stops authenticating
+silently.
+
+`eva-aviso.service` is optional -- systemd ignores an `OnFailure` pointing at a
+unit that does not exist, so this costs nothing if you do not want the alert.
