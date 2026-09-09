@@ -232,9 +232,34 @@ def herramientas():
     return out
 
 
+def perfiles():
+    """Which edition each tool belongs to, read from the server's own table.
+
+    Not copied here. A second list with the same intent is how two files that
+    meant the same thing ended up disagreeing, and nobody noticed for days.
+    """
+    src = open(SERVER, encoding="utf-8").read()
+    i = src.find("PERFIL_HERRAMIENTA = {")
+    if i < 0:
+        return {}, set()
+    bloque = src[i:src.find("\n}", i)]
+    perf = dict(re.findall(r'"(\w+)":\s*"(ambos|vps|escritorio)"', bloque))
+    # RETIRANDOSE se construye por prefijo en el servidor; se refleja igual aqui
+    # en vez de copiar una lista que se quedaria atras.
+    j = src.find("RETIRANDOSE = {")
+    retirados = set()
+    if j > 0:
+        pref = re.findall(r'startswith\(\(([^)]*)\)\)', src[j:j + 400])
+        if pref:
+            trozos = tuple(x.strip().strip("\"'") for x in pref[0].split(","))
+            retirados = {n for n in perf if n.startswith(trozos)}
+    return perf, retirados
+
+
 def main(argv):
     solo_comprobar = "--check" in argv
     tools = herramientas()
+    perf, retirados = perfiles()
 
     agrupadas = {n for _, _, ns in GRUPOS for n in ns}
     sin_resumen = sorted(t for t in tools if t not in RESUMEN)
@@ -248,6 +273,10 @@ def main(argv):
         problemas.append("tools in no section: " + ", ".join(sin_grupo))
     if fantasmas:
         problemas.append("described but no longer in server.py: " + ", ".join(fantasmas))
+    sin_perfil = sorted(t for t in tools if t not in perf)
+    if perf and sin_perfil:
+        problemas.append("tools with no profile in PERFIL_HERRAMIENTA: "
+                         + ", ".join(sin_perfil))
 
     if problemas:
         print("docs/TOOLS.md is out of date:")
@@ -276,12 +305,25 @@ def main(argv):
         "",
         "%d tools." % len(tools),
         "",
+        "Tools marked **VPS edition only** administer something that lives on the",
+        "server -- TLS on demand, systemd units, a root helper -- so a desktop",
+        "install does not expose them. Everything else coordinates people and",
+        "agents and exists in both editions. The classification lives in",
+        "`PERFIL_HERRAMIENTA` in `server.py`; this document reads it rather than",
+        "keeping a second copy that would drift.",
+        "",
     ]
     for titulo, intro, nombres in GRUPOS:
         lineas += ["## " + titulo, "", " ".join(intro.split()), ""]
         for n in nombres:
-            lineas += ["### `%s(%s)`" % (n, tools[n]), "",
+            etiqueta = {"vps": " · **VPS edition only**",
+                        "escritorio": " · **desktop edition only**"}.get(perf.get(n), "")
+            lineas += ["### `%s(%s)`%s" % (n, tools[n], etiqueta), "",
                        " ".join(RESUMEN[n].split()), ""]
+            if n in retirados:
+                lineas += ["> **Being retired.** Local resource management left this "
+                           "server's scope; it is handled by the workstation's own "
+                           "arbiter. Do not build on these.", ""]
 
     os.makedirs(os.path.dirname(SALIDA), exist_ok=True)
     with open(SALIDA, "w", encoding="utf-8", newline="\n") as f:

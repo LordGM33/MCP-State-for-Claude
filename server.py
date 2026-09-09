@@ -301,6 +301,56 @@ def estacion(pid=None):
 def _solapa(a1, a2, b1, b2):
     return a1 <= b2 and b1 <= a2
 
+def _hace_minutos(cuando):
+    """Minutos desde una marca ISO, o None si no se puede leer.
+
+    Devolver None y no 0: un dato cuya edad no se puede calcular NO es un dato
+    recien hecho, y 0 se lee exactamente asi."""
+    try:
+        d = datetime.datetime.fromisoformat(cuando)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return int((datetime.datetime.now(datetime.timezone.utc) - d).total_seconds() // 60)
+    except (TypeError, ValueError):
+        return None
+
+
+def _no_lo_se(porque, ultima_vez=None, sobre=""):
+    """LA forma de decir que algo no se pudo comprobar. Una, no doce.
+
+    El canal ya avisaba de esto, pero cada herramienta invento su clave --
+    MEDICION_VIEJA, SIN_DECLARAR, SIN_MEDIR, SE_PASO, CADUCADO... -- con su prosa
+    en castellano. Sirve para una persona y no para un cliente, que tendria que
+    conocer las doce y leer el idioma para ramificar. Lo que un cliente no puede
+    detectar, acaba ignorandolo.
+
+    `porque` es obligatorio a proposito: "no lo se" sin motivo no se distingue de
+    un fallo, y manda a buscar en el sitio equivocado.
+    """
+    d = {"sabido": False, "porque": porque}
+    if sobre:
+        d["sobre"] = sobre
+    if ultima_vez:
+        d["ultima_vez_que_se_supo"] = ultima_vez
+        d["hace_minutos"] = _hace_minutos(ultima_vez)
+    return d
+
+
+def _lo_se(valor, fuente="", cuando=None):
+    """La contraria: se sabe, y se dice de donde y de cuando.
+
+    La edad va SIEMPRE que haya fecha. Un dato de hace dos meses y uno de hoy se
+    leen igual si ninguno dice cuantos dias tiene, y esa es la mitad silenciosa
+    del mismo problema."""
+    d = {"sabido": True, "valor": valor}
+    if fuente:
+        d["fuente"] = fuente
+    if cuando:
+        d["cuando"] = cuando
+        d["hace_minutos"] = _hace_minutos(cuando)
+    return d
+
+
 def estacion_de(pid):
     """La estacion normalizada de CUALQUIER participante, no solo la del que llama.
 
@@ -636,6 +686,17 @@ def recurso_estado(recurso: str = "") -> str:
                 "libre_segun_lo_declarado": libre, "notas": r.get("notas", ""),
                 "tomado_por": tomas}
         _, med = _get("medicion", f"{maq}:{rid}")
+        # LA AUSENCIA ERA EL SILENCIO. Hasta hoy, sin medicion no se anadia
+        # ningun campo, y un campo que falta se lee como "nada que senalar"
+        # cuando significa lo contrario: que NADIE HA MEDIDO NUNCA y que todo lo
+        # de arriba son reservas declaradas, no consumo.
+        fila["consumo_real"] = (
+            _lo_se(med.get("usado"), med.get("medido_por"), med.get("cuando"))
+            if med else
+            _no_lo_se("nadie ha medido nunca este recurso. `declarado` son "
+                      "RESERVAS: lo que la gente dijo que iba a usar, no lo que "
+                      "la maquina esta usando. Mide con recurso_medir.",
+                      sobre="cuanto se esta usando de verdad"))
         if med:
             fila["medido"] = med.get("usado")
             fila["medido_cuando"] = med.get("cuando")
@@ -926,7 +987,17 @@ def herramienta_estado(id: str = "") -> str:
         hid, hmaq = h.get("herramienta"), h.get("maquina")
         fila = {"herramienta": hid, "maquina": hmaq, "puerto": h.get("puerto"),
                 "arranque": h.get("arranque", ""), "notas": h.get("notas", ""),
-                "arrancarla": "LIBRE: cualquiera, sin permiso ni turno"}
+                "arrancarla": "LIBRE: cualquiera, sin permiso ni turno",
+                # EL CANAL NO MIRA LA MAQUINA. Lo de abajo habla de PERMISOS, no
+                # de procesos, y el 3-sep se leyo como "sigue encendida" con PC1
+                # apagada. La herramienta era honesta en lo suyo y aun asi enganó,
+                # porque callaba sobre lo otro: un dato que falta se lee como un
+                # dato que no hace falta.
+                "encendida": _no_lo_se(
+                    "el canal no observa procesos: solo registra lo que se declara. "
+                    "Para saber si esta viva, preguntale a su estacion o mira el puerto.",
+                    ultima_vez=h.get("_creado"),
+                    sobre="si el proceso esta corriendo ahora mismo")}
         abierta = next((x for x in paradas if x.get("herramienta") == hid
                         and x.get("maquina") == hmaq
                         and x.get("estado") == "pedida"), None)
@@ -1021,6 +1092,79 @@ def rotacion_estado() -> str:
                          "conectarse, mira ultima_conexion antes de dar por hecho que te ignora.")})
 
 # ───────────── IDENTIDAD ─────────────
+# ───────────── PERFIL DE CADA HERRAMIENTA (FECHA-025, parte 2) ─────────────
+# En que edicion vive cada herramienta. Hoy SOLO SE DECLARA: el catalogo sigue
+# siendo el mismo en todas partes. Filtrar de verdad es el paso siguiente, y va
+# aparte a proposito -- un cambio que introduce una clasificacion y la aplica a
+# la vez no se puede revisar ni revertir por partes.
+#
+#   "ambos"      coordina personas o agentes: existe en las dos ediciones
+#   "vps"        administra algo que vive en el servidor (Caddy, TLS bajo
+#                demanda, unidades systemd, ayudante root). En una instalacion
+#                de escritorio no hay nada de eso, asi que ofrecerla seria
+#                ofrecer algo que va a fallar
+#   "escritorio" solo tendria sentido sin servidor. Hoy no hay ninguna; se deja
+#                el valor porque el canal en caliente de la parte 3 sera la
+#                primera, y es la que justifica que la edicion exista
+#
+# El guardian de que esto no se quede atras es un caso de la bateria que lo
+# compara contra tools/list. Una clasificacion que vive lejos del catalogo
+# diverge del catalogo.
+PERFIL_HERRAMIENTA = {
+    # — coordinacion: el nucleo, y lo que hace que la edicion de escritorio valga
+    "whoami": "ambos", "state_overview": "ambos", "participantes": "ambos",
+    "parametros": "ambos", "search": "ambos",
+    "msg_send": "ambos", "msg_inbox": "ambos", "msg_leer": "ambos",
+    "msg_desde": "ambos", "msg_hilo": "ambos", "msg_ack": "ambos",
+    "msg_historial": "ambos", "sol_cerrar": "ambos",
+    "cartel_publicar": "ambos", "cartelera": "ambos", "cartel_confirmar": "ambos",
+    "cartel_estado": "ambos", "cartel_cerrar": "ambos",
+    "fecha_comprometer": "ambos", "fecha_mover": "ambos", "fecha_estado": "ambos",
+    "fecha_list": "ambos", "fecha_quien": "ambos", "fecha_hilo": "ambos",
+    "decision_log": "ambos", "decision_list": "ambos",
+    "fact_set": "ambos", "fact_get": "ambos", "fact_list": "ambos",
+    "infra_put": "ambos", "infra_list": "ambos",
+    # — identidad y llaves: sin esto no hay canal en ninguna edicion
+    "alta_invitar": "ambos", "altas_pendientes": "ambos", "alta_aprobar": "ambos",
+    "alta_rechazar": "ambos", "participante_baja": "ambos",
+    "participante_estacion": "ambos", "participante_cartelera": "ambos",
+    "rotacion_invitar": "ambos", "rotacion_estado": "ambos",
+    "rotacion_anular": "ambos", "rotacion_cerrar": "ambos",
+    "token_confirmar": "ambos", "intentos_frase": "ambos",
+    # — puertos: son de la estacion, no del servidor. En escritorio hacen MAS
+    #   falta, porque ahi es donde chocan de verdad
+    "puerto_reservar": "ambos", "puerto_list": "ambos", "puerto_quien": "ambos",
+    "puerto_liberar": "ambos",
+    # — recursos y herramientas compartidas: viven en las dos ediciones, PERO
+    #   estan en retirada (ver RETIRANDOSE). Las dos cosas a la vez, y por eso
+    #   son dos campos
+    "recurso_declarar": "ambos", "recurso_tomar": "ambos", "recurso_soltar": "ambos",
+    "recurso_estado": "ambos", "recurso_medir": "ambos",
+    "herramienta_declarar": "ambos", "herramienta_estado": "ambos",
+    "herramienta_parada_pedir": "ambos", "herramienta_parada_autorizar": "ambos",
+    "herramienta_parada_cerrar": "ambos",
+    # — VPS: todo esto necesita Caddy, TLS bajo demanda, unidades systemd o el
+    #   ayudante root. En escritorio no existe nada de eso
+    "subdomain_claim": "vps", "subdomain_tipo": "vps", "subdomain_list": "vps",
+    "subdomain_release": "vps", "subdomain_pendientes": "vps",
+    "subdomain_aprobar": "vps", "subdomain_rechazar": "vps",
+    "pase_crear": "vps", "pase_anular": "vps", "pase_list": "vps",
+    "deploy_info": "vps", "app_list": "vps", "app_status": "vps", "app_logs": "vps",
+    "app_restart": "vps", "app_stop": "vps", "app_start": "vps",
+    "app_dormir": "vps", "app_eliminar": "vps",
+}
+
+# Herramientas que van a desaparecer. Se dice AHORA, no el dia que se borren:
+# construir encima de algo que se retira sin que nada lo avise es la misma
+# familia de silencio que el resto de esta propuesta.
+_RETIRO_RECURSOS = ("la gestion de recursos locales dejo de ser de state el 4-sep "
+                    "(decision de Ricardo): la lleva el arbitro de PC1. Estas se "
+                    "retiran en cuanto CART-021 y CART-022 esten confirmadas por "
+                    "todos. No construyas encima.")
+RETIRANDOSE = {n: _RETIRO_RECURSOS for n in PERFIL_HERRAMIENTA
+               if n.startswith(("recurso_", "herramienta_"))}
+
+
 @mcp.tool()
 def whoami() -> str:
     """Devuelve la identidad con la que este cliente escribe (la sella el servidor)."""
@@ -1057,7 +1201,21 @@ def parametros(herramienta: str = "") -> str:
         if h not in out:
             return f"ERROR: no existe la herramienta '{h}'. Llama a parametros() sin argumento para verlas."
         return _jd({h: out[h]})
-    return _jd({"total": len(out), "nota": "un parametro que no figure aqui se rechaza", "herramientas": out})
+    # El perfil y la retirada viajan CON cada herramienta, no en una lista aparte
+    # que habria que cruzar. Un cliente que ya lee parametros() se entera sin
+    # aprender nada nuevo.
+    for _n, _d in out.items():
+        _d["perfil"] = PERFIL_HERRAMIENTA.get(_n, "")
+        if _n in RETIRANDOSE:
+            _d["retirandose"] = RETIRANDOSE[_n]
+    _sin = sorted(n for n in out if not out[n].get("perfil"))
+    return _jd({"total": len(out),
+                "nota": "un parametro que no figure aqui se rechaza",
+                "perfiles": {"ambos": "existe en las dos ediciones",
+                             "vps": "administra algo del servidor: no existe en escritorio",
+                             "escritorio": "solo tiene sentido sin servidor"},
+                **({"SIN_PERFIL": _sin} if _sin else {}),
+                "herramientas": out})
 
 @mcp.tool()
 def participantes() -> str:

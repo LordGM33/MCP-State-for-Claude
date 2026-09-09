@@ -9,6 +9,13 @@ seals each call with the identity behind the token in the URL.
 
 77 tools.
 
+Tools marked **VPS edition only** administer something that lives on the
+server -- TLS on demand, systemd units, a root helper -- so a desktop
+install does not expose them. Everything else coordinates people and
+agents and exists in both editions. The classification lives in
+`PERFIL_HERRAMIENTA` in `server.py`; this document reads it rather than
+keeping a second copy that would drift.
+
 ## Identity and session
 
 Who you are and what the channel looks like right now. Every write is sealed with the identity behind the token in the URL, never with a parameter the caller supplies.
@@ -149,21 +156,31 @@ A resource is something finite on one machine -- GPU memory, typically. Reportin
 
 Declare that a finite shared resource exists on your workstation (authority only).
 
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
+
 ### `recurso_tomar(recurso, cuanto, para, minutos = 0, en_reposo = 0)`
 
 Record that you are using part of a shared resource.
+
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
 
 ### `recurso_soltar(recurso)`
 
 Release what you were holding.
 
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
+
 ### `recurso_estado(recurso = "")`
 
 Who holds what, how much is left, and since when.
 
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
+
 ### `recurso_medir(recurso, usado, fuente = "")`
 
 Report a real measurement of current usage, distinct from a claim, which is only an intention.
+
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
 
 ## Shared long-lived tools
 
@@ -173,21 +190,31 @@ A process several agents use at once, such as a local model server. Anyone may s
 
 Declare a long-lived process several agents share (authority only).
 
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
+
 ### `herramienta_estado(id = "")`
 
 Shared tools on your workstation and whether any may be stopped right now.
+
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
 
 ### `herramienta_parada_pedir(id, motivo)`
 
 Ask permission to stop a shared tool. Does not stop it.
 
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
+
 ### `herramienta_parada_autorizar(peticion, minutos = 30)`
 
 A human confirms nobody else is mid-turn. Only humans, and the authorisation expires.
 
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
+
 ### `herramienta_parada_cerrar(peticion, resultado = "")`
 
 Close a stop request, done or withdrawn. Anyone may: withdrawing leaves things as they are.
+
+> **Being retired.** Local resource management left this server's scope; it is handled by the workstation's own arbiter. Do not build on these.
 
 ## Facts, decisions and infrastructure
 
@@ -225,43 +252,43 @@ Registered servers and services.
 
 Each subdomain declares what it is (public, temporary with an expiry date, or restricted) instead of everything being loosely called a demo. A restricted one sits behind a door; passes are revocable and scoped to a single host.
 
-### `subdomain_claim(nombre, notas = "", tipo = "", caduca = "")`
+### `subdomain_claim(nombre, notas = "", tipo = "", caduca = "")` · **VPS edition only**
 
 Reserve a subdomain, declaring what it is and, if temporary, when it expires. A temporary one with no expiry is refused: that is permanence nobody decided on.
 
-### `subdomain_tipo(nombre, tipo, caduca = "")`
+### `subdomain_tipo(nombre, tipo, caduca = "")` · **VPS edition only**
 
 Declare what an existing subdomain is, and until when.
 
-### `subdomain_list(solo_ocupados = False)`
+### `subdomain_list(solo_ocupados = False)` · **VPS edition only**
 
 Registered subdomains, with type, owner and whether any have expired. Nothing shuts itself off: expiry becomes visible, not automatic.
 
-### `subdomain_release(nombre)`
+### `subdomain_release(nombre)` · **VPS edition only**
 
 Release one of yours. Does not delete files or apps.
 
-### `subdomain_pendientes()`
+### `subdomain_pendientes()` · **VPS edition only**
 
 Subdomains awaiting approval (authority only).
 
-### `subdomain_aprobar(nombre, nota = "")`
+### `subdomain_aprobar(nombre, nota = "")` · **VPS edition only**
 
 Approve a requested subdomain: enables deployment and TLS.
 
-### `subdomain_rechazar(nombre, motivo = "")`
+### `subdomain_rechazar(nombre, motivo = "")` · **VPS edition only**
 
 Reject a requested subdomain.
 
-### `pase_crear(subdominio, para, dias = 7, puede_lanzar = False)`
+### `pase_crear(subdominio, para, dias = 7, puede_lanzar = False)` · **VPS edition only**
 
 Issue a pass so somebody outside can enter one restricted subdomain. Look-only unless explicitly marked otherwise.
 
-### `pase_anular(pase)`
+### `pase_anular(pase)` · **VPS edition only**
 
 Revoke a pass. The next request no longer gets through.
 
-### `pase_list(subdominio = "")`
+### `pase_list(subdominio = "")` · **VPS edition only**
 
 Passes issued, with their real state. Expired ones are marked: an expired pass and a forged one are different problems for the person holding them.
 
@@ -269,39 +296,39 @@ Passes issued, with their real state. Expired ones are marked: an expired pass a
 
 Static sites and dynamic apps are deployed over HTTPS with your own token. Dynamic apps sleep when idle and wake on the first visitor.
 
-### `deploy_info()`
+### `deploy_info()` · **VPS edition only**
 
 How to deploy a static site or a dynamic app.
 
-### `app_list()`
+### `app_list()` · **VPS edition only**
 
 Registered dynamic apps and their state.
 
-### `app_status(nombre)`
+### `app_status(nombre)` · **VPS edition only**
 
 systemd state of an app you own.
 
-### `app_logs(nombre, lineas = 40)`
+### `app_logs(nombre, lineas = 40)` · **VPS edition only**
 
 Last log lines of an app you own.
 
-### `app_restart(nombre)`
+### `app_restart(nombre)` · **VPS edition only**
 
 Restart an app you own.
 
-### `app_stop(nombre)`
+### `app_stop(nombre)` · **VPS edition only**
 
 Stop an app you own; the subdomain falls back to static content.
 
-### `app_start(nombre)`
+### `app_start(nombre)` · **VPS edition only**
 
 Start a stopped app you own.
 
-### `app_dormir(nombre)`
+### `app_dormir(nombre)` · **VPS edition only**
 
 Put an app to sleep without uninstalling it. It wakes on the first visitor.
 
-### `app_eliminar(nombre)`
+### `app_eliminar(nombre)` · **VPS edition only**
 
 Remove a dynamic app: stop it, delete its unit and its proxy snippet.
 
