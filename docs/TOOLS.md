@@ -44,7 +44,7 @@ Free-text search across the whole shared state.
 
 Messages replace exchange files on disk. `state_overview` returns headers only; bodies are fetched on demand, because the greeting used to weigh 193 KB and every participant paid it every session.
 
-### `msg_send(para, asunto, cuerpo, tipo = "aviso", responde_a = "", ref = "")`
+### `msg_send(para, asunto, cuerpo, tipo = "aviso", responde_a = "", ref = "", vigencia_dias = -1)`
 
 Send a message. `para` takes a participant id or 'todos'. A `solicitud` gets a stable SOL-N reference; a `respuesta` must name what it answers. A `ref` on any other type is refused rather than quietly dropped.
 
@@ -72,7 +72,7 @@ Mark a message addressed to you as handled.
 
 Full direct history between you and one other participant.
 
-### `sol_cerrar(ref, estado = "respondida", nota = "")`
+### `sol_cerrar(ref, estado = "respondida", nota = "", divulgar = "")`
 
 Close a request as answered or discarded.
 

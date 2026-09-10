@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shared-state MCP server: identity-sealed messaging, facts, decisions,
 subdomain/app deployment. All config via EVASTATE_* env vars."""
+import hashlib
 import json, os, re, sqlite3, sys, datetime, contextlib, contextvars, io, tarfile, hashlib, secrets
 import time, logging, functools, inspect
 from collections import deque
@@ -130,6 +131,13 @@ def _put(kind, key, data):
     with db() as con:
         row = con.execute("SELECT id FROM items WHERE kind=? AND key=?", (kind, key)).fetchone()
         if row:
+            # QUIEN lo actualiza queda anotado. Sin esto, actualizar no contaba
+            # como senal de vida (D11), y acreditarselo al autor original habria
+            # sido peor: una senal falsa es peor que ninguna.
+            try:
+                data = {**data, "_escrito_por": ident(), "_escrito_en": t}
+            except Exception:
+                pass          # sin identidad (tarea interna): no se acredita a nadie
             con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
                         (json.dumps(data, ensure_ascii=False), t, row["id"]))
             return {"accion": "actualizado", "id": row["id"], "kind": kind, "key": key}
@@ -191,16 +199,33 @@ def _ultima_escritura():
     contador aparte que haya que acordarse de subir — un contador se desincroniza
     cuando aparece un tipo nuevo, una derivacion no puede."""
     out = {}
+
+    def _anotar(quien, cuando, que):
+        # LA MAS RECIENTE, no la primera que aparezca. Antes se usaba setdefault
+        # sobre `ORDER BY id DESC`, que da por hecho que el orden de los ids es
+        # el orden del tiempo. Es cierto para lo que se inserta y FALSO para lo
+        # que se actualiza: un registro viejo tocado hoy tiene id bajo y fecha
+        # de hoy, y quedaba fuera.
+        if not (isinstance(quien, str) and quien in PARTICIPANTES and cuando):
+            return
+        vieja = out.get(quien)
+        if not vieja or cuando > vieja["cuando"]:
+            out[quien] = {"cuando": cuando, "que": que}
+
     with db() as con:
-        for r in con.execute("SELECT kind,data,created FROM items WHERE kind NOT IN "
+        for r in con.execute("SELECT kind,data,created,updated FROM items WHERE kind NOT IN "
                              "('participant','actividad') ORDER BY id DESC LIMIT 4000"):
             try: d = json.loads(r["data"])
             except Exception: continue
+            # quien lo creo, con la fecha de creacion
             for campo in _AUTOR:
                 a = d.get(campo)
                 if isinstance(a, str) and a in PARTICIPANTES:
-                    out.setdefault(a, {"cuando": r["created"], "que": r["kind"]})
+                    _anotar(a, r["created"], r["kind"])
                     break
+            # y quien lo actualizo despues, con la suya. Son dos hechos
+            # distintos y los dos son senal de vida.
+            _anotar(d.get("_escrito_por"), d.get("_escrito_en"), r["kind"])
     return out
 
 def _actividad(pid=None):
@@ -208,7 +233,7 @@ def _actividad(pid=None):
     conectarse prueba que miras, escribir prueba que aportas, y confundirlas fue
     justo el error del 30-ago."""
     esc = _ultima_escritura()
-    con_ = {r.get("id"): r.get("ultima_conexion") for r in _rows("actividad", 200)}
+    con_ = {r.get("id"): r.get("ultima_conexion") for r in _rows("actividad", None)}
     ids = [pid] if pid else list(PARTICIPANTES)
     out = {}
     for i in ids:
@@ -575,7 +600,7 @@ def recurso_tomar(recurso: str, cuanto: int, para: str, minutos: int = 0,
     rid = recurso.strip().lower()
     r = _recurso_de(maq, rid)
     if not r:
-        hay = sorted(x["recurso"] for x in _rows("recurso", 200) if x.get("maquina") == maq)
+        hay = sorted(x["recurso"] for x in _rows("recurso", None) if x.get("maquina") == maq)
         return (f"ERROR: en {maq} no hay declarado ningun recurso '{rid}'."
                 + (f" Declarados: {', '.join(hay)}." if hay else
                    " No hay ninguno; pide a la autoridad que lo declare."))
@@ -641,7 +666,7 @@ def recurso_estado(recurso: str = "") -> str:
     Ricardo supervisa, no trabaja en una maquina, y devolverle una lista vacia le
     dejaba la vista de GPU en blanco sin decir por que."""
     maq = estacion()
-    decl = _rows("recurso", 200)
+    decl = _rows("recurso", None)
     if maq:
         decl = [x for x in decl if x.get("maquina") == maq]
     if recurso.strip():
@@ -842,7 +867,7 @@ def herramienta_parada_pedir(id: str, motivo: str) -> str:
     hid = id.strip().lower()
     _, h = _get("herramienta", f"{maq}:{hid}")
     if not h:
-        hay = sorted(x["herramienta"] for x in _rows("herramienta", 200)
+        hay = sorted(x["herramienta"] for x in _rows("herramienta", None)
                      if x.get("maquina") == maq)
         return (f"ERROR: en {maq} no hay declarada ninguna herramienta '{hid}'."
                 + (f" Declaradas: {', '.join(hay)}." if hay else ""))
@@ -967,7 +992,7 @@ def herramienta_estado(id: str = "") -> str:
     identificado en la parte de autorizar; se arreglo ahi y se olvido aqui."""
     maq = estacion()
     todo = not maq          # sin estacion asignada: supervisa, no trabaja en una
-    decl = _rows("herramienta", 300)
+    decl = _rows("herramienta", None)
     if not todo:
         decl = [x for x in decl if x.get("maquina") == maq]
     filtro = id.strip().lower()
@@ -1157,11 +1182,30 @@ PERFIL_HERRAMIENTA = {
 # Herramientas que van a desaparecer. Se dice AHORA, no el dia que se borren:
 # construir encima de algo que se retira sin que nada lo avise es la misma
 # familia de silencio que el resto de esta propuesta.
-_RETIRO_RECURSOS = ("la gestion de recursos locales dejo de ser de state el 4-sep "
-                    "(decision de Ricardo): la lleva el arbitro de PC1. Estas se "
-                    "retiran en cuanto CART-021 y CART-022 esten confirmadas por "
-                    "todos. No construyas encima.")
-RETIRANDOSE = {n: _RETIRO_RECURSOS for n in PERFIL_HERRAMIENTA
+# EN REVISION, no "en retirada". La etiqueta anterior decia "no construyas
+# encima" sobre las diez, y para las de recursos era FALSO: el arbitro de
+# produccion escribe en ellas desde CART-016 (su msg 563: "el arbitro ya anota
+# SOLO en el canal al reservar, asi que la GPU deja de tener dos registros").
+# Les dije que no construyeran encima de lo que acababan de construir encima.
+#
+# Lo que salio del alcance de state el 4-sep fue DECIDIR el reparto -- eso lo
+# lleva el arbitro. MOSTRARLO sigue siendo del canal: es comunicacion y flujo de
+# informacion, que es justo lo que se le dejo.
+#
+# Cuales de las diez sobran de verdad lo decide produccion, que es quien tiene el
+# arbitro. Hasta entonces la etiqueta dice lo que se sabe, no una orden.
+_EN_REVISION_RECURSOS = (
+    "EN REVISION, no retirada. El arbitro de PC1 DECIDE el reparto desde el 4-sep, "
+    "pero escribe aqui sus reservas (CART-016), asi que esto sigue siendo el sitio "
+    "donde mirar. Se puede seguir usando. Lo que se decidira con produccion es si "
+    "alguna sobra; se avisara antes de quitar nada.")
+_EN_REVISION_HERR = (
+    "EN REVISION, no retirada. El arbitro de PC1 tiene su propio camino de parada, "
+    "pero el de aqui exige que confirme un participante de tipo HUMANO, cosa que en "
+    "local no se puede distinguir (lo dice el propio contrato del arbitro). Mientras "
+    "esa diferencia exista, las dos no son equivalentes. Se puede seguir usando.")
+RETIRANDOSE = {n: (_EN_REVISION_RECURSOS if n.startswith("recurso_") else _EN_REVISION_HERR)
+               for n in PERFIL_HERRAMIENTA
                if n.startswith(("recurso_", "herramienta_"))}
 
 
@@ -1175,6 +1219,28 @@ def whoami() -> str:
         p["rotacion"] = ("ESTAS USANDO EL TOKEN ANTIGUO" if CON_TOKEN_VIEJO.get()
                          else "usando el token nuevo; llama a token_confirmar() si aun no lo hiciste")
     return _jd({"id": pid, **p})
+
+def _adornar_param(nombre, d):
+    """Lo que se dice de una herramienta, igual se pregunte por una o por todas.
+
+    Vivia solo en la rama de "todas" y la de "una" devolvia antes, asi que
+    `parametros("msg_send")` no traia ni el perfil ni la ventana. Un dato que
+    aparece o no segun como preguntes es un dato en el que no se puede confiar.
+    """
+    d["perfil"] = PERFIL_HERRAMIENTA.get(nombre, "")
+    if nombre in RETIRANDOSE:
+        d["retirandose"] = RETIRANDOSE[nombre]
+    if nombre == "msg_send":
+        d["ventana_duplicado_segundos"] = VENTANA_DUPLICADO
+        d["nota_duplicado"] = (
+            "dos mensajes identicos del mismo emisor dentro de esa ventana se leen como "
+            "un reintento. Si es una SOLICITUD, no se abre una segunda: se devuelve la "
+            "que ya hay, porque dos referencias para lo mismo son dos obligaciones y una "
+            "no existe. Si es cualquier otro tipo, se crea igual y la respuesta trae "
+            "`posible_duplicado`: repetir puede ser legitimo y perder un mensaje es peor "
+            "que verlo dos veces.")
+    return d
+
 
 @mcp.tool()
 def parametros(herramienta: str = "") -> str:
@@ -1200,14 +1266,12 @@ def parametros(herramienta: str = "") -> str:
         h = herramienta.strip()
         if h not in out:
             return f"ERROR: no existe la herramienta '{h}'. Llama a parametros() sin argumento para verlas."
-        return _jd({h: out[h]})
+        return _jd({h: _adornar_param(h, out[h])})
     # El perfil y la retirada viajan CON cada herramienta, no en una lista aparte
     # que habria que cruzar. Un cliente que ya lee parametros() se entera sin
     # aprender nada nuevo.
     for _n, _d in out.items():
-        _d["perfil"] = PERFIL_HERRAMIENTA.get(_n, "")
-        if _n in RETIRANDOSE:
-            _d["retirandose"] = RETIRANDOSE[_n]
+        _adornar_param(_n, _d)
     _sin = sorted(n for n in out if not out[n].get("perfil"))
     return _jd({"total": len(out),
                 "nota": "un parametro que no figure aqui se rechaza",
@@ -1297,6 +1361,52 @@ def msg_leer(ids: str) -> str:
     return _jd(out)
 
 
+# Cuantos recursos SIN NADIE DENTRO caben en el saludo. Los tomados van
+# todos: esos son los que cambian lo que puedes hacer.
+TOPE_RECURSOS_SALUDO = 6
+
+
+def _recursos_de(maq):
+    """Lo tomado ahora mismo, resumido para el saludo.
+
+    Resumido a proposito: `recurso_estado` da el detalle entero y esto son unas
+    lineas. El saludo se adelgazo de 193 KB a 44 ayer y no se deshace por esto.
+
+    Sin estacion se ven TODAS, por lo mismo que con los puertos: quien supervisa
+    no trabaja en una maquina, y devolverle una lista vacia le dejaba la vista de
+    GPU en blanco sin decir por que.
+    """
+    con_dueno, libres = [], []
+    for d in _rows("recurso", None):
+        if maq and d.get("maquina") != maq:
+            continue
+        rid, rmaq = d.get("recurso"), d.get("maquina")
+        tomas = _tomas_vivas(rmaq, rid)
+        base = int(d.get("base", 0))
+        repartible = int(d.get("capacidad", 0)) - base
+        usado = sum(int(t.get("cuanto", 0)) for t in tomas)
+        fila = {"recurso": rid, "maquina": rmaq, "unidad": d.get("unidad", "MB"),
+                "repartible": repartible, "libre_segun_lo_declarado": repartible - usado}
+        if tomas:
+            # Lo TOMADO va entero: es lo accionable, y `para` es lo que evita que
+            # alguien mate un proceso creyendo que sobra.
+            fila["tomado_por"] = [
+                {"dueno": t.get("dueno"), "cuanto": t.get("cuanto"),
+                 "para": t.get("para"), "desde": t.get("desde")}
+                for t in tomas]
+            con_dueno.append(fila)
+        else:
+            libres.append(fila)
+    # LO LIBRE TAMBIEN SE ENSENA, pero acotado: no saber que algo esta libre es
+    # lo que hace que nadie lo use. Lo que no cabe se DICE, no se calla.
+    out = con_dueno + libres[:TOPE_RECURSOS_SALUDO]
+    if len(libres) > TOPE_RECURSOS_SALUDO:
+        out.append({"y_ademas": len(libres) - TOPE_RECURSOS_SALUDO,
+                    "estado": "libres, sin nadie dentro",
+                    "como_verlos": "recurso_estado()"})
+    return out
+
+
 @mcp.tool()
 def state_overview(completo: bool = False) -> str:
     """Foto del estado compartido para MI identidad. Llamar al iniciar sesión.
@@ -1306,10 +1416,15 @@ def state_overview(completo: bool = False) -> str:
     Para leer uno: `msg_leer(ids="573")`. Para el saludo de antes, entero:
     `state_overview(completo=True)`."""
     me = ident()
-    pend = [m for m in _rows("msg", 500, order="DESC")
-            if m.get("para") in (me, "todos") and m.get("de") != me
-            and m.get("estado") not in ("atendido", "respondida", "descartada")]
-    _entregar(me, pend)
+    _todo_pend = [m for m in _rows("msg", 500, order="DESC")
+                  if _me_llega(m, me) and m.get("de") != me
+                  and m.get("estado") not in ("atendido", "respondida", "descartada")]
+    # SE ENTREGA TODO, tambien lo caducado: haberlo tenido delante es un hecho, y
+    # que se deje de mostrar no lo cambia. Si solo se entregara lo visible, el
+    # acuse de lectura empezaria a mentir por una decision de presentacion.
+    _entregar(me, _todo_pend)
+    pend = [m for m in _todo_pend if not _caducado(m)]
+    _caducados = [m for m in _todo_pend if _caducado(m)]
     _todos_msg = _rows("msg", 500, order="DESC")
     mias = _mis_solicitudes(me, _todos_msg)
     cart_pend = []
@@ -1323,7 +1438,7 @@ def state_overview(completo: bool = False) -> str:
     por_aprobar = {}
     if es_autoridad(me):
         subs = [r["nombre"] for r in _rows("subdomain", None) if r.get("estado") == "solicitado"]
-        altas = [i.get("id") for i in _rows("invitacion", 200) if i.get("estado") == "solicitada"]
+        altas = [i.get("id") for i in _rows("invitacion", None) if i.get("estado") == "solicitada"]
         if subs: por_aprobar["subdominios"] = subs
         if altas: por_aprobar["altas"] = altas
     # Lo temporal que se paso de fecha, a la vista de TODOS y no solo de la
@@ -1369,6 +1484,12 @@ def state_overview(completo: bool = False) -> str:
         **({"mis_fechas_14_dias": mis_prox} if mis_prox else {}),
         **({"del_resto_esta_semana": del_resto} if del_resto else {}),
         "puertos_de_mi_estacion": puertos,
+        # LA MITAD QUE FALTABA DE CART-016. El cartel dijo que reservar la
+        # tarjeta sustituye a los ACTIVO:/LIBRE: -- "un sitio donde mirar es mejor
+        # que dos" -- pero ese sitio no estaba aqui, asi que habia que preguntar
+        # por el y produccion seguia escribiendo el aviso a mano.
+        # El puerto que choca molesta; la VRAM que falta para el trabajo a medias.
+        "recursos_de_mi_estacion": _recursos_de(maq),
         **({"por_aprobar": por_aprobar} if por_aprobar else {}),
         **({"subdominios_vencidos": vencidos} if vencidos else {}),
         "cartelera_pendiente": cart_pend,
@@ -1378,15 +1499,23 @@ def state_overview(completo: bool = False) -> str:
         # El sellado de entrega no depende de lo que se devuelva -- si dependiera,
         # adelgazar el saludo habria apagado en silencio los acuses de D11.
         "mensajes_pendientes": pend if completo else [_titular(m) for m in pend],
+        # NADA DESAPARECE EN SILENCIO. Un mensaje que se quita de la vista sin
+        # decirlo es indistinguible de uno que nunca llego.
+        **({"anuncios_caducados": {
+            "cuantos": len(_caducados),
+            "el_mas_reciente": max((m.get("_creado") or "") for m in _caducados),
+            "nota": ("anuncios cuyo emisor declaro cuanto valian y ya pasaron. NO se han "
+                     "borrado ni atendido: siguen pendientes y salen en msg_inbox(). "
+                     "Solo han dejado de ocupar este saludo.")}} if _caducados else {}),
         "decisiones_recientes": (_rows("decision", 8, order="DESC") if completo else
                                  [{k: d[k] for k in ("_id", "de", "titulo", "proyecto", "_creado")
                                    if d.get(k) not in (None, "")}
                                   for d in _rows("decision", 8, order="DESC")]),
-        "hechos": (_rows("fact", 100) if completo else
+        "hechos": (_rows("fact", None) if completo else
                    [{"clave": f.get("_key") or f.get("clave"),
                      "resumen": " ".join(str(f.get("valor") or "").split())[:120] +
                                 ("…" if len(str(f.get("valor") or "")) > 120 else "")}
-                    for f in _rows("fact", 100)]),
+                    for f in _rows("fact", None)]),
         **({} if completo else {"como_leer_lo_demas": {
             "un mensaje entero": "msg_leer(ids=\"573\") — el numero sale en mensajes_pendientes",
             "un hecho entero": "fact_get(clave)",
@@ -1401,8 +1530,113 @@ def state_overview(completo: bool = False) -> str:
     })
 
 # ───────────── MENSAJES (sustituyen a los archivos INTERCAMBIO) ─────────────
+# Segundos dentro de los cuales dos mensajes identicos del mismo emisor se leen
+# como UN reintento. Se publica en parametros(): un limite que no se puede
+# consultar se descubre chocando con el.
+VENTANA_DUPLICADO = 180
+
+
+def _huella_msg(de, para, tipo, asunto, cuerpo):
+    """Lo que hace a un mensaje el mismo mensaje. El tipo entra: el mismo texto
+    como aviso y como solicitud son dos cosas distintas."""
+    return hashlib.sha256(("\x00".join([de or "", para or "", tipo or "",
+                                        asunto or "", cuerpo or ""])
+                           ).encode("utf-8")).hexdigest()
+
+
+def _gemelo_reciente(de, para, tipo, asunto, cuerpo):
+    """El mismo mensaje, del mismo emisor, hace menos de VENTANA_DUPLICADO.
+
+    Devuelve (mensaje, segundos) o (None, None). Un reintento llega en segundos,
+    asi que basta con mirar los ultimos por orden descendente.
+    """
+    h = _huella_msg(de, para, tipo, asunto, cuerpo)
+    ahora = datetime.datetime.now(datetime.timezone.utc)
+    for m in _rows("msg", 60, order="DESC"):
+        if m.get("de") != de:
+            continue
+        try:
+            d = datetime.datetime.fromisoformat(m.get("_creado"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=datetime.timezone.utc)
+            seg = (ahora - d).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if seg > VENTANA_DUPLICADO:
+            break            # en orden DESC, de aqui para atras todos son mas viejos
+        if _huella_msg(m.get("de"), m.get("para"), m.get("tipo"),
+                       m.get("asunto"), m.get("cuerpo")) == h:
+            return m, int(seg)
+    return None, None
+
+
+def _caducado(m):
+    """¿Este anuncio ya no vale la pena en el saludo?
+
+    Solo si su emisor lo DECLARO. Sin `caduca`, no caduca: es como se ha
+    comportado el canal siempre, y es lo que protege a las normas -- que son
+    avisos a `todos` sin declarar nada y tienen que seguir viendose.
+    """
+    c = m.get("caduca")
+    if not c:
+        return False
+    try:
+        d = datetime.datetime.fromisoformat(c)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d < datetime.datetime.now(datetime.timezone.utc)
+    except (TypeError, ValueError):
+        # Una fecha ilegible NO es una fecha pasada. Ante la duda, se muestra:
+        # esconder por no saber leer una fecha seria lo peor de los dos mundos.
+        return False
+
+
+def _me_llega(m, me):
+    """¿Este mensaje va dirigido a mi?
+
+    Un solo sitio a proposito: msg_inbox y state_overview hacian el mismo filtro
+    copiado, y dos copias de una regla de acceso acaban divergiendo. `hilo` se
+    anade aqui y las dos lo heredan.
+    """
+    p = m.get("para")
+    if p in (me, "todos"):
+        return True
+    if p == "hilo":
+        return me in (m.get("implicados") or [])
+    return False
+
+
+def _implicados_del_hilo(ref, excluir=""):
+    """Quien esta metido en un hilo, ahora mismo.
+
+    Cuenta: quien lo abrio, a quien se lo dirigio (si no fue a `todos`), y quien
+    ha respondido o ha sido destinatario de una respuesta. Es lo que en una
+    conversacion de personas seria "los que estan en la sala".
+
+    NO incluye a quien solo lo leyo: leer no es participar, y meter a un lector
+    silencioso en el reparto convertiria `hilo` en `todos` con pasos extra.
+    """
+    ref = _norm_ref(ref) or (ref or "").strip().upper()
+    if not ref:
+        return []
+    dentro = set()
+    for m in _rows("msg", None):
+        propia = _norm_ref(m.get("ref")) == ref
+        contesta = _norm_ref(m.get("responde_a")) == ref
+        if not (propia or contesta):
+            continue
+        if m.get("de"):
+            dentro.add(m["de"])
+        p = m.get("para")
+        if p and p not in ("todos", "hilo"):
+            dentro.add(p)
+    dentro.discard(excluir)
+    return sorted(dentro)
+
+
 @mcp.tool()
-def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_a: str = "", ref: str = "") -> str:
+def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso",
+             responde_a: str = "", ref: str = "", vigencia_dias: int = -1) -> str:
     """Envía un mensaje. `para`: id de participante o 'todos' (por defecto úsalo:
     R-023 prohíbe filtrar por adelantado). `tipo`: aviso|solicitud|respuesta|bitacora|alerta.
     Si tipo=solicitud se asigna ref estable (SOL-NNN) y estado=abierta; se puede
@@ -1415,7 +1649,30 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
         return ("ERROR: `tipo` debe ser uno de: aviso, solicitud, respuesta, bitacora, alerta. "
                 "Ej. tipo='aviso' para contar algo; tipo='solicitud' si esperas respuesta.")
     para = para.strip().lower()
-    if para != "todos" and para not in PARTICIPANTES:
+    # DESTINO `hilo`: a los que ya estan dentro. Exige decir CUAL, porque
+    # aceptarlo sin ref obligaria a adivinar a quien se le habla, y adivinar el
+    # destinatario es la peor forma de equivocarse en un canal.
+    # VIGENCIA: cuantos dias vale la pena que esto ocupe el saludo de los demas.
+    # -1 = no declarada = no caduca, que es como se ha comportado todo hasta hoy.
+    if vigencia_dias >= 0 and tipo == "solicitud":
+        return ("ERROR: una solicitud no puede declarar vigencia. Una solicitud "
+                "abierta es una obligacion, y dejar que caduque de la vista "
+                "fabricaria la ilusion de que se atendio. Cierrala con sol_cerrar "
+                "cuando este resuelta.")
+    if vigencia_dias > 365:
+        return "ERROR: vigencia_dias mayor que un año no declara nada util; deja el valor por defecto."
+    _implicados = []
+    if para == "hilo":
+        if not responde_a.strip():
+            return ("ERROR: para='hilo' necesita `responde_a` con la ref del hilo "
+                    "(ej. responde_a='SOL-058'). Sin ella no se sabe a que hilo "
+                    "contestas ni quien esta dentro.")
+        _implicados = _implicados_del_hilo(responde_a, excluir=me)
+        if not _implicados:
+            return (f"ERROR: no hay ningun hilo '{responde_a.strip()}' con gente dentro. "
+                    "Comprueba la ref con msg_hilo(ref); si el hilo existe y eres el "
+                    "unico, no hace falta destino 'hilo'.")
+    elif para != "todos" and para not in PARTICIPANTES:
         return (f"ERROR: destinatario '{para}' no existe. Usa un id de participantes() "
                 f"o 'todos' (ej. para='produccion').")
     # UNA `ref` FUERA DE UNA SOLICITUD SE RECHAZA, NO SE TIRA. Todo lo que
@@ -1426,12 +1683,35 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
     # Se rechaza en vez de avisar porque un aviso hay que acordar leerlo y un
     # rechazo no se puede ignorar -- el criterio de Ricardo del 2-sep: que el
     # fallo sea imposible por estructura, no por acuerdo.
+    # ¿ES ESTO UN REINTENTO? Se mira siempre; lo que se HACE depende del dano.
+    _gem, _seg = _gemelo_reciente(me, para, tipo, asunto, cuerpo)
+    if _gem and tipo == "solicitud" and not ref:
+        # Una solicitud repetida crea una obligacion que no existe y quema una
+        # referencia. Se devuelve la que ya hay. (Con `ref` explicita no se toca:
+        # esa tiene su propia comprobacion de duplicado, mas precisa.)
+        return _jd({"accion": "ya_estaba", "id": _gem.get("_id"), "kind": "msg",
+                    "ref": _gem.get("ref"), "duplicado": True,
+                    "hace_segundos": _seg,
+                    "nota": ("identica a la solicitud que abriste hace %d s. NO se ha "
+                             "abierto una segunda: dos referencias para lo mismo son dos "
+                             "obligaciones, y una de ellas no existe. Si querias pedir otra "
+                             "cosa, cambia el asunto o el cuerpo." % _seg),
+                    "ventana_segundos": VENTANA_DUPLICADO})
     if ref and tipo != "solicitud":
         return (f"ERROR: un mensaje de tipo '{tipo}' no lleva `ref`: solo la llevan las "
                 f"solicitudes. Si querias abrir una solicitud, manda tipo='solicitud' "
                 f"(la ref se asigna sola). Si querias APUNTAR a una existente, usa "
                 f"tipo='respuesta' con responde_a='{ref}'.")
     d = {"de": me, "para": para, "asunto": asunto, "cuerpo": cuerpo, "tipo": tipo}
+    if vigencia_dias >= 0:
+        d["vigencia_dias"] = int(vigencia_dias)
+        d["caduca"] = (datetime.datetime.now(datetime.timezone.utc)
+                       + datetime.timedelta(days=int(vigencia_dias))).isoformat()
+    if _implicados:
+        # Congelado AQUI. Recalcularlo al leer haria que el mismo mensaje
+        # alcanzara a mas gente conforme el hilo creciera, y quien lo escribio no
+        # podria saber a quien le hablo.
+        d["implicados"] = _implicados
     if tipo == "solicitud":
         if ref:
             nref = _norm_ref(ref)
@@ -1457,7 +1737,7 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
         # solo se normaliza a mayusculas si es una ref del canal; el texto libre se respeta
         d["responde_a"] = _norm_ref(ra) or ra
         if str(d["responde_a"]).startswith("CART-"):
-            cart = next((c for c in _rows("cartel", 300) if _norm_ref(c.get("ref")) == d["responde_a"]), None)
+            cart = next((c for c in _rows("cartel", None) if _norm_ref(c.get("ref")) == d["responde_a"]), None)
             if not cart: return f"ERROR: no existe el cartel {d['responde_a']}."
             if para != cart.get("de"):
                 return (f"ERROR: las respuestas a la cartelera van EN PRIVADO a la autoridad emisora "
@@ -1470,6 +1750,24 @@ def msg_send(para: str, asunto: str, cuerpo: str, tipo: str = "aviso", responde_
     # que pidio con lo que paso, que es exactamente lo que editorial no pudo
     # hacer. `ref: null` DICHO es distinto de no decir nada.
     res = {**res, "ref": d.get("ref")}
+    if _implicados:
+        res["implicados"] = _implicados
+    if d.get("caduca"):
+        # Se devuelve para que el emisor pueda comprobar lo que pidio contra lo
+        # que paso, en vez de fiarse.
+        res["vigencia_dias"] = d["vigencia_dias"]
+        res["caduca"] = d["caduca"]
+    # SE CONSERVA Y SE SENALA. Un aviso repetido puede ser legitimo -- el mismo
+    # cierre de jornada dos dias seguidos son dos hechos -- asi que no se colapsa.
+    # Pero ocho segundos entre dos mensajes iguales es un reintento, y quien lo
+    # lea merece saberlo sin tener que compararlos a ojo.
+    if _gem:
+        res["posible_duplicado"] = {
+            "id": _gem.get("_id"), "hace_segundos": _seg,
+            "nota": ("identico a tu mensaje %s de hace %d s. Se ha creado igual: repetir "
+                     "puede ser legitimo y perder un mensaje es peor que verlo dos veces. "
+                     "Si fue un reintento, atiende o descarta el otro."
+                     % (_gem.get("_id"), _seg))}
     if tipo == "respuesta" and str(d.get("responde_a", "")).startswith("CART-"):
         with db() as con:
             for r in con.execute("SELECT id,data FROM items WHERE kind='cartel'").fetchall():
@@ -1498,7 +1796,7 @@ def msg_inbox(incluir_atendidos: bool = False) -> str:
     """Qué hay abierto dirigido a MÍ (o a 'todos')."""
     me = ident()
     rows = _rows("msg", 500, order="DESC")
-    out = [m for m in rows if m.get("para") in (me, "todos") and m.get("de") != me
+    out = [m for m in rows if _me_llega(m, me) and m.get("de") != me
            and (incluir_atendidos or m.get("estado") not in ("atendido", "respondida", "descartada"))]
     # los envios propios no son "bandeja": se consultan con search o msg_hilo (D1, 25-ago)
     return _jd(_entregar(me, out))
@@ -1562,9 +1860,28 @@ def msg_ack(id: int, nota: str = "") -> str:
                     (json.dumps(d, ensure_ascii=False), now(), id))
     return _jd({"accion": "atendido", "id": id})
 
+def asunto_de_ref(d):
+    """El asunto de la solicitud, recortado para que quepa en el de la divulgacion."""
+    a = (d.get("asunto") or "").strip()
+    return (a[:70] + "…") if len(a) > 70 else a
+
+
 @mcp.tool()
-def sol_cerrar(ref: str, estado: str = "respondida", nota: str = "") -> str:
-    """Cierra una solicitud: estado respondida|descartada."""
+def sol_cerrar(ref: str, estado: str = "respondida", nota: str = "",
+               divulgar: str = "") -> str:
+    """Cierra una solicitud: estado respondida|descartada.
+
+    `divulgar`: lo que de esto le sirve a QUIEN NO ESTABA en el hilo. Se publica
+    como aviso al canal, enlazado a la ref.
+
+    Existe porque la resolucion es lo que suele llevar la leccion. El 9-sep
+    salieron de hilos tres hallazgos que valian para todos -- un juez visual que
+    aprobaba un cuadro negro, difflib.get_opcodes para cazar mala pronunciacion,
+    y un grabador que se quedaba sin fuente de captura. Con el seguimiento
+    restringido a los implicados, esas tres se pierden si nadie decide sacarlas.
+
+    Vacio es una respuesta valida: no todo hilo deja una leccion. Lo que no vale
+    es que lo decida el olvido."""
     if estado not in ("respondida", "descartada"):
         return "ERROR: estado debe ser respondida|descartada"
     ref = _norm_ref(ref) or ref.strip().upper()
@@ -1589,7 +1906,31 @@ def sol_cerrar(ref: str, estado: str = "respondida", nota: str = "") -> str:
                         con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
                                     (json.dumps(d2, ensure_ascii=False), now(), r2["id"]))
                         atendidas += 1
-                return _jd({"accion": estado, "ref": ref, "respuestas_atendidas": atendidas})
+                _divulgado = None
+                if divulgar.strip():
+                    # Se anota dentro de la MISMA transaccion: si el cierre se
+                    # deshace, la divulgacion no queda suelta hablando de algo
+                    # que no se cerro.
+                    _dd = {"de": me, "para": "todos", "tipo": "aviso",
+                           "asunto": f"De {ref}, para quien no estaba: " + asunto_de_ref(d),
+                           "cuerpo": divulgar.strip() + (
+                               f"\n\n(Sale del cierre de {ref}. El hilo entero: "
+                               f"msg_hilo(\"{ref}\").)"),
+                           "estado": "pendiente", "sale_de": ref}
+                    con.execute(
+                        "INSERT INTO items(kind,key,data,created,updated) "
+                        "VALUES('msg',NULL,?,?,?)",
+                        (json.dumps(_dd, ensure_ascii=False), now(), now()))
+                    _divulgado = con.execute(
+                        "SELECT last_insert_rowid()").fetchone()[0]
+                return _jd({"accion": estado, "ref": ref,
+                            "respuestas_atendidas": atendidas,
+                            **({"divulgado_como": _divulgado} if _divulgado else
+                               {"divulgado": False,
+                                "nota": ("no se ha divulgado nada al canal. Si de esto "
+                                         "sale una leccion que le sirva a quien no estaba, "
+                                         "vuelve a cerrarla con `divulgar`: la resolucion "
+                                         "es lo que suele llevarla.")})})
     return f"ERROR: no existe la solicitud {ref}."
 
 # ───────────── CARTELERA (divulgación de la autoridad) e HISTORIAL ─────────────
@@ -1687,7 +2028,7 @@ def cartel_estado(ref: str) -> str:
     me = ident()
     if not es_autoridad(me): return "ERROR: cartel_estado es de la autoridad."
     ref = _norm_ref(ref) or ref.strip().upper()
-    for c in _rows("cartel", 300):
+    for c in _rows("cartel", None):
         if _norm_ref(c.get("ref")) == ref:
             conf = c.get("confirmaciones", {})
             pend = [p for p in c.get("dirigido_a", []) if p not in conf
@@ -1898,7 +2239,7 @@ def fecha_estado(ref: str, estado: str, nota: str = "") -> str:
     _put("fecha", nref, d)
     out = {"ref": nref, "antes": antes, "ahora": e, "que": d.get("que")}
     if e in FINALES:
-        colgadas = [r.get("_key") for r in _rows("fecha", 500)
+        colgadas = [r.get("_key") for r in _rows("fecha", None)
                     if r.get("depende_de") == nref and r.get("estado") not in FINALES]
         if colgadas:
             out["dependian_de_esta"] = colgadas
@@ -2413,7 +2754,7 @@ def altas_pendientes() -> str:
     me = ident()
     if not es_autoridad(me): return "ERROR: altas_pendientes es de la autoridad."
     out = []
-    for i in _rows("invitacion", 200):
+    for i in _rows("invitacion", None):
         if i.get("estado") == "solicitada":
             out.append({k: v for k, v in i.items() if k not in ("codigo_sha256", "token_sha256")})
     return _jd(out)
