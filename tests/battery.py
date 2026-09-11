@@ -672,6 +672,26 @@ def puerta_D():
     caso("D", "fact_set/fact_get conservan acentos y eñes (UTF-8 íntegro)", _d_utf8)
     caso("D", "decision_log queda y decision_list la devuelve", _d_decision)
     caso("D", "search encuentra lo escrito", _d_search)
+    caso("D", "the greeting carries headlines, not bodies", _pub_saludo_trae_titulares_no_cuerpos)
+    caso("D", "msg_leer returns one whole message", _pub_msg_leer_trae_el_cuerpo)
+    caso("C", "msg_leer does not open somebody else's mail", _pub_msg_leer_no_abre_correo_ajeno)
+    caso("D", "an unknown is reported as unknown, not guessed", _pub_no_lo_se_en_vez_de_adivinar)
+    caso("D", "every tool declares its profile", _pub_cada_herramienta_declara_su_perfil)
+    caso("D", "parametros(one) and parametros(all) agree", _pub_parametros_de_una_y_de_todas_coinciden)
+    caso("D", "a retried request does not open a second one", _pub_un_reintento_no_crea_dos_solicitudes)
+    caso("D", "a repeated notice IS created, and says so", _pub_un_aviso_repetido_si_se_crea)
+    caso("D", "a notice can declare how long it is worth", _pub_un_anuncio_declara_cuanto_vale)
+    caso("D", "a notice without a lifetime never expires", _pub_un_aviso_sin_vigencia_no_caduca)
+    caso("D", "a request cannot expire on its own", _pub_una_solicitud_no_declara_vigencia)
+    caso("D", "updating counts as a sign of life", _pub_actualizar_cuenta_como_senal_de_vida)
+    caso("D", "acking does NOT credit the sender with a write", _pub_acusar_no_acredita_a_quien_no_escribio)
+    caso("D", "the greeting shows what is taken on this machine", _pub_el_saludo_ensena_lo_tomado_en_mi_estacion)
+    caso("D", "that section does not bloat the greeting (contract)", _pub_esa_seccion_no_engorda_el_saludo)
+    if FRASE:
+        caso("C", "aborting a rotation returns the token you had", _pub_abortar_devuelve_el_token_de_siempre)
+        caso("C", "aborting refuses once confirmed (it would strand them)", _pub_abortar_se_niega_si_ya_confirmo)
+    else:
+        salto("C", "abort rotation", "no BAT_FRASE")
     caso("D", "serie TEST-N: única, cerrable y NO toca el contador SOL (D3)", _d_serie_test)
     caso("D", "refs normalizadas: SOL-7 ≡ SOL-007 en duplicado y en sol_cerrar (H1)", _d_norm)
     caso("D", "puertos: colisión detectada en la misma estación, rangos incluidos", _d_puertos)
@@ -746,6 +766,427 @@ def _d11_actividad_no_epistolar():
     yo2 = [p for p in ps if p.get("id") == ID2]
     assert yo2 and yo2[0].get("ultima_escritura") == e, "participantes() no lleva la huella"
     call(T2, "puerto_liberar", {"puerto": pto})
+
+def _jd_(x):
+    """Short JSON for assertion messages. TRUNCATES, so never assert on this."""
+    try:
+        return json.dumps(x, ensure_ascii=False)[:400]
+    except Exception:
+        return str(x)[:400]
+
+
+def _otro_segundo():
+    """Wait for the clock second to change.
+
+    Timestamps here have one-second resolution. Asked which of two writes in the
+    same second came last, the honest answer is that nobody knows, and a test
+    that asserts one of them passes or fails by luck. Rather than make the server
+    answer firmly -- which would manufacture a certainty it does not have -- the
+    test makes sure there IS a last write before asking for one.
+    """
+    t0 = time.time()
+    while int(time.time()) == int(t0) and time.time() - t0 < 2:
+        time.sleep(0.05)
+
+
+def _pub_saludo_trae_titulares_no_cuerpos():
+    """The opening snapshot carries headlines, not full messages.
+
+    It used to return every pending message in full. On a channel with history
+    that reached 185 KB, paid on every session of every participant before a
+    single useful word was exchanged. The fix is only half a fix unless you can
+    still fetch a body on demand, which is the next case.
+    """
+    # THE MARKER GOES AT THE END, and that is the whole point of the case.
+    #
+    # A headline legitimately carries the FIRST few hundred characters, so
+    # asserting that the start of the body is absent tests the opposite of the
+    # design and fails on a correct server. What must not travel is the END: if
+    # that arrives, nothing was trimmed.
+    cuerpo = "start-" + RUN + ("x" * 3000) + "-FINAL-" + RUN
+    call(T2, "msg_send", {"para": ID1, "tipo": "aviso",
+                          "asunto": "headline test " + RUN, "cuerpo": cuerpo})
+    ov = call(T1, "state_overview")
+    txt = json.dumps(ov, ensure_ascii=False)
+    assert "-FINAL-" + RUN not in txt, (
+        "the greeting still ships whole message bodies: no saving at all")
+    assert len(txt) < 400000, "the greeting is %d bytes: nothing was trimmed" % len(txt)
+    pend = ov.get("mensajes_pendientes") or []
+    mio = [m for m in pend if (m.get("asunto") or "").endswith(RUN)]
+    assert mio, "the message is not in the inbox at all: %s" % _jd_(pend)[:200]
+    assert mio[0].get("_id"), "a headline with no id cannot be expanded: %s" % _jd_(mio[0])
+
+
+def _pub_msg_leer_trae_el_cuerpo():
+    """Fetching one message by id returns it whole.
+
+    Without this the slimmed greeting would not save anything: it would only move
+    the cost to a second call that does not exist.
+    """
+    cuerpo = "CUERPO-ENTERO-" + RUN
+    r = call(T2, "msg_send", {"para": ID1, "tipo": "aviso",
+                              "asunto": "read one " + RUN, "cuerpo": cuerpo})
+    res = call(T1, "msg_leer", {"ids": str(r["id"])})
+    if isinstance(res, dict):
+        res = res.get("mensajes", [])
+    assert res and cuerpo in json.dumps(res, ensure_ascii=False), \
+        "msg_leer did not return the body: %s" % _jd_(res)
+
+
+def _pub_msg_leer_no_abre_correo_ajeno():
+    """Message ids are consecutive, so without a recipient check anyone could
+    walk the numbers and read other people's mail. The saving must not open a
+    door that was closed before."""
+    r = call(T2, "msg_send", {"para": ID2, "tipo": "aviso",
+                              "asunto": "private " + RUN,
+                              "cuerpo": "SECRETO-" + RUN})
+    res = call(T1, "msg_leer", {"ids": str(r["id"])})
+    txt = json.dumps(res, ensure_ascii=False)
+    assert "SECRETO-" + RUN not in txt, (
+        "msg_leer handed over a message addressed to somebody else. Ids are "
+        "consecutive: this is a door, not an edge case.")
+
+
+def _pub_no_lo_se_en_vez_de_adivinar():
+    """An unknown is reported as an unknown, not as a zero or a false.
+
+    A tool that answers "off" when it has no reading is indistinguishable from
+    one that measured and found it off, and the reader cannot tell. The shape is
+    explicit: sabido=False plus why, and when it was last known if ever.
+    """
+    import random as _r
+    rid = "tool-" + RUN[-6:]
+    call(T1, "herramienta_declarar", {"id": rid, "puerto": _r.randint(26000, 26999),
+                                      "arranque": "battery probe, never started"})
+    est = call(T1, "herramienta_estado", {"id": rid})
+    txt = json.dumps(est, ensure_ascii=False)
+    assert "sabido" in txt, (
+        "state of a tool nobody has measured does not say it is unknown: %s"
+        % txt[:300])
+    enc = est.get("encendida") if isinstance(est, dict) else None
+    if isinstance(enc, dict):
+        assert enc.get("sabido") is False, "expected sabido=False, got %s" % _jd_(enc)
+        assert enc.get("porque"), "says it does not know but not why"
+    else:
+        assert enc is not True, (
+            "with no measurement it answers a plain %r, which reads as a fact" % enc)
+
+
+def _pub_cada_herramienta_declara_su_perfil():
+    """Every tool says which edition it belongs to.
+
+    An install that is a desktop has no use for the parts that manage a server,
+    and a tool with no declared profile is one nobody decided about. The server
+    reports the gap itself rather than leaving the reader to diff two lists.
+    """
+    p = call(T1, "parametros")
+    assert isinstance(p, dict) and p.get("herramientas"), \
+        "parametros() does not list the tools: %s" % _jd_(p)
+    sin = p.get("SIN_PERFIL")
+    assert not sin, ("these tools declare no profile: %s. Undeclared is not "
+                     "neutral, it is undecided." % _jd_(sin))
+
+
+def _pub_parametros_de_una_y_de_todas_coinciden():
+    """Asking about one tool and asking about all of them must agree.
+
+    Two code paths that answer the same question are how two answers end up
+    disagreeing without anybody noticing.
+    """
+    # The two answers have DIFFERENT SHAPES on purpose: asking about one tool
+    # returns it at the top level, asking about all of them nests them under
+    # "herramientas" alongside the totals. The first version of this case assumed
+    # one shape for both and failed on a correct server -- assuming the shape of
+    # an answer is the same mistake as assuming its content.
+    una = call(T1, "parametros", {"herramienta": "msg_send"})
+    todas = call(T1, "parametros")
+    a = (una or {}).get("msg_send") if isinstance(una, dict) else None
+    b = ((todas or {}).get("herramientas") or {}).get("msg_send") \
+        if isinstance(todas, dict) else None
+    assert a, "parametros('msg_send') does not return it: %s" % _jd_(una)
+    assert b, "parametros() does not list msg_send under 'herramientas': %s" % _jd_(
+        list((todas or {}).keys()))
+    for campo in ("obligatorios", "opcionales", "perfil"):
+        assert a.get(campo) == b.get(campo), (
+            "parametros('msg_send') and parametros() disagree on %r:\n  one: %s\n  all: %s"
+            % (campo, _jd_(a.get(campo)), _jd_(b.get(campo))))
+
+
+def _pub_un_reintento_no_crea_dos_solicitudes():
+    """The same request sent twice in seconds is a retry, not two obligations.
+
+    A client that loses the reply and resends would otherwise open two tickets
+    for one problem, and one of them is then real to nobody. Only requests
+    collapse: for other kinds, losing a message is worse than seeing it twice.
+    """
+    args = {"para": ID1, "tipo": "solicitud", "asunto": "retry " + RUN,
+            "cuerpo": "same request twice"}
+    a = call(T2, "msg_send", dict(args))
+    b = call(T2, "msg_send", dict(args))
+    assert a.get("ref") and a.get("ref") == b.get("ref"), (
+        "a retry opened a SECOND request: %s then %s. Two references for one "
+        "thing means one of them is nobody's." % (a.get("ref"), b.get("ref")))
+    assert a.get("id") == b.get("id"), "same ref but a different message was created"
+
+
+def _pub_un_aviso_repetido_si_se_crea():
+    """The mirror of the case above, and the reason it is not one rule.
+
+    Repeating a notice can be legitimate. Collapsing those would silently drop
+    messages, which is what an early version of this did. They are created, and
+    the answer carries a flag so the sender can notice.
+    """
+    args = {"para": ID1, "tipo": "aviso", "asunto": "repeat " + RUN,
+            "cuerpo": "same notice twice"}
+    a = call(T2, "msg_send", dict(args))
+    b = call(T2, "msg_send", dict(args))
+    assert a.get("id") != b.get("id"), (
+        "two identical notices collapsed into one. Losing a message is worse "
+        "than seeing it twice.")
+    assert b.get("posible_duplicado"), (
+        "created it but said nothing: the sender cannot tell it was a repeat")
+
+
+def _pub_un_anuncio_declara_cuanto_vale():
+    """A notice can say how long it is worth, and then leaves the greeting.
+
+    Daily notices otherwise sit in everyone's inbox forever. The lifetime is
+    DECLARED by the sender, never inferred from the text: inferring it from a
+    prefix would be a rule nobody agreed to, and it would quietly hide standing
+    norms that happen to look like daily notices.
+    """
+    r = call(T2, "msg_send", {"para": "todos", "tipo": "aviso",
+                              "asunto": "expires " + RUN, "cuerpo": "short lived",
+                              "vigencia_dias": 1})
+    assert r.get("caduca"), "declared a lifetime and the server did not record it: %s" % _jd_(r)
+
+
+def _pub_un_aviso_sin_vigencia_no_caduca():
+    """Protects the standing norms. A notice that declares nothing lasts."""
+    r = call(T2, "msg_send", {"para": "todos", "tipo": "aviso",
+                              "asunto": "forever " + RUN, "cuerpo": "a standing rule"})
+    assert not r.get("caduca"), (
+        "a notice that declared no lifetime got one anyway: standing rules would "
+        "disappear on their own")
+
+
+def _pub_una_solicitud_no_declara_vigencia():
+    """A request cannot expire by itself: it is closed or it is open. An expiring
+    obligation is one nobody has to answer."""
+    try:
+        r = call(T2, "msg_send", {"para": ID1, "tipo": "solicitud",
+                                  "asunto": "expiring duty " + RUN,
+                                  "cuerpo": "should be refused", "vigencia_dias": 1})
+    except Rechazo:
+        return
+    assert not r.get("caduca"), (
+        "a request was allowed to expire on its own: %s" % _jd_(r))
+
+
+def _pub_actualizar_cuenta_como_senal_de_vida():
+    """Updating something counts as being alive, the same as creating it.
+
+    The signal is derived from the rows, and a row updated today keeps its
+    original creation date and its original id. Reading only creations, or
+    reading the most recent rows by id, both miss exactly the case this exists
+    for: whoever only updates things looks inactive. That misreading is what this
+    signal was added to prevent in the first place.
+    """
+    import random as _r
+    pto = _r.randint(24000, 24999)
+    call(T2, "puerto_reservar", {"puerto": pto, "servicio": "alive-" + RUN})
+    # THE RELEASE GOES IN A finally, and it is not tidiness.
+    #
+    # Without it, a case that fails midway leaves its port reserved, and the NEXT
+    # run trips over it: the port-collision case then reports a clash that the
+    # server was right to report. A red caused by the previous run's leftovers is
+    # worse than no test, because it sends you looking for a defect that is not
+    # there. Happened here, with a port left behind by this very case.
+    try:
+        _otro_segundo()
+        call(T2, "fact_set", {"clave": "bat.alive.%s" % RUN, "valor": "x",
+                              "fuente": "battery"})
+        act = (call(T1, "state_overview").get("actividad_de_todos") or {}).get(ID2) or {}
+        assert act.get("ultimo_escrito") == "fact", \
+            "unexpected starting point: %s" % _jd_(act)
+        _otro_segundo()
+        r = call(T2, "puerto_reservar", {"puerto": pto, "servicio": "alive-again-" + RUN})
+        assert (r.get("accion") or "") == "actualizado", (
+            "expected an update and got %r; the case is not testing what it claims"
+            % r.get("accion"))
+        act = (call(T1, "state_overview").get("actividad_de_todos") or {}).get(ID2) or {}
+        assert act.get("ultimo_escrito") == "puerto", (
+            "updating left no trace: %s. Whoever only updates things appears "
+            "inactive, and reading that as absence is the misunderstanding this "
+            "signal exists to prevent." % _jd_(act))
+    finally:
+        try:
+            call(T2, "puerto_liberar", {"puerto": pto})
+        except Exception:
+            pass
+
+
+def _pub_acusar_no_acredita_a_quien_no_escribio():
+    """The trap in the obvious fix for the case above.
+
+    Deriving the signal from the update timestamp alone would credit the SENDER
+    of a message with a write when the RECEIVER acknowledges it, because the ack
+    updates the sender's row. A false sign of life is worse than none: it says
+    somebody is working when they are not.
+    """
+    r = call(T2, "msg_send", {"para": ID1, "tipo": "aviso",
+                              "asunto": "ack credit " + RUN, "cuerpo": "x"})
+    antes = ((call(T1, "state_overview").get("actividad_de_todos") or {})
+             .get(ID2) or {}).get("ultima_escritura")
+    _otro_segundo()
+    call(T1, "msg_ack", {"id": int(r["id"])})
+    despues = ((call(T1, "state_overview").get("actividad_de_todos") or {})
+               .get(ID2) or {}).get("ultima_escritura")
+    assert antes == despues, (
+        "acknowledging somebody else's message credited THEM with a write they "
+        "did not make: %s -> %s" % (antes, despues))
+
+
+def _pub_el_saludo_ensena_lo_tomado_en_mi_estacion():
+    """What is taken on your machine is visible when you open the session.
+
+    The greeting already showed the ports registered on your machine. Not showing
+    the resources was an asymmetry with no defence: a clashing port is an
+    annoyance, missing VRAM leaves the job half done. Declaring that reserving a
+    resource replaces hand-written notices only works if the reservation is
+    visible without asking for it.
+    """
+    rid = "res-" + RUN[-6:]
+    call(T1, "recurso_declarar", {"id": rid, "capacidad": 10000, "unidad": "MiB",
+                                  "base": 1000, "notas": "battery probe"})
+    call(T2, "recurso_tomar", {"recurso": rid, "cuanto": 3000,
+                               "para": "battery run " + RUN, "minutos": 30})
+    try:
+        ov = call(T1, "state_overview")
+        rec = ov.get("recursos_de_mi_estacion")
+        assert isinstance(rec, list), (
+            "the greeting does not show what is taken on this machine: %s"
+            % _jd_(sorted(ov.keys())))
+        mio = [x for x in rec if x.get("recurso") == rid]
+        assert mio, "%s was just taken and does not appear: %s" % (rid, _jd_(rec))
+        txt = json.dumps(mio[0], ensure_ascii=False)
+        assert ID2 in txt, "does not say who holds it: %s" % txt[:200]
+        assert "battery run" in txt, (
+            "does not say WHAT FOR, which is what stops somebody killing the "
+            "process believing it is spare")
+    finally:
+        try:
+            call(T2, "recurso_soltar", {"recurso": rid})
+        except Exception:
+            pass
+
+
+def _pub_esa_seccion_no_engorda_el_saludo():
+    """Contract. A new section cannot undo the slimming.
+
+    Caught in testing with 45 leftover resources, where the section reached 7 KB.
+    An install with two cards would never have shown it, and by the time it did
+    it would be too late.
+    """
+    rec = call(T1, "state_overview").get("recursos_de_mi_estacion") or []
+    peso = len(json.dumps(rec, ensure_ascii=False))
+    assert peso < 4000, (
+        "the resources section is %d bytes; it is meant to be a few lines, not "
+        "the whole register" % peso)
+
+
+def _pub_abortar_devuelve_el_token_de_siempre():
+    """Undoing an exchanged rotation leaves you with the token you already use.
+
+    Rotation is deliberately not atomic: the participant generates their own
+    token and the old one keeps working until they confirm. When the new token is
+    lost between the exchange and the disk, they are left with two registered
+    tokens, one of which nobody holds. Before this existed the only apparent way
+    out retired the OLD token -- the only one they still had.
+
+    Checked by CALLING the channel with that token, not by reading the answer:
+    an "aborted" that left the door shut would be the worst possible outcome.
+    """
+    import urllib.request as _u
+    viejo = T2
+    call(viejo, "parametros")
+    inv = call(T1, "rotacion_invitar", {"id": ID2, "dias": 1, "frase": FRASE})
+    nuevo = "bat" + RUN + "x" * max(0, 40 - len(RUN))
+    d = json.dumps({"codigo": inv["codigo"], "token_propuesto": nuevo}).encode()
+    rq = _u.Request(BASE + "/rotacion", d,
+                    {"Content-Type": "application/json", "User-Agent": UA})
+    assert json.loads(_u.urlopen(rq, timeout=30).read().decode()).get("ok"), \
+        "could not exchange; the case measures nothing"
+    try:
+        res = call(T1, "rotacion_abortar", {"id": ID2, "frase": FRASE})
+        assert "abort" in json.dumps(res, ensure_ascii=False).lower(), \
+            "rotacion_abortar does not report aborting: %s" % _jd_(res)
+        call(viejo, "parametros")          # the door, not the answer
+        est = [p for p in call(T1, "rotacion_estado")["participantes"]
+               if p["id"] == ID2][0]
+        assert not est["en_rotacion"], \
+            "aborted but the channel still reports an open rotation: %s" % _jd_(est)
+        try:
+            call(nuevo, "parametros")
+            raise AssertionError("the aborted token still opens: nothing was retired")
+        except Rechazo:
+            pass
+        except AssertionError:
+            raise
+        except Exception:
+            pass
+    finally:
+        try:
+            call(T1, "rotacion_abortar", {"id": ID2, "frase": FRASE})
+        except Exception:
+            pass
+
+
+def _pub_abortar_se_niega_si_ya_confirmo():
+    """The refusal is the useful half.
+
+    Confirming is only possible by calling WITH the new token, so whoever
+    confirmed holds it and is using it. Aborting there would take away the token
+    they use. It is the same rule closing applies from the other end -- closing
+    refuses while somebody has NOT confirmed -- and neither call can leave anyone
+    without a working token.
+    """
+    import urllib.request as _u
+    inv = call(T1, "rotacion_invitar", {"id": ID2, "dias": 1, "frase": FRASE})
+    nuevo = "bt2" + RUN + "y" * max(0, 40 - len(RUN))
+    d = json.dumps({"codigo": inv["codigo"], "token_propuesto": nuevo}).encode()
+    rq = _u.Request(BASE + "/rotacion", d,
+                    {"Content-Type": "application/json", "User-Agent": UA})
+    assert json.loads(_u.urlopen(rq, timeout=30).read().decode()).get("ok")
+    try:
+        call(nuevo, "token_confirmar")
+        try:
+            res = call(T1, "rotacion_abortar", {"id": ID2, "frase": FRASE})
+        except Rechazo as e:
+            res = str(e)
+        txt = res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
+        assert "confirm" in txt.lower(), (
+            "abort did NOT refuse on somebody already using the new token. That "
+            "takes away the token they use: %s" % txt[:250])
+    finally:
+        # Back to the token in the file. Closing here would retire the OLD one
+        # and leave the test identity holding a token that exists nowhere --
+        # which is how an earlier version of this cleanup broke the whole run.
+        try:
+            call(T1, "rotacion_cerrar", {"id": ID2, "frase": FRASE})
+            inv = call(T1, "rotacion_invitar", {"id": ID2, "dias": 1, "frase": FRASE})
+            d = json.dumps({"codigo": inv["codigo"], "token_propuesto": T2}).encode()
+            rq = _u.Request(BASE + "/rotacion", d,
+                            {"Content-Type": "application/json", "User-Agent": UA})
+            _u.urlopen(rq, timeout=30).read()
+            call(T2, "token_confirmar")
+            call(T1, "rotacion_cerrar", {"id": ID2, "frase": FRASE})
+            call(T2, "parametros")
+        except Exception as e:
+            raise AssertionError(
+                "cleanup did not give %s its token back: %s. The rest of the "
+                "battery will fail on 404." % (ID2, e))
+
 
 def _d_ciclo_msg():
     call(T1, "msg_send", {"para": ID2, "asunto": "ciclo completo",
