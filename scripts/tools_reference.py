@@ -99,7 +99,7 @@ do.""", [
         "alta_invitar", "altas_pendientes", "alta_aprobar", "alta_rechazar",
         "participante_baja", "participante_estacion", "participante_cartelera",
         "rotacion_invitar", "rotacion_estado", "rotacion_anular", "rotacion_cerrar",
-        "token_confirmar", "intentos_frase",
+        "rotacion_abortar", "token_confirmar", "intentos_frase",
     ]),
 ]
 
@@ -214,7 +214,17 @@ RESUMEN = {
     "rotacion_estado": "Who has already confirmed their new token and who has not.",
     "rotacion_anular": "Cancel a live rotation code so another can be issued. Touches "
                        "no token: it only invalidates an unused permission.",
-    "rotacion_cerrar": "Retire the old tokens once everyone has moved (passphrase).",
+    "rotacion_cerrar": "Retire the old tokens once everyone has moved (passphrase). "
+                       "Refuses while somebody has not confirmed: closing on them "
+                       "would leave them outside with no channel to say so.",
+    "rotacion_abortar": "Undo an exchanged rotation, keeping the OLD token and "
+                        "retiring the new one (passphrase). The inverse of closing, "
+                        "and the way back when a participant's new token is lost "
+                        "between the exchange and the disk. Refuses once they have "
+                        "confirmed, because confirming is only possible with the new "
+                        "token in hand: taking it away then would strand them. Each "
+                        "of the two refuses exactly where it would leave somebody "
+                        "with no working token.",
     "token_confirmar": "Confirm you are now using your new token.",
     "intentos_frase": "Failed passphrase attempts (authority only). A failure nobody "
                       "can see is a failure nobody investigates.",

@@ -7,7 +7,7 @@ has no description, so a new capability cannot ship undocumented.
 Every tool returns JSON as text. Identity is never a parameter: the server
 seals each call with the identity behind the token in the URL.
 
-77 tools.
+78 tools.
 
 Tools marked **VPS edition only** administer something that lives on the
 server -- TLS on demand, systemd units, a root helper -- so a desktop
@@ -378,7 +378,11 @@ Cancel a live rotation code so another can be issued. Touches no token: it only 
 
 ### `rotacion_cerrar(id = "", frase = "", forzar = False)`
 
-Retire the old tokens once everyone has moved (passphrase).
+Retire the old tokens once everyone has moved (passphrase). Refuses while somebody has not confirmed: closing on them would leave them outside with no channel to say so.
+
+### `rotacion_abortar(id, frase = "")`
+
+Undo an exchanged rotation, keeping the OLD token and retiring the new one (passphrase). The inverse of closing, and the way back when a participant's new token is lost between the exchange and the disk. Refuses once they have confirmed, because confirming is only possible with the new token in hand: taking it away then would strand them. Each of the two refuses exactly where it would leave somebody with no working token.
 
 ### `token_confirmar()`
 

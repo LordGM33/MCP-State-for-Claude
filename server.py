@@ -213,8 +213,16 @@ def _ultima_escritura():
             out[quien] = {"cuando": cuando, "que": que}
 
     with db() as con:
+        # ORDENADO POR `updated`, NO POR `id`. El id crece al INSERTAR: una fila
+        # antigua actualizada hoy conserva id bajo y se caia de la ventana en
+        # cuanto la base pasaba de 4000 filas -- justo el caso que esto existe
+        # para ver. `updated` se sella tambien en el INSERT, asi que una sola
+        # consulta cubre lo creado y lo actualizado.
+        #
+        # Una ventana hay que ordenarla por lo que se esta buscando. Ordenar por
+        # id y preguntar por fechas es pedirle a la lista que adivine.
         for r in con.execute("SELECT kind,data,created,updated FROM items WHERE kind NOT IN "
-                             "('participant','actividad') ORDER BY id DESC LIMIT 4000"):
+                             "('participant','actividad') ORDER BY updated DESC LIMIT 4000"):
             try: d = json.loads(r["data"])
             except Exception: continue
             # quien lo creo, con la fecha de creacion
@@ -1155,6 +1163,7 @@ PERFIL_HERRAMIENTA = {
     "participante_estacion": "ambos", "participante_cartelera": "ambos",
     "rotacion_invitar": "ambos", "rotacion_estado": "ambos",
     "rotacion_anular": "ambos", "rotacion_cerrar": "ambos",
+    "rotacion_abortar": "ambos",
     "token_confirmar": "ambos", "intentos_frase": "ambos",
     # — puertos: son de la estacion, no del servidor. En escritorio hacen MAS
     #   falta, porque ahi es donde chocan de verdad
@@ -2600,6 +2609,65 @@ def rotacion_anular(id: str, frase: str = "") -> str:
                 "nota": "ningun token se ha tocado; ya puedes emitir otro"})
 
 @mcp.tool()
+def rotacion_abortar(id: str, frase: str = "") -> str:
+    """(AUTORIDAD + frase) Deshace una rotacion CANJEADA que no se pudo terminar:
+    se queda el token ANTIGUO y se retira el nuevo. Es la inversa de
+    rotacion_cerrar, y existe porque faltaba.
+
+    Cuando el token nuevo se pierde entre el canje y el disco -- el servidor lo
+    acepta y el `open` local falla -- el participante queda con dos tokens
+    registrados, uno de los cuales no tiene nadie. Paso el 2-sep y volvio a pasar
+    el 11-sep. Hasta hoy no habia forma de volver atras, y la unica salida que
+    parecia existir era `rotacion_cerrar(forzar=True)`, que retira precisamente
+    el UNICO token que el participante todavia tiene.
+
+    SE NIEGA SI YA HA CONFIRMADO. Confirmar solo es posible llamando CON el token
+    nuevo, asi que quien confirmo lo tiene y lo esta usando: retirarselo lo
+    dejaria fuera. Es la misma regla que aplica rotacion_cerrar al reves, y por
+    el mismo motivo: ninguna de las dos puede dejar a nadie sin token valido.
+    """
+    me = ident()
+    if not es_autoridad(me): return "ERROR: rotacion_abortar es de la autoridad."
+    ok, err = _frase_ok(frase)
+    if not ok: return err
+    pid = id.strip().lower()
+    p = PARTICIPANTES.get(pid)
+    if not p or not p.get("activo", True):
+        return f"ERROR: '{pid}' no existe o no esta activo."
+    viejo = p.get("token_anterior_sha256")
+    if not viejo:
+        return _jd({"error": f"'{pid}' no tiene ninguna rotacion abierta que abortar",
+                    "nota": "si lo que quieres es cambiarle el token, empieza por rotacion_invitar"})
+    if _confirmo_esta_rotacion(pid):
+        return _jd({"error": f"'{pid}' YA CONFIRMO su token nuevo: lo tiene y lo esta usando",
+                    "por_que_no": ("confirmar solo se puede llamando CON el token nuevo, asi que "
+                                   "abortar aqui le retiraria el que usa y lo dejaria fuera."),
+                    "lo_que_querras": f"rotacion_cerrar('{pid}') — terminar, no deshacer"})
+    # Se queda el ANTIGUO como unico vigente y desaparece el nuevo.
+    p["token_sha256"] = viejo
+    p.pop("token_anterior_sha256", None)
+    p.pop("rota_hasta", None)
+    p.pop("rot_id", None)
+    _guardar_participantes(); _recargar_participantes()
+    # Los codigos vivos de este participante tambien sobran: la rotacion se acabo.
+    n = 0
+    with db() as con:
+        for r in con.execute("SELECT id,data FROM items WHERE kind='rot_invitacion'").fetchall():
+            d = json.loads(r["data"])
+            if d.get("para") == pid and d.get("estado") == "emitida":
+                d["estado"] = "anulada"; d["anulada_por"] = me; d["anulada"] = now()
+                con.execute("UPDATE items SET data=?, updated=? WHERE id=?",
+                            (json.dumps(d, ensure_ascii=False), now(), r["id"]))
+                n += 1
+    return _jd({"accion": "rotacion abortada", "id": pid,
+                "vigente_ahora": "el token ANTIGUO, el que ya usaba",
+                "retirado": "el token nuevo que se habia canjeado",
+                "codigos_anulados": n,
+                "nota": ("No hace falta que cambie nada en su configuracion: sigue con el "
+                         "token que tenia. Si hay que rotarlo de verdad, se empieza de cero "
+                         "con rotacion_invitar.")})
+
+@mcp.tool()
 def rotacion_cerrar(id: str = "", frase: str = "", forzar: bool = False) -> str:
     """(AUTORIDAD + frase) Retira los tokens antiguos. Sin `id`, cierra todas las
     rotaciones abiertas. Se NIEGA mientras alguien no haya confirmado: cerrar sobre
@@ -2670,18 +2738,47 @@ def rotacion_invitar(id: str, dias: int = 7, frase: str = "") -> str:
                 "instrucciones": _texto_rotacion(codigo, pid)})
 
 def _texto_rotacion(codigo, pid):
+    """SE GUARDA ANTES DE CANJEAR, y el orden es el arreglo, no un detalle.
+
+    Hasta el 11-sep esto canjeaba primero y escribia despues. Ricardo lo ejecuto
+    con RUTA apuntando a un directorio: el servidor acepto el token nuevo y el
+    `open` reviento. El token existio solo en la memoria de ese proceso y se
+    perdio, con el servidor dandolo por bueno.
+
+    La regla que lo impide ya estaba escrita en el canal desde el 2-sep
+    (`regla.persistir_antes_de_comprometer`), y el propio rotacion_invitar
+    llevaba el comentario de que eso mismo habia pasado. La leccion estaba
+    archivada y el defecto seguia en pie: escribir la leccion no es arreglarla.
+
+    Escribiendo primero, una RUTA mala falla ANTES de tocar el servidor: no se
+    gasta el codigo y no hay nada que recuperar.
+    """
     return (
         f"Cambio de token de '{pid}'. Genera TU el nuevo; el canal no te lo manda.\n\n"
+        "1) Pon abajo la RUTA COMPLETA DEL FICHERO donde lees tu token, CON SU\n"
+        f"   NOMBRE (esta en infra_list como token-{pid}). Una carpeta no vale:\n"
+        "      mal:  r'C:\\Eva\\TuNombre'\n"
+        "      bien: r'C:\\Eva\\TuNombre\\claves\\tu.token'\n"
+        "   Dejalo en cadena CRUDA, con la r delante: sin ella, una ruta con\n"
+        "   \\E o \\n se corrompe (a veces con aviso, a veces en silencio).\n\n"
+        "2) Ejecuta:\n\n"
         "python -c \"import secrets,json,urllib.request;"
+        "RUTA=r'PON_AQUI_LA_RUTA';"
         "t=secrets.token_urlsafe(36);"
+        "open(RUTA,'w').write(t);"
         f"d=json.dumps({{'codigo':'{codigo}','token_propuesto':t}}).encode();"
         "r=urllib.request.Request('https://" + PUBLIC_HOST + "/rotacion',d,"
         "{'Content-Type':'application/json','User-Agent':'eva-rotacion/1.0'});"
-        "print(urllib.request.urlopen(r,timeout=30).read().decode());"
-        "open(RUTA,'w').write(t)\"\n\n"
-        "Cambia RUTA por el fichero donde lees tu token (esta en infra_list como "
-        f"token-{pid}). Tu token ANTIGUO sigue valiendo hasta que confirmes: reinicia "
-        "tu cliente y llama a token_confirmar().")
+        "print(urllib.request.urlopen(r,timeout=30).read().decode())\"\n\n"
+        "SE ESCRIBE ANTES DE CANJEAR, a proposito: si la ruta esta mal, falla ahi\n"
+        "y no se gasta el codigo. Al reves se pierde el token con el canje ya\n"
+        "hecho, que es como se perdio uno el 2-sep y otro el 11-sep.\n\n"
+        "3) Reinicia tu cliente con el token nuevo y llama a token_confirmar().\n"
+        "   El canal rechaza esa llamada si llega con el token viejo, asi que no\n"
+        "   puedes confirmar sin haberlo probado.\n\n"
+        "TU TOKEN ANTIGUO SIGUE ABRIENDO hasta que la autoridad cierre la\n"
+        "rotacion. Es la red que te deja avisar si algo sale mal: no borres su\n"
+        "fichero hasta despues del cierre.")
 
 async def rotacion_post(request):
     """Canje del codigo de rotacion. El cliente propone su token; aqui no se emite
