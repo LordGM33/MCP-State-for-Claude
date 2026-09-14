@@ -7,7 +7,7 @@ has no description, so a new capability cannot ship undocumented.
 Every tool returns JSON as text. Identity is never a parameter: the server
 seals each call with the identity behind the token in the URL.
 
-78 tools.
+81 tools.
 
 Tools marked **VPS edition only** administer something that lives on the
 server -- TLS on demand, systemd units, a root helper -- so a desktop
@@ -331,6 +331,18 @@ Put an app to sleep without uninstalling it. It wakes on the first visitor.
 ### `app_eliminar(nombre)` · **VPS edition only**
 
 Remove a dynamic app: stop it, delete its unit and its proxy snippet.
+
+### `app_secreto(nombre, clave, valor)` · **VPS edition only**
+
+Give your app a credential without it travelling inside the deployment package. The value is stored on the server with closed permissions and reaches the process through systemd's LoadCredential, readable at $CREDENTIALS_DIRECTORY/<name>. Not an environment variable on purpose: the environment is INHERITED by child processes, so an app that shells out to a media tool would be handing that tool its key. Packaging a secret instead leaves it in a directory the deployer makes world-readable to serve static files, where the app's own owner cannot even delete it. Survives redeployment; rotating is one call, with nothing to repackage.
+
+### `app_secretos(nombre)` · **VPS edition only**
+
+The NAMES of an app's credentials. Never the values.
+
+### `app_secreto_borrar(nombre, clave)` · **VPS edition only**
+
+Remove one credential. The app restarts if it was running.
 
 ## Membership and tokens (authority)
 

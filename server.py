@@ -1162,6 +1162,7 @@ PERFIL_HERRAMIENTA = {
     "alta_rechazar": "ambos", "participante_baja": "ambos",
     "participante_estacion": "ambos", "participante_cartelera": "ambos",
     "rotacion_invitar": "ambos", "rotacion_estado": "ambos",
+    "app_secreto": "vps", "app_secretos": "vps", "app_secreto_borrar": "vps",
     "rotacion_anular": "ambos", "rotacion_cerrar": "ambos",
     "rotacion_abortar": "ambos",
     "token_confirmar": "ambos", "intentos_frase": "ambos",
@@ -1213,6 +1214,36 @@ _EN_REVISION_HERR = (
     "pero el de aqui exige que confirme un participante de tipo HUMANO, cosa que en "
     "local no se puede distinguir (lo dice el propio contrato del arbitro). Mientras "
     "esa diferencia exista, las dos no son equivalentes. Se puede seguir usando.")
+# ───────────── EL PERFIL ACTIVO (FECHA-025, parte 2, paso 2) ─────────────
+# Hasta hoy la tabla de arriba solo ADORNABA la salida de parametros(): el
+# catalogo era el mismo en todas partes. Declarar una distincion y no aplicarla
+# es peor que no declararla, porque quien lee "perfil: vps" concluye que esa
+# herramienta no esta, y si estaba.
+PERFILES_VALIDOS = ("completo", "escritorio", "vps")
+PERFIL = (os.environ.get("EVASTATE_PERFIL") or "completo").strip().lower()
+if PERFIL not in PERFILES_VALIDOS:
+    # No se cae ni se adivina: se avisa y se queda en el que no quita nada.
+    print("EVASTATE_PERFIL=%r no es %s; sigo en 'completo'"
+          % (PERFIL, "/".join(PERFILES_VALIDOS)), file=sys.stderr)
+    PERFIL = "completo"
+
+
+def _sobra_en_este_perfil(nombre):
+    """Si esta herramienta NO pertenece al perfil activo.
+
+    LO NO DECLARADO SE QUEDA, a proposito. Excluir por omision haria que anadir
+    una herramienta y olvidarse de la tabla la hiciera desaparecer en silencio, y
+    el fallo se estrenaria en la instalacion de otro. parametros() publica
+    SIN_PERFIL para que el olvido se vea en vez de actuar.
+    """
+    if PERFIL == "completo":
+        return False
+    p = PERFIL_HERRAMIENTA.get(nombre)
+    if not p or p == "ambos":
+        return False
+    return p != PERFIL
+
+
 RETIRANDOSE = {n: (_EN_REVISION_RECURSOS if n.startswith("recurso_") else _EN_REVISION_HERR)
                for n in PERFIL_HERRAMIENTA
                if n.startswith(("recurso_", "herramienta_"))}
@@ -1274,6 +1305,14 @@ def parametros(herramienta: str = "") -> str:
     if herramienta:
         h = herramienta.strip()
         if h not in out:
+            # SI LA QUITO EL PERFIL, SE DICE. "No existe" seria cierto en este
+            # catalogo y enganoso sobre el canal: la herramienta existe, no esta
+            # AQUI. Quien lo lee tiene que poder distinguir un nombre mal escrito
+            # de una edicion recortada.
+            if PERFIL != "completo" and h in PERFIL_HERRAMIENTA:
+                return (f"ERROR: '{h}' existe, pero no en el perfil '{PERFIL}': es de "
+                        f"'{PERFIL_HERRAMIENTA[h]}'. Arranca con EVASTATE_PERFIL=completo "
+                        "si la necesitas aqui.")
             return f"ERROR: no existe la herramienta '{h}'. Llama a parametros() sin argumento para verlas."
         return _jd({h: _adornar_param(h, out[h])})
     # El perfil y la retirada viajan CON cada herramienta, no en una lista aparte
@@ -1287,7 +1326,12 @@ def parametros(herramienta: str = "") -> str:
                 "perfiles": {"ambos": "existe en las dos ediciones",
                              "vps": "administra algo del servidor: no existe en escritorio",
                              "escritorio": "solo tiene sentido sin servidor"},
-                **({"SIN_PERFIL": _sin} if _sin else {}),
+                # El perfil activo se publica SIEMPRE, tambien en 'completo'. Si el
+        # catalogo esta recortado, quien lo lee tiene que saber por que sin
+        # deducirlo de las ausencias.
+        "perfil_activo": PERFIL,
+        **({"fuera_de_este_perfil": sorted(_QUITADAS)} if _QUITADAS else {}),
+        **({"SIN_PERFIL": _sin} if _sin else {}),
                 "herramientas": out})
 
 @mcp.tool()
@@ -3419,6 +3463,78 @@ def app_dormir(nombre: str) -> str:
                 "aviso": "despierta sola con la primera visita a su subdominio"})
 
 @mcp.tool()
+def app_secreto(nombre: str, clave: str, valor: str) -> str:
+    """Da una credencial a TU app sin que viaje en el paquete.
+
+    El valor se guarda en el servidor con permisos cerrados y llega al proceso
+    por `$CREDENTIALS_DIRECTORY/<clave>` (LoadCredential de systemd), NO como
+    variable de entorno: el entorno se HEREDA a los hijos, y una app que lanza
+    ffmpeg le estaria pasando su clave a un binario de terceros.
+
+    Sobrevive al redespliegue. Rotar es volver a llamar aqui con el valor nuevo,
+    sin empaquetar nada.
+    """
+    me = ident()
+    n = (nombre or "").strip().lower()
+    _, d = _get("app", n)
+    if not d or d.get("estado") == "eliminada":
+        return f"ERROR: no existe la app '{n}'."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return (f"ERROR: '{n}' es de '{d.get('dueno')}'. Las credenciales de una app "
+                "solo las pone su dueno.")
+    k = (clave or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", k):
+        return ("ERROR: la clave se usa como NOMBRE DE FICHERO: letras, digitos y "
+                "guion bajo, empezando por letra o guion bajo, max 64.")
+    if not valor:
+        return "ERROR: valor vacio. Para quitarla, app_secreto_borrar."
+    if len(valor.encode("utf-8")) > 8192:
+        return "ERROR: valor demasiado grande (max 8192 bytes)."
+    rc, out = _ctl_pedir("secreto", n, {"clave": k, "valor": valor})
+    if rc != 0:
+        # El error del ayudante puede llevar el valor si algo raro paso: no se
+        # reenvia tal cual.
+        return f"ERROR al guardar '{k}' en '{n}'."
+    return _jd({"guardada": k, "app": n,
+                "como_la_lee_tu_app": "open(os.environ['CREDENTIALS_DIRECTORY'] + '/%s')" % k,
+                "detalle": out,
+                "nota": ("no vuelve a salir de aqui: al listar solo se ven los nombres. "
+                         "Sobrevive al redespliegue; para rotar, llama otra vez con el "
+                         "valor nuevo.")})
+
+
+@mcp.tool()
+def app_secretos(nombre: str) -> str:
+    """Los NOMBRES de las credenciales de una app. Nunca los valores."""
+    me = ident()
+    n = (nombre or "").strip().lower()
+    _, d = _get("app", n)
+    if not d or d.get("estado") == "eliminada":
+        return f"ERROR: no existe la app '{n}'."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{n}' es de '{d.get('dueno')}'."
+    rc, out = _ctl_pedir("secretos", n)
+    return out if rc == 0 else f"ERROR consultando '{n}'."
+
+
+@mcp.tool()
+def app_secreto_borrar(nombre: str, clave: str) -> str:
+    """Retira una credencial de tu app. La app se reinicia si estaba viva."""
+    me = ident()
+    n = (nombre or "").strip().lower()
+    _, d = _get("app", n)
+    if not d or d.get("estado") == "eliminada":
+        return f"ERROR: no existe la app '{n}'."
+    if d.get("dueno") != me and not es_autoridad(me):
+        return f"ERROR: '{n}' es de '{d.get('dueno')}'."
+    k = (clave or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", k):
+        return "ERROR: clave invalida."
+    rc, out = _ctl_pedir("secreto_borrar", n, {"clave": k})
+    return out if rc == 0 else f"ERROR: no pude borrar '{k}' de '{n}'. {out}"
+
+
+@mcp.tool()
 def app_eliminar(nombre: str) -> str:
     """Elimina una app dinámica: para el servicio, borra su unidad y su snippet de
     Caddy. Solo el dueño o la autoridad. Los archivos desplegados se conservan."""
@@ -3452,13 +3568,51 @@ def deploy_info() -> str:
             "limites": "512M RAM, 80% CPU, sin privilegios, reinicio automático",
             "gestion": "app_status / app_logs / app_restart / app_stop / app_start",
         },
+        "donde_escribir_lo_que_debe_sobrevivir": {
+            "usa": "os.environ['STATE_DIRECTORY']",
+            "por_que": ("la carpeta de la app SE VACIA en cada despliegue, y /tmp "
+                        "es un tmpfs privado que systemd tira al PARAR el servicio "
+                        "-- incluido el sueño por inactividad. Escribir ahi funciona "
+                        "hasta que deja de funcionar, en silencio."),
+        },
+        "credenciales": {
+            "pon": "app_secreto('<app>', 'MI_CLAVE', '<valor>')",
+            "lee": "open(os.environ['CREDENTIALS_DIRECTORY'] + '/MI_CLAVE')",
+            "por_que": ("NO las metas en el tar.gz: la carpeta de la app queda "
+                        "legible por cualquier usuario del servidor y su dueno no "
+                        "puede ni borrarlas. Por aqui no viajan en el paquete, "
+                        "sobreviven al redespliegue y rotar es una llamada."),
+        },
+        "al_redesplegar": ("si la app estaba CORRIENDO se reinicia con el codigo "
+                           "nuevo; si estaba dormida se queda dormida y arranca con "
+                           "el codigo nuevo en la primera visita. La respuesta dice "
+                           "cual de las dos."),
+        "volver_a_atarse": ("tu app tiene que poder RE-ATARSE a $PORT enseguida: al "
+                            "reiniciar, el socket anterior sigue unos segundos en "
+                            "TIME_WAIT. En Python, `allow_reuse_address = True` en tu "
+                            "servidor (los frameworks normales ya lo hacen). Si no, "
+                            "muere con 'Address already in use' y systemd la "
+                            "reintenta a los 3 s: se recupera, pero da un susto."),
+        "user_agent": ("manda un User-Agent propio en el PUT. Con el de urllib por "
+                       "defecto, el filtro del borde devuelve un 403 SECO, sin cuerpo "
+                       "y sin decir quien te para: parece un rechazo del canal y no "
+                       "lo es."),
         "maximo": "50 MB por despliegue",
         "nota": "el tar.gz no debe contener rutas absolutas ni '..'",
     })
 
 SPOOL = os.environ.get("EVASTATE_SPOOL", "/var/lib/evastate/ctl-spool")
 CTL_OUT = os.environ.get("EVASTATE_CTL_OUT", "/var/lib/evastate/ctl-out")
+# 0700, NO 0755. Por aqui viaja el VALOR de las credenciales de las apps camino
+# del ayudante root, y estaba legible por cualquier usuario del VPS: unos
+# segundos, pero el mismo defecto que este mecanismo viene a quitar. El ayudante
+# corre como root y lee igual; nadie mas tiene nada que hacer aqui.
 os.makedirs(SPOOL, exist_ok=True); os.makedirs(CTL_OUT, exist_ok=True)
+for _d in (SPOOL, CTL_OUT):
+    try:
+        os.chmod(_d, 0o700)
+    except OSError:
+        pass
 
 def _ctl_pedir(accion, nombre, extra=None):
     """Deja la petición en el spool; el ayudante root (eva-appd) la ejecuta.
@@ -3467,7 +3621,11 @@ def _ctl_pedir(accion, nombre, extra=None):
     rid = uuid.uuid4().hex
     req = {"id": rid, "accion": accion, "nombre": nombre, **(extra or {})}
     tmp = os.path.join(SPOOL, f".{rid}.tmp")
-    with open(tmp, "w") as f: json.dump(req, f)
+    # 0600 DESDE QUE NACE. Con `open(...,"w")` el fichero existe primero con lo
+    # que diga el umask y se cierra despues: esa ventana es suficiente para algo
+    # que puede llevar una credencial dentro.
+    _fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(_fd, "w") as f: json.dump(req, f)
     pet_p = os.path.join(SPOOL, f"{rid}.json")
     os.replace(tmp, pet_p)
     res_p = os.path.join(CTL_OUT, f"{rid}.json")
@@ -4081,6 +4239,27 @@ def _instrucciones_dinamicas():
     except Exception as e:
         print(f"AVISO: instrucciones dinamicas no disponibles: {e}", file=sys.stderr)
         return False
+
+# ───────────── APLICAR EL PERFIL AL CATALOGO ─────────────
+# Aqui, y no antes: hasta esta linea no han corrido todos los decoradores, asi
+# que antes no existe el catalogo completo que hay que recortar.
+#
+# Se usa `mcp.remove_tool`, que es API publica del SDK. Desaparecen de
+# tools/list, o sea que un cliente NO puede llamarlas. No se deja un estado en
+# que el catalogo diga una cosa y el servidor otra: eso seria peor que no
+# filtrar, porque el cliente tendria razon al quejarse.
+_QUITADAS = []
+if PERFIL != "completo":
+    for _n in sorted(PERFIL_HERRAMIENTA):
+        if _sobra_en_este_perfil(_n):
+            try:
+                mcp.remove_tool(_n)
+                _QUITADAS.append(_n)
+            except Exception:
+                pass      # no estaba registrada: nada que quitar
+    print("perfil %s: %d herramientas fuera del catalogo (%s)"
+          % (PERFIL, len(_QUITADAS), ", ".join(_QUITADAS) or "ninguna"),
+          file=sys.stderr)
 
 SALUDO_DINAMICO = _instrucciones_dinamicas()
 

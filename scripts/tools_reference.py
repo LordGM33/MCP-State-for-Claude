@@ -91,6 +91,7 @@ HTTPS with your own token. Dynamic apps sleep when idle and wake on the first
 visitor.""", [
         "deploy_info", "app_list", "app_status", "app_logs", "app_restart",
         "app_stop", "app_start", "app_dormir", "app_eliminar",
+        "app_secreto", "app_secretos", "app_secreto_borrar",
     ]),
     ("Membership and tokens (authority)", """Joining, leaving and key rotation.
 The ones marked with a passphrase need a second factor the authority holds and
@@ -210,6 +211,18 @@ RESUMEN = {
                              "resources and notices that identity sees.",
     "participante_cartelera": "Set whether a participant confirms notices. Turn it off "
                               "for services, and for the authority the rules come from.",
+    "app_secreto": "Give your app a credential without it travelling inside the "
+                   "deployment package. The value is stored on the server with closed "
+                   "permissions and reaches the process through systemd's "
+                   "LoadCredential, readable at $CREDENTIALS_DIRECTORY/<name>. Not an "
+                   "environment variable on purpose: the environment is INHERITED by "
+                   "child processes, so an app that shells out to a media tool would be "
+                   "handing that tool its key. Packaging a secret instead leaves it in a "
+                   "directory the deployer makes world-readable to serve static files, "
+                   "where the app's own owner cannot even delete it. Survives "
+                   "redeployment; rotating is one call, with nothing to repackage.",
+    "app_secretos": "The NAMES of an app's credentials. Never the values.",
+    "app_secreto_borrar": "Remove one credential. The app restarts if it was running.",
     "rotacion_invitar": "Issue a single-use code so a participant can set a new token.",
     "rotacion_estado": "Who has already confirmed their new token and who has not.",
     "rotacion_anular": "Cancel a live rotation code so another can be issued. Touches "
