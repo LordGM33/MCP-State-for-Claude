@@ -673,6 +673,15 @@ def puerta_D():
     caso("D", "decision_log queda y decision_list la devuelve", _d_decision)
     caso("D", "search encuentra lo escrito", _d_search)
     caso("D", "the greeting carries headlines, not bodies", _pub_saludo_trae_titulares_no_cuerpos)
+    caso("D", "the catalogue agrees with the edition it declares", _pub_el_catalogo_concuerda_con_su_perfil)
+    caso("C", "stopping a tool needs a person, not an authority", _pub_parar_exige_un_humano)
+    caso("C", "a pass belongs to its own door and only looks", _pub_un_pase_es_de_su_puerta_y_solo_mira)
+    caso("D", "the core survives any edition", _pub_el_nucleo_sobrevive_a_cualquier_perfil)
+    caso("D", "a removed tool is distinguishable from a nonexistent one", _pub_una_herramienta_quitada_se_distingue_de_una_inexistente)
+    caso("C", "only the owner sets an app's credentials", _pub_solo_el_dueno_pone_credenciales)
+    caso("C", "a credential value never comes back", _pub_una_credencial_no_vuelve_nunca)
+    caso("C", "a path as a credential name is refused", _pub_una_clave_con_ruta_se_rechaza)
+    caso("D", "deploy_info mentions what used to bite people", _pub_deploy_info_dice_lo_que_callaba)
     caso("D", "msg_leer returns one whole message", _pub_msg_leer_trae_el_cuerpo)
     caso("C", "msg_leer does not open somebody else's mail", _pub_msg_leer_no_abre_correo_ajeno)
     caso("D", "an unknown is reported as unknown, not guessed", _pub_no_lo_se_en_vez_de_adivinar)
@@ -1186,6 +1195,298 @@ def _pub_abortar_se_niega_si_ya_confirmo():
             raise AssertionError(
                 "cleanup did not give %s its token back: %s. The rest of the "
                 "battery will fail on 404." % (ID2, e))
+
+
+def _pub_el_catalogo_concuerda_con_su_perfil():
+    """The catalogue must agree with the edition the server says it is running.
+
+    An installation can run a reduced edition: a desktop has no use for the parts
+    that manage a server. The risk is not that tools are missing -- that is the
+    point -- but that the reduction takes something it should not, or claims a
+    reduction it did not apply. Either way the operator finds out by a call
+    failing, days later, with no hint that an edition decided it.
+
+    This works in EVERY edition, including the full one, where it asserts nothing
+    was dropped. A case that only runs on one configuration tests nothing on the
+    others -- and the reduced editions are exactly the ones nobody runs the
+    battery against.
+    """
+    p = call(T1, "parametros")
+    assert isinstance(p, dict), "parametros() did not answer an object: %s" % _jd_(p)
+    activo = p.get("perfil_activo")
+    assert activo, ("parametros() does not say which edition is running. With a "
+                    "trimmed catalogue the reader would have to infer it from "
+                    "what is missing.")
+    herr = p.get("herramientas") or {}
+    fuera = p.get("fuera_de_este_perfil") or []
+
+    if activo == "completo":
+        assert not fuera, ("the full edition dropped tools: %s. Full means full."
+                           % _jd_(fuera))
+        return
+
+    # Edicion recortada: lo declarado fuera tiene que estar fuera DE VERDAD, y lo
+    # que queda no puede pertenecer a la otra edicion.
+    for n in fuera:
+        assert n not in herr, ("%r is listed as excluded and is still in the "
+                               "catalogue: the two halves disagree" % n)
+    otra = "vps" if activo == "escritorio" else "escritorio"
+    intrusos = [n for n, d in herr.items() if (d or {}).get("perfil") == otra]
+    assert not intrusos, ("edition %r still offers tools belonging to %r: %s. "
+                          "Offering what will fail here is worse than not "
+                          "offering it." % (activo, otra, _jd_(intrusos)))
+
+
+def _pub_el_nucleo_sobrevive_a_cualquier_perfil():
+    """Whatever the edition, coordination must still be there.
+
+    An edition that drops the core is not an edition, it is a broken install. The
+    tools marked as belonging to both editions are the ones this channel exists
+    for: if a reduction reaches them, the operator loses the ability to say so
+    through the very channel that would carry the complaint.
+    """
+    p = call(T1, "parametros")
+    herr = p.get("herramientas") or {}
+    for n in ("whoami", "state_overview", "msg_send", "msg_inbox", "parametros",
+              "search", "fact_set", "cartelera"):
+        assert n in herr, ("edition %r is missing %r, which belongs to both. An "
+                           "edition that drops the core is a broken install."
+                           % (p.get("perfil_activo"), n))
+
+
+def _pub_una_herramienta_quitada_se_distingue_de_una_inexistente():
+    """Asking about a tool the edition removed must not read like a typo.
+
+    "No such tool" is true of this catalogue and misleading about the channel:
+    the tool exists, it is not HERE. Confusing the two sends somebody hunting a
+    misspelling when the answer is an edition decision.
+    """
+    p = call(T1, "parametros")
+    fuera = p.get("fuera_de_este_perfil") or []
+    if not fuera:
+        return          # full edition: nothing was removed, nothing to tell apart
+    try:
+        r = call(T1, "parametros", {"herramienta": fuera[0]})
+        t = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
+    except Rechazo as e:
+        t = str(e)
+    assert "perfil" in t.lower(), (
+        "about a tool this edition removed it answers as if it never existed: %s"
+        % t[:200])
+
+
+def _pub_solo_el_dueno_pone_credenciales():
+    """An app's credentials belong to whoever owns the app.
+
+    The root helper that writes them knows nothing about ownership -- only the
+    channel does. Without this check anyone could place credentials in somebody
+    else's application, or replace theirs with their own, and the application
+    would start using them without noticing.
+    """
+    apps = call(T1, "app_list")
+    mias = [a for a in (apps if isinstance(apps, list) else [])
+            if a.get("estado") != "eliminada" and a.get("dueno") == ID1]
+    if not mias:
+        return          # nothing deployed by T1 here: nothing to guard
+    n = mias[0]["nombre"]
+    try:
+        r = call(T2, "app_secreto", {"nombre": n, "clave": "AJENA", "valor": "x"})
+        t = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
+    except Rechazo as e:
+        t = str(e)
+    assert "dueno" in t.lower() or "no existe" in t.lower(), (
+        "another participant could touch the credentials of an app that is not "
+        "theirs: %s" % t[:250])
+
+
+def _pub_una_credencial_no_vuelve_nunca():
+    """Setting a credential must not echo it, and listing must show names only.
+
+    A value that comes back in an answer is a value in a transcript, in a log,
+    and in whatever the caller prints while debugging. The whole point of moving
+    secrets out of the deployment package is lost if the channel hands them back.
+    """
+    apps = call(T1, "app_list")
+    mias = [a for a in (apps if isinstance(apps, list) else [])
+            if a.get("estado") != "eliminada" and a.get("dueno") == ID1]
+    if not mias:
+        return
+    n = mias[0]["nombre"]
+    secreto = "bat-secret-" + RUN
+    try:
+        r = call(T1, "app_secreto", {"nombre": n, "clave": "BAT_PRUEBA", "valor": secreto})
+        t = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
+    except Rechazo as e:
+        t = str(e)
+    assert secreto not in t, "THE VALUE CAME BACK in the answer: %s" % t[:250]
+    try:
+        l = call(T1, "app_secretos", {"nombre": n})
+        tl = l if isinstance(l, str) else json.dumps(l, ensure_ascii=False)
+        assert secreto not in tl, "the value shows up when listing: %s" % tl[:250]
+        assert "BAT_PRUEBA" in tl, "the name does not show up when listing: %s" % tl[:250]
+    except Rechazo:
+        pass
+    finally:
+        try:
+            call(T1, "app_secreto_borrar", {"nombre": n, "clave": "BAT_PRUEBA"})
+        except Exception:
+            pass
+
+
+def _pub_una_clave_con_ruta_se_rechaza():
+    """The key name becomes a FILE name on the server.
+
+    A name that admits slashes or dots admits leaving the directory it was meant
+    for. This is checked at the channel as well as in the helper, because a check
+    that lives in only one of two layers is one refactor away from living in
+    neither.
+    """
+    apps = call(T1, "app_list")
+    mias = [a for a in (apps if isinstance(apps, list) else [])
+            if a.get("estado") != "eliminada" and a.get("dueno") == ID1]
+    if not mias:
+        return
+    n = mias[0]["nombre"]
+    for mala in ("../../etc/passwd", "con/barra", "con espacio", ""):
+        try:
+            r = call(T1, "app_secreto", {"nombre": n, "clave": mala, "valor": "x"})
+            t = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
+        except Rechazo as e:
+            t = str(e)
+        assert "clave" in t.lower() or "error" in t.lower(), (
+            "accepted %r as a credential name, which becomes a file name: %s"
+            % (mala, t[:200]))
+
+
+def _pub_deploy_info_dice_lo_que_callaba():
+    """The deployment notes must mention what bites people.
+
+    Three things were missing and all three were found the hard way by whoever
+    deployed first: where to write data that must outlive a deployment, where
+    credentials go, and that a redeployment restarts a running app. A manual that
+    omits something does not leave the reader without an answer -- it makes them
+    invent one, and the invented answer was the unsafe one.
+    """
+    d = call(T1, "deploy_info")
+    t = json.dumps(d, ensure_ascii=False)
+    for clave, que in (("STATE_DIRECTORY", "where to write data that survives"),
+                       ("CREDENTIALS_DIRECTORY", "how an app reads a credential"),
+                       ("app_secreto", "how to place one")):
+        assert clave in t, "deploy_info does not mention %s (%s)" % (clave, que)
+
+
+def _pub_parar_exige_un_humano():
+    """Starting is free; STOPPING needs a human to confirm it.
+
+    What this really defends is subtler than it looks: that a cowork cannot
+    authorise a stop EVEN IF IT IS THE AUTHORITY. The permission hangs on being a
+    person, not on holding authority. If it hung on authority instead, the
+    administrator of this channel could authorise stopping its own dependencies,
+    which is exactly what the rule forbids -- and the two are easy to confuse,
+    because in most systems authority is the stronger claim.
+
+    Written to fail against a build that treats them as the same thing.
+    """
+    hid = "bat" + RUN[-6:]
+    # Only the authority declares tools: a tool nobody declared has no owner to
+    # ask before stopping it.
+    try:
+        call(T2, "herramienta_declarar", {"id": hid, "puerto": 65000})
+        raise AssertionError("a non-authority declared a tool")
+    except Rechazo as e:
+        assert "autoridad" in str(e).lower(), "refused for another reason: %s" % e
+    call(T1, "herramienta_declarar", {"id": hid, "puerto": 65000,
+                                      "arranque": "start-me.bat"})
+
+    # With no request on file the state must SAY SO, not leave it to be inferred
+    # from an absence. An absence reads as permission; a sentence does not.
+    e0 = call(T1, "herramienta_estado", {"id": hid})["herramientas"][0]
+    assert "NO AUTORIZADA" in (e0.get("pararla") or ""), (
+        "with nothing authorised it does not say plainly that it stays up: %s"
+        % _jd_(e0))
+
+    # A request without a reason is a yes asked blind.
+    try:
+        call(T1, "herramienta_parada_pedir", {"id": hid, "motivo": "   "})
+        raise AssertionError("accepted a stop request with no reason")
+    except Rechazo:
+        pass
+
+    p = call(T2, "herramienta_parada_pedir",
+             {"id": hid, "motivo": "battery: the card has to be freed"})
+    pet = p.get("peticion")
+    assert pet, _jd_(p)
+
+    # Asking twice must not open a second request: two live requests over one
+    # thing make an authorisation given to one look like it covers the other.
+    p2 = call(T2, "herramienta_parada_pedir", {"id": hid, "motivo": "again"})
+    assert p2.get("ya_habia_una") == pet, "a duplicate live request: %s" % _jd_(p2)
+
+    # THE CASE. T1 holds authority here and is still a cowork, not a person.
+    try:
+        call(T1, "herramienta_parada_autorizar", {"peticion": pet})
+        raise AssertionError(
+            "a cowork WITH AUTHORITY authorised a stop. The permission is hanging "
+            "on authority instead of on being a person.")
+    except Rechazo as e:
+        assert "humano" in str(e).lower(), (
+            "refused, but not for not being a person: %s" % e)
+
+    # And the failed attempt must leave the tool exactly as protected as before.
+    e1 = call(T1, "herramienta_estado", {"id": hid})["herramientas"][0]
+    assert "NO AUTORIZADA" in (e1.get("pararla") or ""), (
+        "a cowork's failed attempt left the stop authorised: %s" % _jd_(e1))
+
+
+def _pub_un_pase_es_de_su_puerta_y_solo_mira():
+    """What a pass to a restricted demo can and cannot do.
+
+    Three properties, each one a door somebody would otherwise walk through: a
+    pass belongs to ONE subdomain and does not open the neighbour's; the guest
+    only LOOKS unless explicitly marked otherwise; and revoking takes effect at
+    once. A pass that outlives its revocation is worse than no pass, because the
+    owner believes it is closed.
+    """
+    a, b = "pas" + RUN[-6:] + "a", "pas" + RUN[-6:] + "b"
+    call(T1, "subdomain_claim", {"nombre": a, "tipo": "restringido"})
+    call(T1, "subdomain_claim", {"nombre": b, "tipo": "restringido"})
+
+    # No passes where there is no door.
+    c = "pas" + RUN[-6:] + "c"
+    call(T1, "subdomain_claim", {"nombre": c, "tipo": "publico"})
+    try:
+        call(T1, "pase_crear", {"subdominio": c, "para": "somebody"})
+        raise AssertionError("issued a pass for a public subdomain")
+    except Rechazo as e:
+        assert "restringido" in str(e).lower(), "refused for another reason: %s" % e
+
+    # Without saying who it is for, there is no way to know which one to revoke.
+    try:
+        call(T1, "pase_crear", {"subdominio": a, "para": "  "})
+        raise AssertionError("accepted a pass with no recipient")
+    except Rechazo:
+        pass
+
+    # THE GUEST ONLY LOOKS, unless somebody says otherwise on purpose.
+    p = call(T1, "pase_crear", {"subdominio": a, "para": "battery guest"})
+    assert p.get("puede_lanzar") is False, (
+        "by default the guest can start work: %s" % _jd_(p))
+    assert "caduca" in p, "a pass with no end: %s" % _jd_(p)
+
+    # A pass belongs to ITS subdomain and not the neighbour's.
+    mios = {x["id"] for x in call(T1, "pase_list", {"subdominio": a})}
+    assert p["pase"] in mios, "the pass is not listed under its own subdomain"
+    otros = {x["id"] for x in call(T1, "pase_list", {"subdominio": b})}
+    assert p["pase"] not in otros, (
+        "a pass shows up under a subdomain that is not its own")
+
+    # Revoking has effect, and the effect is visible.
+    r = call(T1, "pase_anular", {"pase": p["pase"]})
+    assert r.get("estado") == "anulado", _jd_(r)
+    ahora = {x["id"]: x for x in call(T1, "pase_list", {"subdominio": a})}
+    if p["pase"] in ahora:
+        assert ahora[p["pase"]].get("estado") == "anulado", (
+            "revoked and still listed as live: %s" % _jd_(ahora[p["pase"]]))
 
 
 def _d_ciclo_msg():
