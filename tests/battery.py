@@ -675,6 +675,7 @@ def puerta_D():
     caso("D", "the greeting carries headlines, not bodies", _pub_saludo_trae_titulares_no_cuerpos)
     caso("D", "the catalogue agrees with the edition it declares", _pub_el_catalogo_concuerda_con_su_perfil)
     caso("C", "stopping a tool needs a person, not an authority", _pub_parar_exige_un_humano)
+    caso("C", "subdomain_tipo: declara lo que es, y nadie declara el de otro", _pub_subdomain_tipo_declara_lo_que_es)
     caso("C", "a pass belongs to its own door and only looks", _pub_un_pase_es_de_su_puerta_y_solo_mira)
     caso("D", "the core survives any edition", _pub_el_nucleo_sobrevive_a_cualquier_perfil)
     caso("D", "a removed tool is distinguishable from a nonexistent one", _pub_una_herramienta_quitada_se_distingue_de_una_inexistente)
@@ -1436,6 +1437,75 @@ def _pub_parar_exige_un_humano():
     e1 = call(T1, "herramienta_estado", {"id": hid})["herramientas"][0]
     assert "NO AUTORIZADA" in (e1.get("pararla") or ""), (
         "a cowork's failed attempt left the stop authorised: %s" % _jd_(e1))
+
+
+def _pub_subdomain_tipo_declara_lo_que_es():
+    """Declarar QUE es un subdominio decide si queda detras de la puerta, y no
+    lo probaba NINGUNA bateria. La que reparte visibilidad sin una sola prueba.
+
+    El caso que de verdad se busca es el ultimo: que un participante NO pueda
+    declarar 'publico' el subdominio restringido de otro. Si pudiera, quitar una
+    puerta seria una llamada."""
+    d = "tip" + RUN[-6:]
+    call(T1, "subdomain_claim", {"nombre": d, "tipo": "publico"})
+
+    # 1. Lo que no existe no se declara: si no, quedan tipos sin subdominio.
+    try:
+        call(T1, "subdomain_tipo", {"nombre": "nohay" + RUN[-5:], "tipo": "publico"})
+        assert False, "declaro el tipo de un subdominio que no existe"
+    except Rechazo:
+        pass
+
+    # 2. Un tipo inventado se rechaza, y la respuesta dice cuales valen: un
+    # rechazo que no ensena la salida obliga a adivinar.
+    try:
+        call(T1, "subdomain_tipo", {"nombre": d, "tipo": "secretisimo"})
+        assert False, "acepto un tipo que no existe"
+    except Rechazo as e:
+        assert "publico" in str(e), "el rechazo no dice que tipos hay: " + str(e)
+
+    # 3. 'temporal' sin fecha: permanencia que nadie decidio.
+    try:
+        call(T1, "subdomain_tipo", {"nombre": d, "tipo": "temporal"})
+        assert False, "acepto un temporal SIN fecha de caducidad"
+    except Rechazo:
+        pass
+
+    # 4. Y al reves: una caducidad en algo que no caduca. Una fecha que nadie va
+    # a mirar es peor que ninguna, porque parece que alguien la vigila.
+    try:
+        call(T1, "subdomain_tipo", {"nombre": d, "tipo": "publico",
+                                    "caduca": "2030-01-01"})
+        assert False, "acepto caducidad en un subdominio que no es temporal"
+    except Rechazo:
+        pass
+
+    # 5. Temporal con fecha: queda declarada.
+    r = call(T1, "subdomain_tipo", {"nombre": d, "tipo": "temporal",
+                                    "caduca": "2030-01-01"})
+    assert r.get("tipo") == "temporal", r
+    assert (r.get("caduca") or "").startswith("2030-01-01"), r
+
+    # 6. EL QUE SE PUDRE EN SILENCIO. Al volver a publico la fecha tiene que
+    # DESAPARECER. Si se quedara, subdomain_list mostraria como vencido un
+    # subdominio permanente, y nadie relacionaria una cosa con la otra.
+    r = call(T1, "subdomain_tipo", {"nombre": d, "tipo": "publico"})
+    assert r.get("tipo") == "publico", r
+    assert not r.get("caduca"), (
+        "al dejar de ser temporal se quedo la caducidad: " + str(r.get("caduca")))
+
+    # 7. EL CASO DE SEGURIDAD: el de otro, no.
+    try:
+        call(T2, "subdomain_tipo", {"nombre": d, "tipo": "restringido"})
+        assert False, ("OTRO PARTICIPANTE CAMBIO EL TIPO DE UN SUBDOMINIO AJENO: "
+                       "podria declarar publico un restringido y quitarle la puerta")
+    except Rechazo:
+        pass
+
+    try:
+        call(T1, "subdomain_release", {"nombre": d})
+    except Rechazo:
+        pass
 
 
 def _pub_un_pase_es_de_su_puerta_y_solo_mira():
