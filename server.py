@@ -1087,6 +1087,32 @@ def token_confirmar() -> str:
                 "nota": ("Tu token viejo seguira valiendo hasta que el administrador cierre la "
                          "rotacion. No te quedaras fuera por haber confirmado.")})
 
+def _fila_rotacion(q, v, codigos):
+    """El estado de rotacion de UN participante.
+
+    Se saco de `rotacion_estado` (v52) por la regla del campamento: esa funcion
+    estaba en 32 lineas efectivas, dos por encima del tope de CART-030.
+
+    Pero el corte no salio del tope, salio del criterio 1.1. Describir a UN
+    participante y resumir a TODOS son dos razones distintas para cambiar: la
+    fila cambia cuando cambia lo que se sabe de alguien, el resumen cuando
+    cambia lo que se decide con el conjunto. Juntar renglones para colar el
+    numero habria dejado el tope contento y el codigo igual de mezclado.
+    """
+    _, r = _get("rotacion", q)
+    vale = _confirmo_esta_rotacion(q)
+    en_rot = bool(v.get("token_anterior_sha256"))
+    act = _actividad(q).get(q, {})
+    return {"id": q,
+            "en_rotacion": en_rot,
+            **({"codigo_emitido_sin_usar": codigos[q]} if q in codigos else {}),
+            "confirmado": ((r or {}).get("confirmado") if vale else None),
+            **({"confirmacion_vieja_ignorada": (r or {}).get("confirmado")}
+               if (r and not vale and en_rot) else {}),
+            "ultima_conexion": act.get("ultima_conexion"),
+            "ultima_escritura": act.get("ultima_escritura")}
+
+
 @mcp.tool()
 def rotacion_estado() -> str:
     """Quien ha confirmado ya su token nuevo y quien no. Solo la autoridad."""
@@ -1099,30 +1125,31 @@ def rotacion_estado() -> str:
     for r in _rows("rot_invitacion", 500, order="DESC"):
         if r.get("estado") == "emitida":
             pendientes_cod.setdefault(r.get("para"), r.get("emitida"))
-    filas = []
-    for q, v in PARTICIPANTES.items():
-        if not v.get("activo", True): continue
-        en_rot = bool(v.get("token_anterior_sha256"))
-        _, r = _get("rotacion", q)
-        vale = _confirmo_esta_rotacion(q)
-        act = _actividad(q).get(q, {})
-        filas.append({"id": q,
-                      "en_rotacion": en_rot,
-                      **({"codigo_emitido_sin_usar": pendientes_cod[q]}
-                         if q in pendientes_cod else {}),
-                      "confirmado": ((r or {}).get("confirmado") if vale else None),
-                      **({"confirmacion_vieja_ignorada": (r or {}).get("confirmado")}
-                         if (r and not vale and en_rot) else {}),
-                      "ultima_conexion": act.get("ultima_conexion"),
-                      "ultima_escritura": act.get("ultima_escritura")})
+    filas = [_fila_rotacion(q, v, pendientes_cod)
+             for q, v in PARTICIPANTES.items() if v.get("activo", True)]
     pend = [f["id"] for f in filas if f["en_rotacion"] and not f["confirmado"]]
-    sueltos = sorted(pendientes_cod)
     return _jd({"participantes": filas, "faltan": pend,
-                "codigos_emitidos_sin_usar": sueltos,
+                "codigos_emitidos_sin_usar": sorted(pendientes_cod),
                 "listo_para_cerrar": not pend,
-                "nota": ("Cerrar con: sudo participante.py cerrar-rotacion. Mientras alguien "
-                         "figure en 'faltan', cerrar lo deja incomunicado. Si lleva dias sin "
-                         "conectarse, mira ultima_conexion antes de dar por hecho que te ignora.")})
+                # LA NOTA MANDABA AL CAMINO SIN RED (v52).
+                #
+                # Decia "sudo participante.py cerrar-rotacion". Ese atajo existe
+                # y funciona, pero no comprueba nada: cierra sobre quien no haya
+                # confirmado y lo deja fuera del canal -- y sin canal no puede
+                # avisar de que esta fuera. `rotacion_cerrar` exige la frase y se
+                # NIEGA en ese caso.
+                #
+                # O sea que el canal recomendaba la puerta sin cerradura teniendo
+                # la buena al lado. Quien hace caso a la nota acaba peor que
+                # quien no la lee, y eso es lo que la convierte en un defecto y
+                # no en una errata.
+                "nota": ("Cerrar con rotacion_cerrar(frase=...): exige la frase y se NIEGA "
+                         "mientras alguien figure en 'faltan', porque cerrar sobre quien no "
+                         "ha confirmado lo deja fuera del canal y sin canal no puede avisar "
+                         "de que esta fuera. Si lleva dias sin conectarse, mira "
+                         "ultima_conexion antes de dar por hecho que te ignora. En el VPS "
+                         "existe tambien `sudo participante.py cerrar-rotacion`, SIN esa "
+                         "red: solo para cuando el canal no responde.")})
 
 # ───────────── IDENTIDAD ─────────────
 # ───────────── PERFIL DE CADA HERRAMIENTA (FECHA-025, parte 2) ─────────────
@@ -2084,8 +2111,24 @@ def cartel_estado(ref: str) -> str:
     for c in _rows("cartel", None):
         if _norm_ref(c.get("ref")) == ref:
             conf = c.get("confirmaciones", {})
+            # UN AVISO NO DEJA A NADIE PENDIENTE (v52).
+            #
+            # Antes se calculaba `pendientes` sin mirar `requiere`, asi que un
+            # cartel de tipo aviso -- que no pide nada a nadie -- listaba a sus
+            # destinatarios como morosos para siempre. CART-026 llevaba asi
+            # desde el 11-sep y me hizo perseguir mi propia sombra: aparecia MI
+            # nombre entre los pendientes de un cartel que no pedia nada.
+            #
+            # `cartelera()` ya lo hacia bien. El defecto no era que faltara el
+            # criterio: era que este sitio no lo usaba.
+            #
+            # Una lista de pendientes con ruido permanente ensena a ignorarla, y
+            # una lista de pendientes que se ignora es peor que no tenerla.
+            req = c.get("requiere")
+            pide_algo = req in ("confirmacion", "respuesta")
             pend = [p for p in c.get("dirigido_a", []) if p not in conf
-                    and (PARTICIPANTES.get(p) or {}).get("confirma_cartelera", True)]
+                    and (PARTICIPANTES.get(p) or {}).get("confirma_cartelera", True)
+                    ] if pide_algo else []
             return _jd({"ref": ref, "tipo": c.get("tipo"), "requiere": c.get("requiere"),
                         "estado": c.get("estado"),
                         # A QUIEN SE LE PIDIO, y DE QUE MAQUINA es la norma. Sin
@@ -2095,7 +2138,13 @@ def cartel_estado(ref: str) -> str:
                         # exactamente lo que paso con CART-021.
                         "dirigido_a": c.get("dirigido_a", []),
                         **({"estacion": c["estacion"]} if c.get("estacion") else {}),
-                        "confirmados": conf, "pendientes": pend})
+                        "confirmados": conf, "pendientes": pend,
+                        # Se dice en voz alta en vez de devolver una lista vacia
+                        # a secas: vacia y sin explicacion se lee como "ya
+                        # confirmaron todos", que es una afirmacion distinta.
+                        **({} if pide_algo else
+                           {"nota": "requiere='%s': este cartel no pide nada, "
+                                    "por eso nadie figura pendiente." % req})})
     return f"ERROR: no existe el cartel {ref}."
 
 @mcp.tool()
