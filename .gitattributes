@@ -1,0 +1,38 @@
+# Line endings for the scripts that run via shebang on Linux.
+#
+# Without this file, git on Windows can check these out with CRLF. A shell or
+# python script with CRLF then fails on Linux in a way that does not resemble
+# its cause: the kernel looks for an interpreter literally named "bash\r" or
+# "python3\r" and reports that it does not exist. Nothing in the error mentions
+# line endings.
+#
+# We lost half a day to exactly this on 11-Sep-2026 with a script uploaded to
+# the server: nine checks red and five FALSELY GREEN, because a command that
+# never runs makes every "this is not present" assertion true.
+#
+# Every path below is already LF in the repository, so this protects them
+# without rewriting anything.
+scripts/eva-app-ctl        text eol=lf
+scripts/eva-app-idle       text eol=lf
+scripts/eva-backup.py      text eol=lf
+scripts/instalar.sh        text eol=lf
+scripts/participante.py    text eol=lf
+tests/install_check.sh     text eol=lf
+examples/client.py         text eol=lf
+modulos/**/*.sh            text eol=lf
+modulos/**/*.py            text eol=lf
+caddy/*                    text eol=lf
+systemd/*                  text eol=lf
+
+# NOT listed on purpose: server.py, scripts/tools_reference.py and
+# tests/battery.py. They carry a shebang but are always invoked with an explicit
+# interpreter (`python server.py`), and they are stored with CRLF today. Forcing
+# eol=lf would rewrite all three in full, turning a line-ending policy into a
+# four-thousand-line diff that buries the history of the file. Normalising them
+# is a deliberate change of its own, not a side effect of this one.
+
+# Binaries: keep git away from them.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary

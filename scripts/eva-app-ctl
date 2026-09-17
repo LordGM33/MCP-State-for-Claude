@@ -12,6 +12,14 @@ APPS = _os.environ.get("EVASTATE_APPS", "/srv/apps"); UNITDIR = "/etc/systemd/sy
 SPOOL = _os.environ.get("EVASTATE_SPOOL", "/var/lib/evastate/ctl-spool")
 OUTD = _os.environ.get("EVASTATE_CTL_OUT", "/var/lib/evastate/ctl-out")
 PREFIJO = _os.environ.get("EVASTATE_APP_PREFIX", "eva-app-")
+# Origen de las credenciales. root:0600, fuera de la carpeta de la app y fuera
+# del tar. systemd las copia a /run/credentials/<unidad>/ con 0400.
+SECRETOS_DIR = _os.environ.get("EVASTATE_SECRETOS", "/etc/evastate-secretos")
+# Nombre de variable de entorno de toda la vida. Estricto a proposito: esto se
+# convierte en un NOMBRE DE FICHERO, y un nombre de fichero que admite barras o
+# puntos admite salirse del directorio.
+CLAVE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+MAX_SECRETO = 8192
 
 UNIT = """[Unit]
 Description=Eva app dinamica: {n}
@@ -20,7 +28,7 @@ After=network.target
 Type=simple
 DynamicUser=yes
 WorkingDirectory={apps}/{n}
-Environment=PORT={p}
+Environment=PORT={p}{creds}
 ExecStart=/bin/sh -lc '{cmd}'
 Restart=on-failure
 RestartSec=3
@@ -29,6 +37,11 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths={apps}/{n}
+# SOL-046 (9-sep): sin esto la app no tiene DONDE escribir que sobreviva
+# a un reinicio. La carpeta de la app es de solo lectura a proposito, y
+# lo unico escribible que quedaba era /tmp -- que se borra. El 5-sep se
+# perdieron respuestas de evaluadores externos por esto, EN SILENCIO.
+StateDirectory={pref}{n}
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
@@ -70,21 +83,237 @@ def leer_cmd(n):
 
 def unidad(n): return f"{PREFIJO}{n}.service"
 
+def val_clave(k):
+    if not CLAVE_RE.match(k or ""):
+        raise ValueError("clave invalida: letras, digitos y _ (empezando por letra o _), max 64")
+    return k
+
+def dir_secretos(n):
+    return os.path.join(SECRETOS_DIR, n)
+
+def lista_secretos(n):
+    """Los NOMBRES de las credenciales de una app. Nunca los valores."""
+    d = dir_secretos(n)
+    try:
+        return sorted(x for x in os.listdir(d) if CLAVE_RE.match(x))
+    except OSError:
+        return []
+
+def bloque_creds(n):
+    """Las lineas LoadCredential= que van en la unidad.
+
+    Se REGENERAN a partir del directorio cada vez que se escribe la unidad, en
+    vez de guardarse en una lista aparte. Una segunda copia de la misma verdad
+    es como acaban dos ficheros diciendo cosas distintas sin que nadie lo note.
+    """
+    ls = lista_secretos(n)
+    if not ls:
+        return ""
+    return "\n" + "\n".join(
+        f"LoadCredential={k}:{os.path.join(dir_secretos(n), k)}" for k in ls)
+
+def escribir_unidad(n, puerto, cmd):
+    open(os.path.join(UNITDIR, unidad(n)), "w").write(
+        UNIT.format(n=n, p=puerto, cmd=cmd, apps=APPS, pref=PREFIJO,
+                    creds=bloque_creds(n)))
+
+def puerto_de(n):
+    """El puerto que ya tiene asignado, leido de su unidad."""
+    try:
+        t = open(os.path.join(UNITDIR, unidad(n))).read()
+        m = re.search(r"^Environment=PORT=(\d+)$", t, re.M)
+        return int(m.group(1)) if m else None
+    except OSError:
+        return None
+
+def secreto(n, clave, valor):
+    """Deposita una credencial y la enchufa a la unidad.
+
+    El VALOR no se registra, ni se devuelve, ni aparece en la salida. Lo unico
+    que sale de aqui es el nombre.
+    """
+    val_nombre(n); val_clave(clave)
+    if valor is None or not isinstance(valor, str) or not valor:
+        raise ValueError("valor vacio")
+    if len(valor.encode("utf-8")) > MAX_SECRETO:
+        raise ValueError(f"valor demasiado grande (max {MAX_SECRETO} bytes)")
+    d = dir_secretos(n)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    p = os.path.join(d, clave)
+    # Se escribe con los permisos puestos DESDE EL PRINCIPIO. Crear y despues
+    # hacer chmod deja una ventana en la que el fichero existe siendo legible.
+    fd = os.open(p + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, valor.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(p + ".tmp", p)
+    pu = puerto_de(n)
+    if pu is None:
+        return 0, f"guardada '{clave}'; la app aun no esta instalada, se enchufara al desplegar"
+    escribir_unidad(n, pu, leer_cmd(n))
+    sh("systemctl", "daemon-reload")
+    activa = sh("systemctl", "is-active", unidad(n))[1] == "active"
+    if activa:
+        sh("systemctl", "restart", unidad(n))
+    return 0, ("guardada '%s'; credenciales ahora: %s; %s"
+               % (clave, ", ".join(lista_secretos(n)),
+                  "reiniciada" if activa else "estaba parada, se aplicara al arrancar"))
+
+def secreto_borrar(n, clave):
+    val_nombre(n); val_clave(clave)
+    p = os.path.join(dir_secretos(n), clave)
+    if not os.path.exists(p):
+        return 1, f"'{clave}' no existe en {n}"
+    os.remove(p)
+    pu = puerto_de(n)
+    if pu is not None:
+        escribir_unidad(n, pu, leer_cmd(n))
+        sh("systemctl", "daemon-reload")
+        if sh("systemctl", "is-active", unidad(n))[1] == "active":
+            sh("systemctl", "restart", unidad(n))
+    return 0, f"borrada '{clave}'; quedan: {', '.join(lista_secretos(n)) or '(ninguna)'}"
+
+def secretos(n):
+    val_nombre(n)
+    return 0, json.dumps({"app": n, "credenciales": lista_secretos(n)})
+
+def _ruta_snippet(n):
+    return os.path.join(CADDYD, f"{n}.caddy")
+
+
+def _tiene_mano_humana(texto):
+    """¿Hay algo en este fragmento que yo no haya escrito?
+
+    NO se compara contra la plantilla renderizada: eso dependia de DOMAIN, una
+    variable de entorno, y con ella ausente TODO parecia personalizado -- los
+    install dejarian de actualizar fragmentos sin dar un solo error.
+
+    Se mira el trabajo, no la igualdad. La plantilla son cuatro lineas y nunca
+    escribe estas directivas; si aparecen, alguien las puso.
+    """
+    lineas = [l for l in texto.splitlines() if l.strip()]
+    if len(lineas) > 4:
+        return True
+    propias_de_una_persona = ("forward_auth", "request_header", "@puerta",
+                              "basic_auth", "respond", "redir")
+    return any(d in texto for d in propias_de_una_persona)
+
+
+def _decidir_snippet(n, puerto):
+    """Que hacer con el fragmento de Caddy. NO toca el disco: solo decide.
+
+    Devuelve (accion, nota). accion: "escribir" | "conservar" | "parar".
+
+    Se separa de install a proposito. Decidir y ejecutar son dos
+    responsabilidades, y aqui la decision tiene que poder tomarse ANTES de
+    mutar nada: si dice "parar", la instalacion no debe haber empezado.
+    """
+    ruta = _ruta_snippet(n)
+    if not os.path.exists(ruta):
+        return "escribir", ""
+    actual = open(ruta, encoding="utf-8").read()
+    if not _tiene_mano_humana(actual):
+        return "escribir", ""
+    # Personalizado. La pregunta ya no es si pisarlo, sino si sigue siendo
+    # valido para ESTE puerto.
+    if f"127.0.0.1:{puerto}" in actual:
+        return "conservar", (
+            f"fragmento de Caddy CONSERVADO: {ruta} esta personalizado (puerta, "
+            f"rutas abiertas o similar) y apunta al puerto correcto. NO se ha "
+            f"sobrescrito con la plantilla")
+    return "parar", (
+        f"NO SE INSTALA NADA. {ruta} esta personalizado -- alguien le puso "
+        f"puerta o reglas propias-- pero NO menciona el puerto {puerto} que "
+        f"pides ahora. Pisarlo dejaria el subdominio abierto; conservarlo "
+        f"dejaria el trafico yendo a un puerto que no escucha. Las dos cosas "
+        f"fallan en silencio, asi que decide tu: actualiza el puerto dentro de "
+        f"ese fichero a mano y vuelve a instalar, o borralo si quieres la "
+        f"plantilla limpia (y pierdes la puerta)")
+
+
+def _escuchando_en(puerto):
+    """En que direccion escucha la app. Se mira, no se impone.
+
+    Un 0.0.0.0 significa 'todas las interfaces'. Hoy lo tapa ufw, pero que algo
+    este protegido por la barrera de al lado y no por la suya es como han
+    empezado los tres hallazgos de esta semana.
+    """
+    rc, out = sh("ss", "-tlnH", f"sport = :{puerto}")
+    if rc != 0 or not out.strip():
+        return None
+    for linea in out.splitlines():
+        partes = linea.split()
+        if len(partes) >= 4:
+            return partes[3]
+    return None
+
+
+def _resumen_instalacion(n, puerto, cmd, estado, nota, nota_caddy):
+    """Lo que se le cuenta a quien instalo. Solo texto: no decide nada.
+
+    Se saco de `install` (17-sep) por la regla del campamento. Contar y hacer
+    son dos razones distintas para cambiar, y este trozo es el que crecio hoy:
+    el aviso de la direccion de escucha y la nota del fragmento son dos frases
+    mas en el informe, no dos pasos mas en el despliegue.
+    """
+    cr = lista_secretos(n)
+    donde = _escuchando_en(puerto) if estado == "active" else None
+    partes = [f"instalada; {nota}; estado={estado}; puerto={puerto}; cmd={cmd}"]
+    if cr:
+        partes.append(f"credenciales={','.join(cr)}")
+    if nota_caddy:
+        partes.append(nota_caddy)
+    if donde and not donde.startswith(("127.0.0.1:", "[::1]:")):
+        partes.append(f"OJO: escucha en {donde}, o sea en TODAS las interfaces. "
+                      f"Hoy solo la tapa el cortafuegos; deberia atarse a "
+                      f"127.0.0.1 y dejar que Caddy sea la unica puerta")
+    return "; ".join(partes)
+
+
 def install(n, puerto):
     val_nombre(n); puerto = int(puerto)
     if not (9100 <= puerto <= 9899): raise ValueError("puerto fuera de rango")
     cmd = leer_cmd(n)
-    sh("chmod", "-R", "a+rX", os.path.join(APPS, n))
-    open(os.path.join(UNITDIR, unidad(n)), "w").write(UNIT.format(n=n, p=puerto, cmd=cmd, apps=APPS))
+    # LA DECISION SOBRE EL FRAGMENTO, ANTES DE MUTAR NADA. Si hay que parar, se
+    # para con la instalacion sin empezar: ni unidad escrita, ni daemon-reload,
+    # ni un chmod. Una negativa a mitad deja la mitad hecha.
     os.makedirs(CADDYD, exist_ok=True)
-    open(os.path.join(CADDYD, f"{n}.caddy"), "w").write(SNIPPET.format(n=n, p=puerto, dom=DOMAIN))
+    accion, nota_caddy = _decidir_snippet(n, puerto)
+    if accion == "parar":
+        return 1, nota_caddy
+    # SE MIRA ANTES DE TOCAR NADA. Despues del enable ya no se distingue si
+    # estaba corriendo, y de esa distincion depende si hay que reiniciar.
+    estaba_activa = sh("systemctl", "is-active", unidad(n))[1] == "active"
+    sh("chmod", "-R", "a+rX", os.path.join(APPS, n))
+    escribir_unidad(n, puerto, cmd)
+    if accion == "escribir":
+        open(_ruta_snippet(n), "w").write(SNIPPET.format(n=n, p=puerto, dom=DOMAIN))
     sh("systemctl", "daemon-reload")
-    rc, out = sh("systemctl", "enable", "--now", unidad(n))
+    # EL DESPLIEGUE TIENE QUE DESPLEGAR.
+    #
+    # Antes: `enable --now`, que arranca si esta parada y NO HACE NADA si ya
+    # corre. Un PUT sobre una app viva instalaba los ficheros nuevos, dejaba el
+    # proceso VIEJO en marcha, y devolvia ok. gamecompanion perdio un
+    # diagnostico entero probando un endpoint nuevo contra el binario anterior.
+    #
+    # Y no se arranca lo que estaba parado: una app dormida por inactividad debe
+    # seguir dormida, o el scale-to-zero deja de existir. Se despierta sola con
+    # la primera visita, ya con el codigo nuevo.
+    rc, out = sh("systemctl", "enable", unidad(n))
     if rc != 0: return rc, f"systemd: {out}"
+    if estaba_activa:
+        rc, out = sh("systemctl", "restart", unidad(n))
+        if rc != 0: return rc, f"systemd restart: {out}"
+        nota = "estaba corriendo: REINICIADA con el codigo nuevo"
+    else:
+        nota = ("estaba parada o dormida: NO se arranca. El codigo nuevo entra "
+                "en la primera visita (o con app_start)")
     rc2, out2 = sh("systemctl", "reload", "caddy")
     if rc2 != 0: return rc2, f"caddy: {out2}"
     rc3, estado = sh("systemctl", "is-active", unidad(n))
-    return 0, f"instalada; estado={estado}; puerto={puerto}; cmd={cmd}"
+    return 0, _resumen_instalacion(n, puerto, cmd, estado, nota, nota_caddy)
 
 def remove(n):
     val_nombre(n)
@@ -92,7 +321,11 @@ def remove(n):
     for p in (os.path.join(UNITDIR, unidad(n)), os.path.join(CADDYD, f"{n}.caddy")):
         if os.path.exists(p): os.remove(p)
     sh("systemctl", "daemon-reload"); sh("systemctl", "reload", "caddy")
-    return 0, "eliminada"
+    # Las credenciales se van con la app. Dejarlas seria dejar secretos de algo
+    # que ya no existe, que es como se acumulan los que nadie recuerda rotar.
+    import shutil as _sh
+    _sh.rmtree(dir_secretos(n), ignore_errors=True)
+    return 0, "eliminada (y sus credenciales)"
 
 def simple(accion, n):
     val_nombre(n)
@@ -118,34 +351,105 @@ def dispatch(req):
     if a in ("start", "stop", "restart"): return simple(a, n)
     if a == "status":  return status(n)
     if a == "logs":    return logs(n, req.get("lineas", 40))
+    if a == "secreto": return secreto(n, req.get("clave", ""), req.get("valor"))
+    if a == "secreto_borrar": return secreto_borrar(n, req.get("clave", ""))
+    if a == "secretos": return secretos(n)
     return 1, f"accion desconocida: {a}"
+
+def _barrer_restos():
+    """Quita del spool lo que no es una peticion y nadie va a recoger.
+
+    POR QUE (9-sep). eva-appd.path vigila con DirectoryNotEmpty, que se dispara
+    con CUALQUIER fichero. Pero este ayudante solo recoge *.json. El servidor
+    escribe primero .<id>.tmp y luego renombra: una escritura interrumpida deja
+    un .tmp que nadie recoge NUNCA, el directorio queda no-vacio para siempre,
+    el vigilante se dispara sin parar y systemd acaba matando la unidad por
+    exceso de arranques. Eso paso el 5-sep: tres dias con TODAS las apps
+    dinamicas fuera y nadie se entero hasta que alguien vio un 503.
+
+    Se barren solo los restos con mas de 5 min: uno recien escrito puede ser una
+    peticion a medio llegar."""
+    import time
+    ahora = time.time()
+    # os.listdir y NO glob: glob NO devuelve los nombres que empiezan por
+    # punto, y los restos del servidor se llaman .<id>.tmp -- justo los que
+    # atascan el directorio. La primera version de este barrido usaba glob y
+    # por eso no barria nada: el mismo defecto que venia a arreglar, cometido
+    # dentro del arreglo. Lo cazo la prueba porque uso el nombre de verdad.
+    try:
+        nombres = os.listdir(SPOOL)
+    except OSError:
+        return
+    for nombre in nombres:
+        f = os.path.join(SPOOL, nombre)
+        if nombre.endswith(".json") or not os.path.isfile(f):
+            continue
+        try:
+            if ahora - os.path.getmtime(f) > 300:
+                os.remove(f)
+        except OSError:
+            pass
+
 
 def spool():
     os.makedirs(OUTD, exist_ok=True)
+    _barrer_restos()
     for f in sorted(glob.glob(os.path.join(SPOOL, "*.json"))):
+        # SIEMPRE se borra la peticion, pase lo que pase al escribir la
+        # respuesta. Antes, un fallo escribiendo en OUTD (disco lleno, permisos)
+        # escapaba del bucle y dejaba el fichero ahi -> el vigilante girando ->
+        # unidad muerta. Perder una respuesta es malo; dejar la plataforma
+        # entera fuera de servicio es peor.
         try:
-            req = json.load(open(f))
-        except Exception:
-            os.remove(f); continue
-        try:
-            rc, out = dispatch(req)
-        except Exception as e:
-            rc, out = 1, f"ERROR: {e}"
-        rid = req.get("id") or os.path.basename(f)[:-5]
-        tmp = os.path.join(OUTD, f".{rid}.tmp")
-        json.dump({"rc": rc, "out": out}, open(tmp, "w"))
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, os.path.join(OUTD, f"{rid}.json"))
-        os.remove(f)
+            try:
+                req = json.load(open(f))
+            except Exception:
+                continue
+            try:
+                rc, out = dispatch(req)
+            except Exception as e:
+                rc, out = 1, f"ERROR: {e}"
+            rid = req.get("id") or os.path.basename(f)[:-5]
+            tmp = os.path.join(OUTD, f".{rid}.tmp")
+            try:
+                json.dump({"rc": rc, "out": out}, open(tmp, "w"))
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, os.path.join(OUTD, f"{rid}.json"))
+            except Exception:
+                pass
+        finally:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "spool":
         spool(); sys.exit(0)
     if len(sys.argv) < 3:
-        print("uso: eva-app-ctl <install|remove|start|stop|restart|status|logs> <nombre> [args]"); sys.exit(2)
+        print("uso: eva-app-ctl <install|remove|start|stop|restart|status|logs|"
+              "secreto|secreto_borrar|secretos> <nombre> [args]"); sys.exit(2)
     a, n = sys.argv[1], sys.argv[2]
     extra = {}
     if a == "install": extra["puerto"] = sys.argv[3]
     if a == "logs" and len(sys.argv) > 3: extra["lineas"] = sys.argv[3]
-    rc, out = dispatch({"accion": a, "nombre": n, **extra})
+    if a == "secreto":
+        # El valor por ENTRADA ESTANDAR, nunca como argumento: los argumentos se
+        # ven en `ps` y quedan en el historial del shell.
+        extra["clave"] = sys.argv[3]
+        extra["valor"] = sys.stdin.read().rstrip("\n")
+    if a == "secreto_borrar": extra["clave"] = sys.argv[3]
+    # UN RECHAZO SE DICE, NO SE LANZA.
+    #
+    # La validacion ya funcionaba, pero por esta via salia como traceback: la
+    # linea de codigo y la ruta del fichero impresas a quien acaba de intentar
+    # meter '../../etc/passwd' como nombre de clave. Y un rechazo con pinta de
+    # cuelgue invita a reintentar en vez de a entender.
+    #
+    # La via del spool ya lo hacia bien (dispatch va dentro de un try); faltaba
+    # esta, que es la que usa el administrador a mano.
+    try:
+        rc, out = dispatch({"accion": a, "nombre": n, **extra})
+    except (ValueError, OSError) as e:
+        print("ERROR: %s" % e, file=sys.stderr); sys.exit(2)
     print(out); sys.exit(rc)
