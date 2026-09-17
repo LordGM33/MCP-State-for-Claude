@@ -118,6 +118,7 @@ h2.t{font-size:14px;font-weight:600;color:var(--mut);margin:20px 0 8px;text-tran
   <div class="nav" data-v="infra"><span class="dot"></span>Subdominios y apps</div>
   <div class="nav" data-v="puertos"><span class="dot"></span>Puertos de mi estación</div>
   <div class="nav" data-v="recursos"><span class="dot"></span>GPU y recursos</div>
+  <div class="nav" data-v="herramientas"><span class="dot"></span>Herramientas compartidas</div>
 </aside>
 <div id="zona">
 <header>
@@ -538,6 +539,47 @@ async recursos() {
     <button class="pri mini" onclick="tomarRecurso()">Tomar</button></div>`;
   $("#vista").innerHTML = h;
 },
+async herramientas() {
+  // Arrancar es libre; parar exige que una PERSONA confirme que nadie mas la usa.
+  // Por eso el boton de autorizar vive aqui y no en ningun guion: es el unico
+  // punto del sistema donde hace falta un humano, y tiene que verse como tal.
+  const d = await tool("herramienta_estado");
+  let h = `<h1>Herramientas compartidas</h1>
+    <div class="card"><div class="meta">${esc(d.regla || "")}</div></div>`;
+  if (!d.herramientas || !d.herramientas.length) {
+    h += `<div class="card"><div class="meta">No hay ninguna herramienta compartida
+      declarada en ${esc(d.maquina || "esta estación")}.</div></div>`;
+    $("#vista").innerHTML = h; return;
+  }
+  h += d.herramientas.map(t => {
+    if (t.error) return card("mal", esc(t.herramienta), esc(t.error), "", "");
+    const autorizada = String(t.pararla || "").startsWith("AUTORIZADA");
+    const p = t.peticion_abierta;
+    // La estación se muestra SIEMPRE. Quien no tiene estación asignada (Ricardo)
+    // ve las de todas las máquinas juntas, y sin esta etiqueta serían un montón
+    // indistinguible en cuanto haya una segunda estación.
+    let cuerpo = `<div class="meta">${t.maquina ? "<b>" + esc(t.maquina) + "</b> · " : ""}Puerto <b>${esc(String(t.puerto))}</b>
+      · Arrancarla: ${esc(t.arrancarla || "")}</div>`;
+    if (t.arranque) cuerpo += `<div class="meta">Se levanta con: <code>${esc(t.arranque)}</code></div>`;
+    if (t.notas) cuerpo += `<div class="meta">${esc(t.notas)}</div>`;
+    // El veredicto completo, sin recortar: es una frase que explica QUE hacer,
+    // y truncarla la convierte en una etiqueta que no dice nada.
+    cuerpo += `<div style="margin-top:8px"><b>Pararla:</b> ${esc(t.pararla || "")}</div>`;
+    let bot = "";
+    if (p) {
+      cuerpo += `<div class="meta" style="margin-top:8px">Petición #${p.id} de
+        <b>${esc(p.la_pidio)}</b>: ${esc(p.motivo || "")} <i>(${esc(p.desde || "")})</i></div>`;
+      if (!autorizada) {
+        bot += `<button class="mini ok" onclick="autorizarParada(${p.id},'${esc(t.herramienta)}','${esc(p.la_pidio)}')">
+          Confirmar que nadie más la usa</button>`;
+      }
+      bot += `<button class="mini mal" onclick="accion('herramienta_parada_cerrar',
+        {peticion:${p.id},resultado:'cerrada desde la consola'},'herramientas')">Cerrar la petición</button>`;
+    }
+    return card(autorizada ? "pend" : "bien", esc(t.herramienta), "", cuerpo, bot);
+  }).join("");
+  $("#vista").innerHTML = h;
+},
 async puertos() {
   const d = await tool("puerto_list");
   let h = `<h1>Puertos de mi estación</h1>
@@ -733,6 +775,25 @@ async function tomarRecurso() {
       "\n\nAhora mismo lo tienen: " +
       (r.quien_mas || []).map(q => `${q.dueno} (${q.cuanto}, ${q.para})`).join("; "));
     ir("recursos");
+  } catch (e) { alert(e.message); }
+}
+
+async function autorizarParada(peticion, herramienta, quien) {
+  // Se pregunta por lo que la persona tiene que SABER, no por lo que quiere hacer.
+  // "¿Seguro?" no comprueba nada: quien va a pulsar ya ha decidido. La unica
+  // pregunta util es la que la regla exige contestar, y va escrita entera.
+  if (!confirm(
+      `Vas a autorizar que se APAGUE '${herramienta}'.\n\n` +
+      `Lo pide: ${quien}\n\n` +
+      `Estás confirmando que NADIE MÁS la está usando ahora mismo. ` +
+      `Si otro cowork tiene trabajo en vuelo contra ella, lo pierde.\n\n` +
+      `La autorización caduca en 30 minutos y vale solo para esta petición.`)) return;
+  try {
+    const r = await tool("herramienta_parada_autorizar", {peticion, minutos: 30});
+    alert(`Autorizada. ${quien} puede parar '${herramienta}' durante los próximos ` +
+          `${r.vale_minutos} minutos.\n\nPasado ese rato vuelve a estar protegida ` +
+          `sin que nadie tenga que hacer nada.`);
+    ir("herramientas");
   } catch (e) { alert(e.message); }
 }
 
